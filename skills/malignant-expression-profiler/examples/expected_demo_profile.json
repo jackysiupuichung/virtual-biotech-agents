@@ -1,0 +1,21 @@
+{
+  "malignant_label": "malignant cell",
+  "malignant": {
+    "n_cells": 60,
+    "mean_expr": 3.0231,
+    "pct_expressing": 1.0
+  },
+  "non_malignant": {
+    "n_cells": 240,
+    "mean_expr": 0.0182,
+    "pct_expressing": 1.0
+  },
+  "malignant_enrichment": 166.104,
+  "enrichment_note": "malignant mean is 166.104\u00d7 non-malignant",
+  "tumour_target_call": "on-tumour (favourable)",
+  "interpretation": "expressed on the malignant compartment and enriched/exclusive vs non-malignant",
+  "skill": "malignant-expression-profiler",
+  "gene": "TUMOR_ANTIGEN",
+  "atlas": "synthetic tumour demo (offline, illustrative)",
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
