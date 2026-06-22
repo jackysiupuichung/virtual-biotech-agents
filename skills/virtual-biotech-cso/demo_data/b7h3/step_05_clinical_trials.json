@@ -1,0 +1,6 @@
+{
+  "skill": "clinical-trial-finder",
+  "summary": "Multiple active B7-H3 ADC programs in solid tumours including NSCLC — validates the modality and target, but the space is competitive.",
+  "example_programs": ["B7-H3 ADC (NSCLC, early phase)", "B7-H3 ADC (multiple solid tumours)"],
+  "note": "Illustrative cached value for the demo walkthrough, not a live ClinicalTrials.gov query."
+}
