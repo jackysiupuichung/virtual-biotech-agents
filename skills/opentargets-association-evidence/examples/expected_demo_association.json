@@ -1,0 +1,20 @@
+{
+  "skill": "opentargets-association-evidence",
+  "version": "0.1.0",
+  "demo": true,
+  "symbol": "CD276",
+  "ensembl_id": "ENSG00000103855",
+  "efo_id": "EFO_0001071",
+  "disease": "lung carcinoma",
+  "overall_score": 0.005,
+  "datatype_scores": {
+    "literature": 0.0424
+  },
+  "_demo": true,
+  "strength": "weak",
+  "evidence_datatypes_present": [
+    "literature"
+  ],
+  "interpretation": "association is weak (score 0.005); driven by literature \u2014 literature-only (no genetic/somatic/known-drug evidence; OT may undersell a somatic/expression-driven target)",
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
