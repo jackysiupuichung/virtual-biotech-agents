@@ -1,0 +1,44 @@
+{
+  "skill": "openfda-safety",
+  "version": "0.1.0",
+  "demo": true,
+  "note": "FAERS counts are spontaneous reports \u2014 they reflect reporting frequency, not incidence or causation, and are confounded by indication and reporting bias.",
+  "drug": "capmatinib",
+  "adverse_events": [
+    {
+      "reaction": "DEATH",
+      "report_count": 411
+    },
+    {
+      "reaction": "PERIPHERAL SWELLING",
+      "report_count": 288
+    },
+    {
+      "reaction": "FATIGUE",
+      "report_count": 260
+    },
+    {
+      "reaction": "OEDEMA PERIPHERAL",
+      "report_count": 243
+    },
+    {
+      "reaction": "NAUSEA",
+      "report_count": 240
+    },
+    {
+      "reaction": "MALIGNANT NEOPLASM PROGRESSION",
+      "report_count": 179
+    },
+    {
+      "reaction": "DYSPNOEA",
+      "report_count": 138
+    },
+    {
+      "reaction": "OEDEMA",
+      "report_count": 134
+    }
+  ],
+  "boxed_warning": null,
+  "_demo": true,
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
