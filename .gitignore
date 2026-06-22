@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv / venv
+.venv/
+
+# Generated skill / workflow output (runtime artifacts, not source)
+output/
+
+# scanpy dataset cache
+data/*.h5ad

@@ -1,0 +1,30 @@
+[project]
+name = "virtual-biotech-agents"
+version = "0.1.0"
+description = "Hybrid Virtual-Biotech CSO over ClawBio — agentic genomics for therapeutic discovery (ClawBio Hackathon @ King's, 2026)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "scanpy>=1.10",
+    "anndata>=0.10",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "pandas>=2.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["skills"]
+
+[tool.pytest.ini_options]
+testpaths = ["skills", "tests"]
