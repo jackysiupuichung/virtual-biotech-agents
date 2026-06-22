@@ -1,0 +1,69 @@
+{
+  "skill": "opentargets-target-factors",
+  "version": "0.1.0",
+  "demo": true,
+  "ensembl_id": "ENSG00000103855",
+  "symbol": "CD276",
+  "biotype": "protein_coding",
+  "prioritisation_factors": [
+    {
+      "key": "geneticConstraint",
+      "value": -0.14,
+      "division": "target_safety"
+    },
+    {
+      "key": "hasLigand",
+      "value": 0.0,
+      "division": "modality"
+    },
+    {
+      "key": "hasPocket",
+      "value": 0.0,
+      "division": "modality"
+    },
+    {
+      "key": "hasSmallMoleculeBinder",
+      "value": 0.0,
+      "division": "modality"
+    },
+    {
+      "key": "isInMembrane",
+      "value": 0.0,
+      "division": "modality"
+    },
+    {
+      "key": "isSecreted",
+      "value": 0.0,
+      "division": "modality"
+    },
+    {
+      "key": "maxClinicalStage",
+      "value": 0.5,
+      "division": "clinical/modality"
+    },
+    {
+      "key": "mouseKOScore",
+      "value": -0.19,
+      "division": "target_safety"
+    },
+    {
+      "key": "tissueSpecificity",
+      "value": -1.0,
+      "division": "target_safety (bulk tissue)"
+    },
+    {
+      "key": "geneEssentiality",
+      "value": 0.0,
+      "division": "functional_genomics (DepMap)"
+    }
+  ],
+  "tractability_positive": [
+    {
+      "modality": "AB",
+      "label": "Advanced Clinical",
+      "value": true
+    }
+  ],
+  "safety_liabilities": [],
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
