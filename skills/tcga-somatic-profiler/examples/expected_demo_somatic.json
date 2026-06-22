@@ -1,0 +1,50 @@
+{
+  "skill": "tcga-somatic-profiler",
+  "version": "0.1.0",
+  "demo": true,
+  "note": "Frequency = cases with >=1 simple somatic mutation in the gene / TCGA cohort size (any SSM, not driver-specific). Source: NCI GDC.",
+  "gene": "MET",
+  "n_tcga_types": 32,
+  "top_cancer_types": [
+    {
+      "cancer_type": "TCGA-UCEC",
+      "mutated_cases": 90,
+      "cohort": 560,
+      "frequency_pct": 16.07
+    },
+    {
+      "cancer_type": "TCGA-SKCM",
+      "mutated_cases": 65,
+      "cohort": 470,
+      "frequency_pct": 13.83
+    },
+    {
+      "cancer_type": "TCGA-KIRP",
+      "mutated_cases": 21,
+      "cohort": 291,
+      "frequency_pct": 7.22
+    },
+    {
+      "cancer_type": "TCGA-COAD",
+      "mutated_cases": 27,
+      "cohort": 461,
+      "frequency_pct": 5.86
+    },
+    {
+      "cancer_type": "TCGA-BLCA",
+      "mutated_cases": 23,
+      "cohort": 412,
+      "frequency_pct": 5.58
+    },
+    {
+      "cancer_type": "TCGA-LUAD",
+      "mutated_cases": 24,
+      "cohort": 585,
+      "frequency_pct": 4.1
+    }
+  ],
+  "_demo": true,
+  "call": "recurrent somatic driver",
+  "interpretation": "top: TCGA-UCEC 16.07% (90/560); recurrent somatic driver",
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
