@@ -9,6 +9,9 @@ target_id_and_prioritization:
   target_disease_association:            # <-- Open Targets target↔disease evidence breakdown
     skill: opentargets-association-evidence
     note: per-datatype evidence (genetic/somatic/known-drug/expression/...) linking target to disease
+  somatic_mutation_frequency:            # <-- TCGA somatic-driver axis
+    skill: tcga-somatic-profiler
+    note: per-cancer-type somatic mutation frequency (GDC/TCGA); driver vs expression target
   single_cell_atlas_fetch:               # <-- data acquisition front-end (our skill)
     skill: cellxgene-fetch
     note: pulls a gene×tissue .h5ad slice from CELLxGENE Census (API, reproducible); feeds the two steps below
