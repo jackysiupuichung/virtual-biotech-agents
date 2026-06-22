@@ -1,0 +1,23 @@
+{
+  "atlas_name": "synthetic demo (cellxgene-fetch --demo; offline, illustrative)",
+  "n_cells": 360,
+  "n_genes": 5,
+  "genes": [
+    "MARKER_RESTRICTED",
+    "HOUSEKEEPING_BROAD",
+    "GENE_A",
+    "GENE_B",
+    "GENE_C"
+  ],
+  "n_cell_types": 6,
+  "cell_types": [
+    "B cell",
+    "NK cell",
+    "T cell",
+    "dendritic cell",
+    "fibroblast",
+    "monocyte"
+  ],
+  "skill": "cellxgene-fetch",
+  "disclaimer": "ClawBio is a research and educational tool. It is not a medical device and does not provide clinical diagnoses. Consult a healthcare professional before making any medical decisions."
+}
