@@ -4,6 +4,7 @@ description: For a gene, report its somatic mutation frequency across TCGA cance
 license: MIT
 metadata:
   version: "0.1.0"
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Jacky Siu
   domain: cancer-genomics
   tags:

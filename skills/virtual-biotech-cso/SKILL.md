@@ -4,6 +4,7 @@ description: Multi-agent therapeutic-target-assessment orchestrator — a Chief-
 license: MIT
 metadata:
   version: "0.1.0"
+  role: orchestrator  # routes to and synthesizes capability skills (not a leaf skill)
   author: Jacky Siu
   domain: orchestration
   tags:

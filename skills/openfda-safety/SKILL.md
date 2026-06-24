@@ -4,6 +4,7 @@ description: For a drug, query openFDA and return a post-market safety snapshot 
 license: MIT
 metadata:
   version: "0.1.0"
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Jacky Siu
   domain: pharmacovigilance
   tags:

@@ -4,6 +4,7 @@ description: For one target, fetch the Open Targets prioritisation factors, trac
 license: MIT
 metadata:
   version: "0.1.0"
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Jacky Siu
   domain: target-discovery
   tags:

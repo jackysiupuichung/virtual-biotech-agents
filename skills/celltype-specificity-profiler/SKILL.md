@@ -6,6 +6,7 @@ description: Per-gene cell-type specificity profiler for single-cell atlases —
 license: MIT
 metadata:
   version: 0.1.0
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Pui Chung Siu
   tags:
   - scrna
