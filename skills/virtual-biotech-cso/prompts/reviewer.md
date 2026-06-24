@@ -12,6 +12,9 @@ skeptical and constructive. You do not run new analyses; you judge what was prod
    - single-cell DE found a signal but **spatial context** wasn't checked
    - a target looks promising but **safety / off-target tissue expression** wasn't assessed
    - a population finding wasn't checked for **cross-ancestry coverage** (HEIM)
+   - the evidence is all structured-database / dissociated data but **recent literature, the
+     competitive/clinical landscape, or emerging safety signals** weren't checked → re-route to
+     `lit-synthesizer` (agentic Tavily web search) for current, citable context
 
 ## Propose experiments to fill the gaps
 

@@ -86,6 +86,8 @@ SOURCE_REGISTRY: dict[str, dict[str, str]] = {
     "clinpgx": {"name": "ClinPGx (PharmGKB/CPIC)", "url": "https://www.clinpgx.org/"},
     "openfda-safety": {"name": "openFDA FAERS / drug label",
                        "url": "https://open.fda.gov/"},
+    "lit-synthesizer": {"name": "Tavily Search API (recent literature / competitive / safety)",
+                        "url": "https://tavily.com/"},
     "clinical-trial-finder": {"name": "ClinicalTrials.gov API v2 (+ EUCTR)",
                               "url": "https://clinicaltrials.gov/"},
     "equity-scorer": {"name": "population genetic references (HEIM)", "url": ""},
@@ -239,14 +241,66 @@ def load_briefing(query: str, case: str, demo: bool) -> dict[str, Any]:
     }
 
 
-def _run_skill_live(skill: str) -> dict[str, Any]:
-    """Execute a routed skill through the ClawBio runtime (best-effort, no LLM).
+# In-repo leaf skills the CSO can execute directly (no external ClawBio runtime):
+# script path relative to REPO_ROOT/skills + the args that run its offline --demo.
+# Used as the first resolution for re-route/routed steps so a live run actually
+# executes (e.g. the reviewer re-routing to lit-synthesizer for current evidence).
+LOCAL_SKILLS: dict[str, tuple[str, list[str]]] = {
+    "lit-synthesizer": ("lit-synthesizer/lit_synthesizer.py", ["--demo"]),
+    "openfda-safety": ("openfda-safety/openfda_safety.py", ["--demo"]),
+    "celltype-specificity-profiler": ("celltype-specificity-profiler/profiler.py", ["--demo"]),
+}
 
-    Imports clawbio.py's run_skill (the bio-orchestrator pattern) and runs the
-    skill in its demo mode as a stand-in for a configured live run. Any failure
-    (skill not registered, needs input, no runtime) returns an honest envelope
-    rather than a fabricated result.
+
+def _run_local_skill(skill: str) -> dict[str, Any] | None:
+    """Run an in-repo leaf skill via its own CLI (offline --demo). None if unknown.
+
+    Returns the skill's JSON envelope (its landscape.json/safety.json/etc.) so the
+    CSO can fold real routed-skill output into the evidence chain without an
+    external runtime. Honest 'not executed' on any failure; never fabricates.
     """
+    entry = LOCAL_SKILLS.get(skill)
+    if entry is None:
+        return None
+    import subprocess
+    import tempfile
+
+    rel, demo_args = entry
+    script = REPO_ROOT / "skills" / rel
+    if not script.exists():
+        return {"status": "not executed", "reason": f"{skill}: script not found at {script}."}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            proc = subprocess.run(
+                [sys.executable, str(script), *demo_args, "--output", td],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                return {"status": "not executed",
+                        "reason": f"{skill} exited {proc.returncode}: {proc.stderr.strip()[:200]}"}
+            # Fold the richest JSON artifact the skill wrote into the evidence row.
+            for name in ("landscape.json", "safety.json", "result.json", "profile.json"):
+                p = Path(td) / name
+                if p.exists():
+                    payload = json.loads(p.read_text())
+                    return {"status": "ok", "via": f"{skill} --demo", **payload}
+            return {"status": "ok", "via": f"{skill} --demo",
+                    "stdout": proc.stdout.strip()[:400]}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _run_skill_live(skill: str) -> dict[str, Any]:
+    """Execute a routed skill (best-effort, no LLM).
+
+    Resolution: an in-repo leaf skill via its own CLI first (LOCAL_SKILLS), else
+    fall back to an external clawbio.py run_skill runtime. Any failure (skill not
+    registered, needs input, no runtime) returns an honest envelope rather than a
+    fabricated result.
+    """
+    local = _run_local_skill(skill)
+    if local is not None:
+        return local
     try:
         import importlib.util
 

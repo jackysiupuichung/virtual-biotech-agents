@@ -51,6 +51,12 @@ modality_selection:
     skill: struct-predictor
     also: [omics-target-evidence-mapper, opentargets-target-factors]  # OT tractability + clinical stage
 
+literature_and_landscape:                 # <-- current-web evidence (Tavily)
+  recent_literature_and_competitive:
+    skill: lit-synthesizer
+    note: agentic Tavily web search — recent papers/preprints, competitive/clinical landscape, emerging safety; the natural reviewer re-route target for "is the evidence current?" gaps
+    reroute_target: true                  # reviewer may route_to this to fill recency/competitive/safety gaps
+
 clinical_officers:
   prior_trials_and_outcomes:
     skill: clinical-trial-finder
