@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from typing import Any, Protocol
 
 
@@ -145,6 +147,45 @@ class OpenAIRunner:
         return _extract_json(resp.choices[0].message.content or "")
 
 
+class ClaudeCLIRunner:
+    """Claude Code CLI backend — reuses local Claude Code auth, no API key.
+
+    Shells out to ``claude -p <message> --output-format json``. Useful on a
+    machine where Claude Code is installed/authenticated (e.g. the hackathon
+    laptop) so the live loop runs without exporting an API key. Not portable to
+    environments lacking the ``claude`` binary — which is why it sits behind the
+    SDK backends in ``select_runner``'s auto order.
+    """
+
+    DEFAULT_MODEL = "sonnet"
+
+    def __init__(self, model: str | None = None, *, bin_path: str | None = None) -> None:
+        self.name = "claude-cli"
+        self.model = model or os.environ.get("VBIO_MODEL") or self.DEFAULT_MODEL
+        self._bin = bin_path or shutil.which("claude")
+        if not self._bin:
+            raise NoBackendError("claude CLI not found on PATH")
+
+    def run(self, prompt: str, context: str, schema: dict[str, Any]) -> dict[str, Any]:
+        message = f"{SYSTEM}\n\n{_compose(prompt, context, schema)}"
+        proc = subprocess.run(
+            [self._bin, "-p", message, "--output-format", "json", "--model", self.model],
+            capture_output=True, text=True, timeout=180,
+        )
+        if proc.returncode != 0:
+            raise AgentError(f"claude CLI exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+        # --output-format json wraps the reply in an envelope: {"result": "...", ...}.
+        # Fall back to the raw stdout if the envelope shape is unexpected.
+        text = proc.stdout
+        try:
+            envelope = json.loads(proc.stdout)
+            if isinstance(envelope, dict) and "result" in envelope:
+                text = envelope["result"]
+        except json.JSONDecodeError:
+            pass
+        return _extract_json(text)
+
+
 class StubRunner:
     """No backend configured — every call raises so the harness stubs the role."""
 
@@ -161,9 +202,10 @@ class StubRunner:
 def select_runner(backend: str = "auto", model: str | None = None) -> Runner:
     """Choose a runner by explicit ``backend`` or by which API key is present.
 
-    Order for ``auto``: Anthropic, then OpenAI, then a no-op StubRunner. The
-    StubRunner is always returned (never None) so callers have a uniform object;
-    it raises NoBackendError on use.
+    Order for ``auto``: Anthropic key, then OpenAI key, then the Claude Code CLI
+    (reuses local auth, no key), then a no-op StubRunner. The StubRunner is
+    always returned (never None) so callers have a uniform object; it raises
+    NoBackendError on use.
     """
     backend = (backend or "auto").lower()
     has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -173,13 +215,17 @@ def select_runner(backend: str = "auto", model: str | None = None) -> Runner:
         return AnthropicRunner(model)
     if backend == "openai":
         return OpenAIRunner(model)
+    if backend == "claude-cli":
+        return ClaudeCLIRunner(model)
     if backend not in ("auto",):
-        raise ValueError(f"unknown backend {backend!r} (use auto|anthropic|openai)")
+        raise ValueError(f"unknown backend {backend!r} (use auto|anthropic|openai|claude-cli)")
 
     if has_anthropic:
         return AnthropicRunner(model)
     if has_openai:
         return OpenAIRunner(model)
+    if shutil.which("claude"):
+        return ClaudeCLIRunner(model)
     return StubRunner()
 
 

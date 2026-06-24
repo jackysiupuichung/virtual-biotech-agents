@@ -241,8 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
         "(Chief of Staff · division scientists · Scientific Reviewer · CSO synthesis).")
     p.add_argument("--query", type=str, default=cso.DEFAULT_QUERY,
                    help=f"Target-assessment query (default: {cso.DEFAULT_QUERY!r})")
-    p.add_argument("--backend", choices=["auto", "anthropic", "openai"], default="auto",
-                   help="Agent backend (default: auto — first available API key)")
+    p.add_argument("--backend", choices=["auto", "anthropic", "openai", "claude-cli"],
+                   default="auto",
+                   help="Agent backend (default: auto — Anthropic/OpenAI key, else claude CLI)")
     p.add_argument("--model", type=str, default=None, help="Override the model id")
     p.add_argument("--demo", action="store_true",
                    help="Use cached fixtures for routed DATA steps; roles still run live")

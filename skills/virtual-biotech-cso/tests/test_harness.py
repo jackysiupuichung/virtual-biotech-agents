@@ -122,10 +122,49 @@ def test_extract_json_handles_fences_and_prose():
         runners._extract_json("no json here")
 
 
-def test_select_runner_no_keys_returns_stub(monkeypatch):
+def test_select_runner_no_keys_no_cli_returns_stub(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(runners.shutil, "which", lambda _: None)
     r = runners.select_runner("auto")
     assert isinstance(r, runners.StubRunner)
     with pytest.raises(runners.NoBackendError):
         r.run("p", "c", {})
+
+
+# --------------------------- Claude CLI backend --------------------------- #
+def test_auto_selects_cli_when_no_key_but_binary(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(runners.shutil, "which", lambda _: "/usr/local/bin/claude")
+    r = runners.select_runner("auto")
+    assert isinstance(r, runners.ClaudeCLIRunner)
+
+
+def test_cli_runner_parses_output_envelope(monkeypatch):
+    class Proc:
+        returncode = 0
+        stdout = json.dumps({"result": '```json\n{"verdict": "synthesize"}\n```'})
+        stderr = ""
+
+    monkeypatch.setattr(runners.subprocess, "run", lambda *a, **k: Proc())
+    r = runners.ClaudeCLIRunner(bin_path="/usr/local/bin/claude")
+    assert r.run("Scientific Reviewer", "ctx", {}) == {"verdict": "synthesize"}
+
+
+def test_cli_runner_raises_on_nonzero_exit(monkeypatch):
+    class Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "auth error"
+
+    monkeypatch.setattr(runners.subprocess, "run", lambda *a, **k: Proc())
+    r = runners.ClaudeCLIRunner(bin_path="/usr/local/bin/claude")
+    with pytest.raises(runners.AgentError):
+        r.run("p", "c", {})
+
+
+def test_cli_runner_missing_binary_raises_no_backend(monkeypatch):
+    monkeypatch.setattr(runners.shutil, "which", lambda _: None)
+    with pytest.raises(runners.NoBackendError):
+        runners.ClaudeCLIRunner()
