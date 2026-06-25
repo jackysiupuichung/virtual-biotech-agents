@@ -57,7 +57,12 @@ class FakeRunner:
             return {"context": "ctx", "data_availability": [], "priority_questions": ["q"],
                     "feasibility_flags": []}
         if "Scientific Reviewer" in title:
-            self._reviews += 1
+            # Panel mode calls this once per lens; a pass begins at the first lens
+            # ("safety"). Count *passes*, not calls, so reroute_times is pass-based
+            # and robust to N lenses. Single-reviewer mode has no lens marker → each
+            # call is its own pass.
+            if "## Your review lens:" not in context or "lens: safety" in context:
+                self._reviews += 1
             if self._reroute_times is not None:
                 verdict = "re-route" if self._reviews <= self._reroute_times else "synthesize"
             else:
@@ -134,6 +139,29 @@ def test_live_reroute_adds_sixth_step(monkeypatch, tmp_path):
     steps = [e["step"] for e in data["evidence"]]
     assert "step_06_reroute" in steps, steps
     assert out["summary"]["reviewer_verdict"] == "re-route"
+
+
+# --------------------- reviewer panel fan-out (multi-agent) --------------- #
+def test_panel_fans_out_four_lens_agents(monkeypatch, tmp_path):
+    runner = FakeRunner("synthesize")
+    out = _run(monkeypatch, runner, tmp_path)
+    # one review pass = four lens calls (safety/genetics/specificity/clinical),
+    # each carrying its lens marker in the context.
+    lens_calls = [c for c in runner.calls if "CSO Orchestrator" in c or "Reviewer" in c]
+    reviewer_calls = [c for c in runner.calls if "Reviewer" in c]
+    assert len(reviewer_calls) == 4, runner.calls
+    # the trace records each lens as its own agent span
+    trace = (tmp_path / "trace.jsonl").read_text()
+    for lens in ("reviewer:safety", "reviewer:genetics",
+                 "reviewer:specificity", "reviewer:clinical"):
+        assert lens in trace, lens
+
+
+def test_panel_records_vote_summary_in_result(monkeypatch, tmp_path):
+    out = _run(monkeypatch, FakeRunner("re-route"), tmp_path)
+    review = json.loads(Path(out["result"]).read_text())["data"]["review"]
+    assert review["panel"]["n_lenses"] == 4
+    assert review["panel"]["reroute_votes"] == 4  # all lenses agree → re-route
 
 
 # --------------------- bounded review loop (change #2) -------------------- #

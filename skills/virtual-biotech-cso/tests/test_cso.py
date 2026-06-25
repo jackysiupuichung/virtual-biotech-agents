@@ -206,3 +206,63 @@ def test_reroute_without_routing_is_backward_compatible():
     # no routing passed → no validation → caller's choice honored (legacy demo path)
     gap = {"missing": "spatial", "route_to": "scrna-orchestrator", "why": "z"}
     assert _reroute_task(gap).skill == "scrna-orchestrator"
+
+
+# --------------------- reviewer panel aggregation (multi-agent) ----------- #
+from cso import aggregate_panel_review, REVIEWER_LENSES  # noqa: E402
+
+
+def _rev(verdict, missing=None, route_to="lit-synthesizer", scores=None):
+    return {"verdict": verdict, "scores": scores or {"relevance": 5, "evidence": 4, "thoroughness": 3},
+            "gaps": [{"missing": missing, "route_to": route_to, "why": "w"}] if missing else [],
+            "experiments": []}
+
+
+def test_panel_reroutes_when_min_votes_met():
+    lens = [("safety", _rev("re-route", "off-target")),
+            ("genetics", _rev("re-route", "weak GWAS")),
+            ("specificity", _rev("synthesize")),
+            ("clinical", _rev("synthesize"))]
+    agg = aggregate_panel_review(lens, ROUTING)  # 2 votes, min_votes=2
+    assert agg["verdict"] == "re-route"
+    assert agg["panel"]["reroute_votes"] == 2
+
+
+def test_panel_synthesizes_on_lone_dissent():
+    lens = [("safety", _rev("re-route", "off-target")),
+            ("genetics", _rev("synthesize")),
+            ("specificity", _rev("synthesize")),
+            ("clinical", _rev("synthesize"))]
+    agg = aggregate_panel_review(lens, ROUTING)  # 1 vote < 2
+    assert agg["verdict"] == "synthesize"
+
+
+def test_panel_dedupes_gaps_and_tags_lenses():
+    # two lenses raise the SAME gap → one deduped entry crediting both lenses
+    lens = [("safety", _rev("re-route", "spatial", "lit-synthesizer")),
+            ("specificity", _rev("re-route", "spatial", "lit-synthesizer"))]
+    agg = aggregate_panel_review(lens, ROUTING)
+    spatial = [g for g in agg["gaps"] if g["missing"] == "spatial"]
+    assert len(spatial) == 1
+    assert sorted(spatial[0]["lenses"]) == ["safety", "specificity"]
+
+
+def test_panel_scores_are_skeptical_min():
+    lens = [("safety", _rev("synthesize", scores={"relevance": 5, "evidence": 2, "thoroughness": 4})),
+            ("genetics", _rev("synthesize", scores={"relevance": 3, "evidence": 5, "thoroughness": 4}))]
+    agg = aggregate_panel_review(lens, ROUTING)
+    assert agg["scores"] == {"relevance": 3, "evidence": 2, "thoroughness": 4}
+
+
+def test_panel_most_corroborated_gap_first():
+    lens = [("safety", _rev("re-route", "spatial", "lit-synthesizer")),
+            ("genetics", _rev("re-route", "spatial", "lit-synthesizer")),
+            ("clinical", _rev("re-route", "trials", "clinical-trial-finder"))]
+    agg = aggregate_panel_review(lens, ROUTING)
+    # the 2-lens gap sorts ahead of the 1-lens gap → _review_loop reroutes on it first
+    assert agg["gaps"][0]["missing"] == "spatial"
+
+
+def test_four_lenses_defined():
+    keys = [lens["key"] for lens in REVIEWER_LENSES]
+    assert keys == ["safety", "genetics", "specificity", "clinical"]

@@ -28,12 +28,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import cso  # sibling module — reused, never modified
 import runners
+from tracing import TraceRecorder
 
 # --- JSON schemas per role (harvested from prompts/*.md) -------------------- #
 BRIEFING_SCHEMA = {
@@ -73,6 +75,14 @@ def _read_prompt(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _usage_of(runner: runners.Runner) -> dict[str, int]:
+    """Token usage from the runner's last call, tolerant of runners that omit it.
+
+    ``last_usage`` is an optional part of the Runner protocol — a custom or test
+    runner need not set it. Missing/empty → no tokens recorded for that span."""
+    return getattr(runner, "last_usage", None) or {}
+
+
 def _evidence_context(results: list[dict[str, Any]]) -> str:
     """Compact JSON of the routed evidence for the reviewer / synthesis agent."""
     slim = [{"step": e["step"], "division": e["division"], "skill": e["skill"],
@@ -95,26 +105,35 @@ class Trace:
 
 
 def _agent_or_stub(trace: Trace, role: str, runner: runners.Runner, prompt: Path,
-                   context: str, schema: dict[str, Any],
-                   stub: dict[str, Any]) -> tuple[dict[str, Any], str]:
+                   context: str, schema: dict[str, Any], stub: dict[str, Any],
+                   rec: TraceRecorder) -> tuple[dict[str, Any], str]:
     """Run a reasoning role live; on any failure fall back to cso's honest stub.
 
     Returns (payload, source) where source is AGENT_SOURCE or cso's DELEGATE.
+    Each call opens a ``rec`` span tagged with the backend, status (ok/stub), and
+    token usage — the degradation moments land as ``status="stub"`` spans.
     """
-    try:
-        payload = runners.run_with_retry(runner, _read_prompt(prompt), context, schema)
-        trace.step("🤖", f"{role}: live agent ({runner.name})")
-        return payload, AGENT_SOURCE
-    except runners.NoBackendError as exc:
-        trace.step("⚪", f"{role}: {exc}")
-        return stub, cso.DELEGATE
-    except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
-        trace.step("⚠️", f"{role}: agent failed ({exc}); using honest stub")
-        return stub, cso.DELEGATE
+    with rec.span(role, kind="agent", backend=runner.name, model=runner.model) as sp:
+        try:
+            payload = runners.run_with_retry(runner, _read_prompt(prompt), context, schema)
+            sp.record_usage(**_usage_of(runner)).set(source=AGENT_SOURCE)
+            trace.step("🤖", f"{role}: live agent ({runner.name})")
+            return payload, AGENT_SOURCE
+        except runners.NoBackendError as exc:
+            sp.status = "stub"
+            sp.set(source=cso.DELEGATE, degraded="no-backend", reason=str(exc))
+            trace.step("⚪", f"{role}: {exc}")
+            return stub, cso.DELEGATE
+        except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
+            sp.status = "stub"
+            sp.set(source=cso.DELEGATE, degraded="agent-failed", reason=str(exc))
+            trace.step("⚠️", f"{role}: agent failed ({exc}); using honest stub")
+            return stub, cso.DELEGATE
 
 
 def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, Any],
-          case: str, routing: dict[str, Any]) -> tuple[list[cso.Subtask], str]:
+          case: str, routing: dict[str, Any], rec: TraceRecorder
+          ) -> tuple[list[cso.Subtask], str]:
     """Ask the planning agent for a plan; validate + bind it, else fall back.
 
     This is change #1 from docs/ai-scientist-landscape-review.md: the plan becomes an
@@ -130,25 +149,73 @@ def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, 
         f"routing menu — do not invent divisions, intents, or skills:\n{menu}\n\n"
         f"depends_on entries must reference earlier steps as step_NN_<intent>."
     )
-    try:
-        payload = runners.run_with_retry(
-            runner, _read_prompt(cso.ORCHESTRATOR_PROMPT), context, PLAN_SCHEMA)
-        subtasks = cso.validate_and_bind_plan(payload.get("subtasks", []), routing)
-        trace.step("🗺️", f"planner: agent-proposed plan ({len(subtasks)} steps, validated)")
-        return subtasks, AGENT_SOURCE
-    except runners.NoBackendError:
-        subtasks = cso.decompose_and_route(query, case, routing)
-        trace.step("⚪", f"planner: no backend → deterministic plan ({len(subtasks)} steps)")
-        return subtasks, cso.DELEGATE
-    except Exception as exc:  # noqa: BLE001 — incl. PlanValidationError; degrade, never fabricate
-        subtasks = cso.decompose_and_route(query, case, routing)
-        trace.step("⚠️", f"planner: {type(exc).__name__} → deterministic plan ({exc})")
-        return subtasks, cso.DELEGATE
+    with rec.span("planner", kind="agent", backend=runner.name, model=runner.model) as sp:
+        try:
+            payload = runners.run_with_retry(
+                runner, _read_prompt(cso.ORCHESTRATOR_PROMPT), context, PLAN_SCHEMA)
+            subtasks = cso.validate_and_bind_plan(payload.get("subtasks", []), routing)
+            sp.record_usage(**_usage_of(runner)).set(
+                source=AGENT_SOURCE, n_steps=len(subtasks), validated=True)
+            trace.step("🗺️", f"planner: agent-proposed plan ({len(subtasks)} steps, validated)")
+            return subtasks, AGENT_SOURCE
+        except runners.NoBackendError:
+            subtasks = cso.decompose_and_route(query, case, routing)
+            sp.status = "stub"
+            sp.set(source=cso.DELEGATE, degraded="no-backend", n_steps=len(subtasks))
+            trace.step("⚪", f"planner: no backend → deterministic plan ({len(subtasks)} steps)")
+            return subtasks, cso.DELEGATE
+        except Exception as exc:  # noqa: BLE001 — incl. PlanValidationError; degrade, never fabricate
+            subtasks = cso.decompose_and_route(query, case, routing)
+            sp.status = "stub"
+            sp.set(source=cso.DELEGATE, degraded=type(exc).__name__,
+                   reason=str(exc), n_steps=len(subtasks))
+            trace.step("⚠️", f"planner: {type(exc).__name__} → deterministic plan ({exc})")
+            return subtasks, cso.DELEGATE
+
+
+def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, Any]],
+                  routing: dict[str, Any], rec: TraceRecorder) -> dict[str, Any]:
+    """Fan out N lens-specialised reviewers concurrently, then aggregate (panel).
+
+    Each lens is an independent agent call with the shared reviewer prompt plus its
+    own focus; they run in a thread pool (true concurrent multi-agent). A lens that
+    fails abstains honestly (synthesize, no gaps) rather than crashing the panel.
+    The deterministic cso.aggregate_panel_review folds them into one verdict the
+    loop consumes unchanged. Only invoked on a live backend (stub keeps 1 reviewer).
+    """
+    prompt = _read_prompt(cso.REVIEWER_PROMPT)
+    evidence = _evidence_context(results)
+
+    def _one(lens: dict[str, str]) -> tuple[str, dict[str, Any]]:
+        ctx = f"## Your review lens: {lens['key']}\nFocus on: {lens['focus']}\n\n{evidence}"
+        with rec.span(f"reviewer:{lens['key']}", kind="agent",
+                      backend=runner.name, model=runner.model) as sp:
+            try:
+                payload = runners.run_with_retry(runner, prompt, ctx, REVIEW_SCHEMA)
+                sp.record_usage(**_usage_of(runner)).set(source=AGENT_SOURCE,
+                                                         verdict=payload.get("verdict"))
+                return lens["key"], payload
+            except Exception as exc:  # noqa: BLE001 — a lens abstains, never fabricates
+                sp.status = "stub"
+                sp.set(degraded="lens-failed", reason=str(exc))
+                return lens["key"], {"verdict": "synthesize", "scores": {}, "gaps": [],
+                                     "experiments": []}
+
+    with rec.span("review_panel", kind="loop", n_lenses=len(cso.REVIEWER_LENSES)) as panel_sp:
+        with ThreadPoolExecutor(max_workers=len(cso.REVIEWER_LENSES)) as pool:
+            lens_reviews = list(pool.map(_one, cso.REVIEWER_LENSES))
+        review = cso.aggregate_panel_review(lens_reviews, routing)
+        panel = review["panel"]
+        panel_sp.set(verdict=review["verdict"], reroute_votes=panel["reroute_votes"])
+    review["source"] = AGENT_SOURCE
+    trace.step("👥", f"reviewer panel: {panel['reroute_votes']}/{panel['n_lenses']} lenses "
+               f"flag re-route → verdict {review['verdict']}")
+    return review
 
 
 def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                  routing: dict[str, Any], results: list[dict[str, Any]],
-                 demo: bool, live: bool) -> dict[str, Any]:
+                 demo: bool, live: bool, rec: TraceRecorder) -> dict[str, Any]:
     """Run reviewer→reroute until `synthesize` or MAX_REROUTES (changes #2 + #3).
 
     Each iteration re-runs the reviewer over the *current* evidence (so a re-route's
@@ -157,34 +224,44 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
     numbered step id so successive re-routes don't collide. Returns the *last*
     reviewer payload (the one the synthesis sees), with its source tag set.
     """
+    panel_capable = runner.name != "stub"  # a live backend → fan out the reviewer panel
     review: dict[str, Any] = {}
-    for i in range(MAX_REROUTES + 1):  # initial review + up to MAX_REROUTES follow-ups
-        review, review_src = _agent_or_stub(
-            trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
-            _evidence_context(results), REVIEW_SCHEMA,
-            stub=cso.load_review(query, case, results, demo=False))
-        review.setdefault("source", review_src)
+    with rec.span("review_loop", kind="loop", mode="panel" if panel_capable else "single"
+                  ) as loop_sp:
+        for i in range(MAX_REROUTES + 1):  # initial review + up to MAX_REROUTES follow-ups
+            if panel_capable:
+                review = _review_panel(trace, runner, results, routing, rec)
+                review_src = AGENT_SOURCE
+            else:
+                review, review_src = _agent_or_stub(
+                    trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
+                    _evidence_context(results), REVIEW_SCHEMA,
+                    stub=cso.load_review(query, case, results, demo=False), rec=rec)
+            review.setdefault("source", review_src)
 
-        if review.get("verdict") != "re-route":
-            trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
-            break
-        if i == MAX_REROUTES:
-            trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
-                       "synthesizing with residual gaps")
-            break
+            if review.get("verdict") != "re-route":
+                trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
+                break
+            if i == MAX_REROUTES:
+                trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
+                           "synthesizing with residual gaps")
+                break
 
-        gap = (review.get("gaps") or [{}])[0]
-        followup = cso._reroute_task(gap, routing, step_n=6 + i)
-        trace.step("🔁", f"reroute {i + 1}/{MAX_REROUTES} → {followup.skill} "
-                   f"({gap.get('missing', 'gap')})")
-        results.append(cso.execute_skill(followup, case, demo, live))
+            gap = (review.get("gaps") or [{}])[0]
+            followup = cso._reroute_task(gap, routing, step_n=6 + i)
+            trace.step("🔁", f"reroute {i + 1}/{MAX_REROUTES} → {followup.skill} "
+                       f"({gap.get('missing', 'gap')})")
+            with rec.span(f"reroute:{followup.skill}", kind="tool", iteration=i + 1,
+                          missing=gap.get("missing")):
+                results.append(cso.execute_skill(followup, case, demo, live))
 
-        # A cached/stub reviewer can't re-evaluate the new evidence — its verdict is
-        # fixed, so looping would just append duplicate re-routes. Only a *live*
-        # reviewer genuinely re-reviews; honor exactly one re-route otherwise.
-        if review_src != AGENT_SOURCE:
-            trace.step("✅", "reviewer (cached/stub) → one re-route, then synthesize")
-            break
+            # A cached/stub reviewer can't re-evaluate the new evidence — its verdict is
+            # fixed, so looping would just append duplicate re-routes. Only a *live*
+            # reviewer genuinely re-reviews; honor exactly one re-route otherwise.
+            if review_src != AGENT_SOURCE:
+                trace.step("✅", "reviewer (cached/stub) → one re-route, then synthesize")
+                break
+        loop_sp.set(verdict=review.get("verdict", "synthesize"))
     return review
 
 
@@ -194,26 +271,28 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     routing = cso.load_routing()
     runner = runners.select_runner(backend, model)
     trace = Trace(runner.name, runner.model)
+    rec = TraceRecorder(out_dir, run_name=case, backend=runner.name, model=runner.model)
 
     # 1 — BRIEF (live agent role) ------------------------------------------- #
     briefing, brief_src = _agent_or_stub(
         trace, "chief_of_staff", runner, cso.CHIEF_OF_STAFF_PROMPT,
         f"User query: {query}", BRIEFING_SCHEMA,
-        stub=cso.load_briefing(query, case, demo=False))
+        stub=cso.load_briefing(query, case, demo=False), rec=rec)
     briefing.setdefault("source", brief_src)
 
     # 2 — PLAN (live agent role; validated against routing.yaml, else deterministic) #
-    subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing)
+    subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing, rec)
     trace.step("🧭", f"plan → {len(subtasks)} routed sub-tasks ({plan_src})")
 
     # 3 — EXECUTE DIVISIONS (deterministic data layer; concurrent where free) #
-    results = _execute_concurrent(subtasks, case, demo, live, trace)
+    with rec.span("execute", kind="tool", n_subtasks=len(subtasks)):
+        results = _execute_concurrent(subtasks, case, demo, live, trace, rec)
 
     # 4 — REVIEW → RE-ROUTE loop (change #2: bounded; verdict drives control flow) #
     #     The reviewer re-runs after each re-route until it returns `synthesize` or
     #     MAX_REROUTES is hit. Each re-route target is the reviewer's *chosen* skill,
     #     validated against the catalog (change #3) before execution.
-    review = _review_loop(trace, runner, query, case, routing, results, demo, live)
+    review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec)
 
     # 5 — SYNTHESIZE (live agent role) -------------------------------------- #
     syn_context = (
@@ -224,7 +303,7 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     synthesis: dict[str, Any] | None
     synthesis, _ = _agent_or_stub(
         trace, "cso_synthesis", runner, cso.ORCHESTRATOR_PROMPT,
-        syn_context, SYNTHESIS_SCHEMA, stub={})
+        syn_context, SYNTHESIS_SCHEMA, stub={}, rec=rec)
     if not synthesis:  # stub path returns {} → let the report show "pending"
         synthesis = None
 
@@ -239,13 +318,29 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     result_path = cso._write_result_json(out_dir, summary, data)
     cso._write_reproducibility(out_dir / "reproducibility", argv, [report_path, result_path])
 
+    # Finalise the execution trace (span tree + timing + token totals).
+    trace_path = rec.close(query=query, decision=summary.get("decision"),
+                           reviewer_verdict=summary.get("reviewer_verdict"),
+                           calls_llm=summary.get("calls_llm"))
+    if trace_path is not None:
+        tok = rec.totals.get("total_tokens", 0)
+        trace.step("🧾", f"trace: {tok} tokens across spans → {trace_path.name}")
+    summary["trace_tokens"] = rec.totals.get("total_tokens", 0)
+
     trace.done(str(report_path))
-    return {"report": str(report_path), "result": str(result_path), "summary": summary}
+    return {"report": str(report_path), "result": str(result_path),
+            "trace": str(trace_path) if trace_path else None, "summary": summary}
 
 
 def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live: bool,
-                        trace: Trace) -> list[dict[str, Any]]:
-    """Run routed steps respecting depends_on; independent ones run in parallel."""
+                        trace: Trace, rec: TraceRecorder) -> list[dict[str, Any]]:
+    """Run routed steps respecting depends_on; independent ones run in parallel.
+
+    Each routed step is wrapped in a ``rec`` span so per-skill latency shows up in
+    the trace. Spans are opened sequentially after the concurrent batch resolves
+    (the recorder's stack is not thread-safe by design — agent reasoning is the
+    interesting timing; the deterministic data layer's wall-clock is captured by
+    the enclosing ``execute`` span)."""
     done: dict[str, dict[str, Any]] = {}
     remaining = list(subtasks)
     while remaining:
@@ -253,9 +348,24 @@ def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live
         if not ready:  # safety: break dependency deadlock by running the rest
             ready = remaining
         with ThreadPoolExecutor(max_workers=max(1, len(ready))) as pool:
-            for task, env in zip(ready, pool.map(
-                    lambda t: cso.execute_skill(t, case, demo, live), ready)):
+            timed: dict[str, float] = {}
+
+            def _run_step(t: cso.Subtask) -> dict[str, Any]:
+                t0 = time.perf_counter()
+                env = cso.execute_skill(t, case, demo, live)
+                timed[t.step] = (time.perf_counter() - t0) * 1000.0
+                return env
+
+            for task, env in zip(ready, pool.map(_run_step, ready)):
                 done[task.step] = env
+                # Record a span per step (sequentially, post-join) for the trace. The
+                # step ran concurrently, so its true latency is carried as an attr
+                # (the span's own wall-clock here is just the bookkeeping cost).
+                with rec.span(f"step:{task.division}/{task.skill}", kind="tool",
+                              step=task.step, intent=getattr(task, "intent", None),
+                              source=env.get("source"),
+                              exec_ms=round(timed.get(task.step, 0.0), 2)):
+                    pass
         trace.step("🔬", f"executed {len(ready)} division step(s): "
                    + ", ".join(t.division for t in ready))
         remaining = [t for t in remaining if t.step not in done]

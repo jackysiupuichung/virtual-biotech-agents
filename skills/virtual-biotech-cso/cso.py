@@ -298,6 +298,84 @@ def _reroute_task(gap: dict[str, Any], routing: dict[str, Any] | None = None,
     )
 
 
+# --------------------------------------------------------------------------- #
+# Reviewer panel — N lens-specialised reviewers, deterministically aggregated
+# --------------------------------------------------------------------------- #
+# Each lens is an independent skeptic with a distinct focus. The harness fans
+# these out concurrently (one agent call each) and aggregate_panel_review folds
+# their verdicts into the single review payload _review_loop already consumes.
+REVIEWER_LENSES = [
+    {"key": "safety",
+     "focus": "off-target / broad-tissue expression and adverse-event risk. Flag any target "
+              "advanced without a safety read; a broad-expression target is a liability."},
+    {"key": "genetics",
+     "focus": "strength of germline/somatic support. Flag over-reach — correlational ORs or "
+              "weak associations stated as causal. Absent GWAS is non-disqualifying for IO."},
+    {"key": "specificity",
+     "focus": "cell-type and malignant-cell localization. For ADC/CAR-T, flag specificity that "
+              "is stromal rather than tumour-cell; that materially changes the conclusion."},
+    {"key": "clinical",
+     "focus": "trial precedent and translatability. Flag a recommendation with no clinical or "
+              "competitive-landscape context, or stale evidence needing a literature check."},
+]
+
+PANEL_REROUTE_MIN_VOTES = 2  # re-route when >= this many lenses flag a gap
+
+
+def _axis_min(reviews: list[dict[str, Any]], axis: str) -> int | None:
+    """Skeptical score aggregation: the weakest lens sets the panel score per axis."""
+    vals = [r.get("scores", {}).get(axis) for r in reviews]
+    nums = [v for v in vals if isinstance(v, (int, float))]
+    return int(min(nums)) if nums else None
+
+
+def aggregate_panel_review(lens_reviews: list[tuple[str, dict[str, Any]]],
+                           routing: dict[str, Any] | None = None,
+                           min_votes: int = PANEL_REROUTE_MIN_VOTES) -> dict[str, Any]:
+    """Fold N lens verdicts into one review payload (deterministic, testable).
+
+    - verdict: ``re-route`` iff >= ``min_votes`` lenses returned ``re-route``; the
+      panel is skeptical but not hair-trigger (one lone dissent doesn't reroute).
+    - gaps: union across lenses, deduped by (route_to, missing); each tagged with the
+      lenses that raised it. If ``routing`` is given, a gap whose ``route_to`` isn't in
+      the catalog is kept but its target will be validated downstream by _reroute_task.
+    - scores: min per axis across lenses (weakest link).
+    - experiments: union across lenses.
+    The ``lens`` provenance on each gap is what makes "survived N skeptics" auditable.
+    """
+    reviews = [r for _, r in lens_reviews]
+    votes = sum(1 for r in reviews if r.get("verdict") == "re-route")
+    verdict = "re-route" if votes >= min_votes else "synthesize"
+
+    seen: dict[tuple, dict[str, Any]] = {}
+    for key, r in lens_reviews:
+        for gap in r.get("gaps", []) or []:
+            if not isinstance(gap, dict):
+                continue
+            sig = (gap.get("route_to"), gap.get("missing"))
+            if sig in seen:
+                seen[sig].setdefault("lenses", []).append(key)
+            else:
+                g = dict(gap)
+                g["lenses"] = [key]
+                seen[sig] = g
+    gaps = list(seen.values())
+    # Surface the most-corroborated gap first so _review_loop reroutes on it.
+    gaps.sort(key=lambda g: len(g.get("lenses", [])), reverse=True)
+
+    experiments = [e for _, r in lens_reviews for e in (r.get("experiments", []) or [])]
+    return {
+        "verdict": verdict,
+        "scores": {axis: _axis_min(reviews, axis)
+                   for axis in ("relevance", "evidence", "thoroughness")},
+        "gaps": gaps,
+        "experiments": experiments,
+        "panel": {"n_lenses": len(lens_reviews), "reroute_votes": votes,
+                  "min_votes": min_votes,
+                  "lenses": [k for k, _ in lens_reviews]},
+    }
+
+
 def _agent_task(role: str, prompt_path: Path, context: str) -> dict[str, Any]:
     """Describe a reasoning step delegated to the driving agent.
 

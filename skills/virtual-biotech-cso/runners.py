@@ -94,6 +94,10 @@ SYSTEM = (
 class Runner(Protocol):
     name: str
     model: str
+    # Token usage from the most recent ``run`` call, for the trace recorder:
+    # {"input_tokens": int, "output_tokens": int}. Empty when the backend does
+    # not report usage (OpenAI without usage, the CLI envelope, or the stub).
+    last_usage: dict[str, int]
 
     def run(self, prompt: str, context: str, schema: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -108,6 +112,7 @@ class AnthropicRunner:
 
         self.name = "anthropic"
         self.model = model or os.environ.get("VBIO_MODEL") or self.DEFAULT_MODEL
+        self.last_usage: dict[str, int] = {}
         self._client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
 
     def run(self, prompt: str, context: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +122,11 @@ class AnthropicRunner:
             system=SYSTEM,
             messages=[{"role": "user", "content": _compose(prompt, context, schema)}],
         )
+        usage = getattr(msg, "usage", None)
+        self.last_usage = {
+            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        } if usage else {}
         text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
         return _extract_json(text)
 
@@ -131,6 +141,7 @@ class OpenAIRunner:
 
         self.name = "openai"
         self.model = model or os.environ.get("VBIO_MODEL") or self.DEFAULT_MODEL
+        self.last_usage: dict[str, int] = {}
         # base_url honours OPENAI_BASE_URL for OpenAI-compatible gateways.
         base_url = os.environ.get("OPENAI_BASE_URL")
         self._client = OpenAI(base_url=base_url) if base_url else OpenAI()
@@ -144,6 +155,11 @@ class OpenAIRunner:
                 {"role": "user", "content": _compose(prompt, context, schema)},
             ],
         )
+        usage = getattr(resp, "usage", None)
+        self.last_usage = {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        } if usage else {}
         return _extract_json(resp.choices[0].message.content or "")
 
 
@@ -162,6 +178,7 @@ class ClaudeCLIRunner:
     def __init__(self, model: str | None = None, *, bin_path: str | None = None) -> None:
         self.name = "claude-cli"
         self.model = model or os.environ.get("VBIO_MODEL") or self.DEFAULT_MODEL
+        self.last_usage: dict[str, int] = {}
         self._bin = bin_path or shutil.which("claude")
         if not self._bin:
             raise NoBackendError("claude CLI not found on PATH")
@@ -177,10 +194,18 @@ class ClaudeCLIRunner:
         # --output-format json wraps the reply in an envelope: {"result": "...", ...}.
         # Fall back to the raw stdout if the envelope shape is unexpected.
         text = proc.stdout
+        self.last_usage = {}
         try:
             envelope = json.loads(proc.stdout)
             if isinstance(envelope, dict) and "result" in envelope:
                 text = envelope["result"]
+            # The CLI json envelope reports usage under "usage" (Anthropic shape).
+            usage = envelope.get("usage") if isinstance(envelope, dict) else None
+            if isinstance(usage, dict):
+                self.last_usage = {
+                    "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                    "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                }
         except json.JSONDecodeError:
             pass
         return _extract_json(text)
@@ -191,6 +216,7 @@ class StubRunner:
 
     name = "stub"
     model = "none"
+    last_usage: dict[str, int] = {}
 
     def run(self, prompt: str, context: str, schema: dict[str, Any]) -> dict[str, Any]:
         raise NoBackendError(
