@@ -182,6 +182,79 @@ def decompose_and_route(query: str, case: str, routing: dict[str, Any]) -> list[
     ]
 
 
+class PlanValidationError(ValueError):
+    """An agent-proposed plan referenced a division/intent/dep that doesn't exist."""
+
+
+def _routable_intents(routing: dict[str, Any]) -> dict[str, set[str]]:
+    """Map each division → the set of intents it can route (from routing.yaml)."""
+    return {
+        division: {intent for intent, entry in intents.items() if isinstance(entry, dict)}
+        for division, intents in routing.items()
+        if isinstance(intents, dict)
+    }
+
+
+def validate_and_bind_plan(
+    proposed: list[dict[str, Any]], routing: dict[str, Any]
+) -> list[Subtask]:
+    """Validate an *agent-proposed* plan and bind each step to a real skill.
+
+    This is the inverse of ``decompose_and_route``: rather than generating the plan
+    deterministically, the driving agent (Chief of Staff / CSO role) proposes it and
+    this function keeps it honest — it is a **validator, not a generator**. It
+
+      * rejects divisions / intents that don't exist in ``routing.yaml`` (no invented
+        skills — the same no-fabrication contract the deterministic path enforces),
+      * resolves each ``(division, intent)`` to its real skill via ``_skill_for``,
+      * assigns stable ``step_NN_<intent>`` ids,
+      * validates that every ``depends_on`` names an earlier step in the plan.
+
+    A proposed step is a dict: ``{division, intent, question, depends_on?}``. Raises
+    :class:`PlanValidationError` on any unroutable reference so the harness can fall
+    back to the deterministic plan rather than execute something fabricated.
+    """
+    if not isinstance(proposed, list) or not proposed:
+        raise PlanValidationError("proposed plan is empty or not a list")
+
+    routable = _routable_intents(routing)
+    subtasks: list[Subtask] = []
+    seen_steps: set[str] = set()
+    for i, entry in enumerate(proposed, 1):
+        if not isinstance(entry, dict):
+            raise PlanValidationError(f"plan step {i} is not an object")
+        division = entry.get("division")
+        intent = entry.get("intent")
+        if division not in routable:
+            raise PlanValidationError(
+                f"plan step {i}: unknown division {division!r} "
+                f"(valid: {sorted(routable)})")
+        if intent not in routable[division]:
+            raise PlanValidationError(
+                f"plan step {i}: intent {intent!r} not routable under {division!r} "
+                f"(valid: {sorted(routable[division])})")
+
+        skill = _skill_for(routing, division, intent)
+        if skill == "unrouted-skill":
+            raise PlanValidationError(
+                f"plan step {i}: {division}/{intent} resolved to no skill")
+
+        step = f"step_{i:02d}_{intent}"
+        deps = entry.get("depends_on") or []
+        if not isinstance(deps, list):
+            raise PlanValidationError(f"plan step {i}: depends_on must be a list")
+        for dep in deps:
+            if dep not in seen_steps:
+                raise PlanValidationError(
+                    f"plan step {i}: depends_on {dep!r} is not an earlier step")
+
+        question = entry.get("question") or f"{division}/{intent} for the target"
+        subtasks.append(Subtask(step=step, division=division, question=str(question),
+                                skill=skill, depends_on=list(deps)))
+        seen_steps.add(step)
+    return subtasks
+
+
 def _reroute_task(gap: dict[str, Any]) -> Subtask:
     """Build a follow-up Subtask from a reviewer gap."""
     return Subtask(

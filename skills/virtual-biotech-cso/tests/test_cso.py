@@ -8,10 +8,14 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_DIR))
 
+import pytest  # noqa: E402
+
 from cso import (  # noqa: E402
+    PlanValidationError,
     case_key,
     decompose_and_route,
     load_routing,
+    validate_and_bind_plan,
     _reroute_task,
     _result_digest,
 )
@@ -127,3 +131,47 @@ def test_default_mode_is_honest_without_backends(tmp_path):
     report = (out / "report.md").read_text()
     assert "not executed" in report
     assert "no data-derived recommendation" in report
+
+
+# --------------------- validate_and_bind_plan (change #1) ----------------- #
+ROUTING = load_routing()
+
+
+def test_validate_binds_proposed_plan_to_real_skills():
+    plan = [
+        {"division": "target_id_and_prioritization",
+         "intent": "germline_genetic_support", "question": "germline?"},
+        {"division": "target_id_and_prioritization",
+         "intent": "cell_type_specificity", "question": "specific?",
+         "depends_on": ["step_01_germline_genetic_support"]},
+    ]
+    subtasks = validate_and_bind_plan(plan, ROUTING)
+    assert [s.step for s in subtasks] == [
+        "step_01_germline_genetic_support", "step_02_cell_type_specificity"]
+    assert subtasks[0].skill == "gwas-lookup"
+    assert subtasks[1].skill == "celltype-specificity-profiler"
+    assert subtasks[1].depends_on == ["step_01_germline_genetic_support"]
+
+
+def test_validate_rejects_unknown_division():
+    with pytest.raises(PlanValidationError, match="unknown division"):
+        validate_and_bind_plan([{"division": "nope", "intent": "x"}], ROUTING)
+
+
+def test_validate_rejects_unroutable_intent():
+    with pytest.raises(PlanValidationError, match="not routable"):
+        validate_and_bind_plan(
+            [{"division": "clinical_officers", "intent": "made_up"}], ROUTING)
+
+
+def test_validate_rejects_forward_dependency():
+    with pytest.raises(PlanValidationError, match="earlier step"):
+        validate_and_bind_plan([
+            {"division": "clinical_officers", "intent": "prior_trials_and_outcomes",
+             "depends_on": ["step_99_future"]},
+        ], ROUTING)
+
+
+def test_validate_rejects_empty_plan():
+    with pytest.raises(PlanValidationError, match="empty"):
+        validate_and_bind_plan([], ROUTING)

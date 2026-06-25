@@ -49,6 +49,11 @@ REVIEW_SCHEMA = {
     "experiments": [{"missing": "string", "proposed_experiment": "string",
                      "route_to": "skill-name", "expected_readout": "string", "why": "string"}],
 }
+PLAN_SCHEMA = {
+    "subtasks": [{"division": "string (a routing.yaml division)",
+                  "intent": "string (an intent under that division)",
+                  "question": "string", "depends_on": ["step_NN_intent"]}],
+}
 SYNTHESIS_SCHEMA = {
     "decision": "GO|CONDITIONAL_GO|REVIEW|NO_GO",
     "confidence": "high|medium|low",
@@ -107,6 +112,39 @@ def _agent_or_stub(trace: Trace, role: str, runner: runners.Runner, prompt: Path
         return stub, cso.DELEGATE
 
 
+def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, Any],
+          case: str, routing: dict[str, Any]) -> tuple[list[cso.Subtask], str]:
+    """Ask the planning agent for a plan; validate + bind it, else fall back.
+
+    This is change #1 from docs/ai-scientist-landscape-review.md: the plan becomes an
+    *agent output* validated against routing.yaml, not a deterministic lookup. The
+    agent may only reference real (division, intent) pairs — anything invented, or any
+    backend failure, degrades to cso.decompose_and_route (the honest deterministic plan).
+    """
+    catalog = cso._routable_intents(routing)
+    menu = "\n".join(f"- {div}: {', '.join(sorted(ix))}" for div, ix in catalog.items())
+    context = (
+        f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
+        f"Propose a plan. Each subtask must use one (division, intent) pair from this "
+        f"routing menu — do not invent divisions, intents, or skills:\n{menu}\n\n"
+        f"depends_on entries must reference earlier steps as step_NN_<intent>."
+    )
+    try:
+        payload = runners.run_with_retry(
+            runner, _read_prompt(cso.ORCHESTRATOR_PROMPT), context, PLAN_SCHEMA)
+        subtasks = cso.validate_and_bind_plan(payload.get("subtasks", []), routing)
+        trace.step("🗺️", f"planner: agent-proposed plan ({len(subtasks)} steps, validated)")
+        return subtasks, AGENT_SOURCE
+    except runners.NoBackendError:
+        subtasks = cso.decompose_and_route(query, case, routing)
+        trace.step("⚪", f"planner: no backend → deterministic plan ({len(subtasks)} steps)")
+        return subtasks, cso.DELEGATE
+    except Exception as exc:  # noqa: BLE001 — incl. PlanValidationError; degrade, never fabricate
+        subtasks = cso.decompose_and_route(query, case, routing)
+        trace.step("⚠️", f"planner: {type(exc).__name__} → deterministic plan ({exc})")
+        return subtasks, cso.DELEGATE
+
+
 def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         demo: bool, live: bool, argv: list[str]) -> dict[str, Any]:
     case = cso.case_key(query)
@@ -121,9 +159,9 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         stub=cso.load_briefing(query, case, demo=False))
     briefing.setdefault("source", brief_src)
 
-    # 2 — DECOMPOSE & ROUTE (deterministic, reused) ------------------------- #
-    subtasks = cso.decompose_and_route(query, case, routing)
-    trace.step("🧭", f"decomposed → {len(subtasks)} routed sub-tasks")
+    # 2 — PLAN (live agent role; validated against routing.yaml, else deterministic) #
+    subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing)
+    trace.step("🧭", f"plan → {len(subtasks)} routed sub-tasks ({plan_src})")
 
     # 3 — EXECUTE DIVISIONS (deterministic data layer; concurrent where free) #
     results = _execute_concurrent(subtasks, case, demo, live, trace)

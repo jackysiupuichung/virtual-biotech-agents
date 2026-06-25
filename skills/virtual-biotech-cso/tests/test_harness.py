@@ -36,6 +36,17 @@ class FakeRunner:
         # "Scientific Reviewer" in its body).
         title = prompt.splitlines()[0]
         self.calls.append(title)
+        # The planner reuses the Orchestrator prompt but is the only call whose
+        # schema asks for `subtasks` — dispatch on that before the synthesis branch.
+        if "subtasks" in schema:
+            return {"subtasks": [
+                {"division": "target_id_and_prioritization",
+                 "intent": "germline_genetic_support", "question": "germline?",
+                 "depends_on": []},
+                {"division": "clinical_officers",
+                 "intent": "prior_trials_and_outcomes", "question": "prior trials?",
+                 "depends_on": []},
+            ]}
         if "Chief of Staff" in title:
             return {"context": "ctx", "data_availability": [], "priority_questions": ["q"],
                     "feasibility_flags": []}
@@ -70,6 +81,39 @@ def test_live_loop_writes_contract_and_marks_llm(monkeypatch, tmp_path):
     assert summary["decision"] == "CONDITIONAL_GO"
     # synthesis recommendation reached the rendered report
     assert "rec [step_03]" in Path(out["report"]).read_text()
+
+
+# --------------------- agent-proposed plan (change #1) -------------------- #
+def test_agent_proposed_plan_is_validated_and_used(monkeypatch, tmp_path):
+    runner = FakeRunner("synthesize")
+    out = _run(monkeypatch, runner, tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    steps = [e["step"] for e in data["evidence"]]
+    # The agent's 2-step plan (not the deterministic 5-step) was bound + executed.
+    assert steps[:2] == ["step_01_germline_genetic_support",
+                         "step_02_prior_trials_and_outcomes"], steps
+    # plan bound to real skills from routing.yaml
+    skills = {e["step"]: e["skill"] for e in data["evidence"]}
+    assert skills["step_01_germline_genetic_support"] == "gwas-lookup"
+    assert skills["step_02_prior_trials_and_outcomes"] == "clinical-trial-finder"
+
+
+class BadPlanRunner(FakeRunner):
+    """Proposes an invented division → harness must fall back to deterministic plan."""
+
+    def run(self, prompt, context, schema):
+        if "subtasks" in schema:
+            return {"subtasks": [{"division": "made_up_division", "intent": "x"}]}
+        return super().run(prompt, context, schema)
+
+
+def test_invalid_plan_falls_back_to_deterministic(monkeypatch, tmp_path):
+    out = _run(monkeypatch, BadPlanRunner("synthesize"), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    steps = [e["step"] for e in data["evidence"]]
+    # deterministic 5-step plan, not the invented one
+    assert steps[0] == "step_01_gwas", steps
+    assert len(steps) >= 5
 
 
 # --------------------- reviewer verdict drives control flow --------------- #
