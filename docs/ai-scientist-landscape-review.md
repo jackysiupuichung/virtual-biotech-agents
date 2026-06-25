@@ -73,7 +73,8 @@ research-autonomy framing. The dimensions that actually move a system up the lad
 | | **Plan** | **Tool selection** | **Iteration** | **Hypotheses** | **Memory across runs** |
 |---|---|---|---|---|---|
 | Fixed pipeline | hardcoded | hardcoded | none | none | no |
-| **virtual-biotech-cso (today)** | **deterministic** (`routing.yaml` by case-key) | **deterministic** | **1 reviewer re-route** | reviewer/CSO *interpret*, don't generate | no |
+| virtual-biotech-cso (before #1–#3) | deterministic (`routing.yaml` by case-key) | deterministic | 1 reviewer re-route | reviewer/CSO *interpret*, don't generate | no |
+| **virtual-biotech-cso (now)** | **agent-proposed, validated** | **agent-chosen, catalog-validated** | **bounded loop (≤`MAX_REROUTES`)** | reviewer/CSO interpret, don't generate | **no — by design** (§5 #4) |
 | TxAgent | emergent (trained) | learned (ToolRAG) | unbounded within a query | answers, doesn't form | no (frozen after training) |
 | Co-Scientist / Sakana | emergent | emergent | unbounded (tournament / tree search) | **generates & ranks** | within a run |
 | Kosmos / Coscientist | emergent | emergent | unbounded + wet-lab | generates & tests | **accumulates** |
@@ -85,16 +86,22 @@ research-autonomy framing. The dimensions that actually move a system up the lad
 - **L2 — task-level autonomy: where virtual-biotech-cso sits today.** Multi-agent-flavoured
   orchestration of a *complete* sub-process (brief → divisions → review → synthesis), but the
   workflow shape is fixed.
-- **L3 — goal-level autonomy.** A super-agent that *plans, orchestrates, and iterates* the
-  workflow itself. **This is the next rung for us, and it's reachable without a rebuild.**
+- **L3 — goal-level autonomy: where virtual-biotech-cso sits *after* changes #1–#3.** A
+  super-agent that *plans, orchestrates, and iterates* the workflow itself — the plan, the
+  iteration count, and the reroute target are now agent decisions validated against the catalog.
 - **L4** — full lifecycle incl. question formulation and experiment execution (Sakana, Kosmos).
+  Out of scope for bounded assessment queries, and gated on cross-run memory we deliberately
+  don't build (see §5 #4).
 
 ---
 
-## 4. Where our code is pipeline-shaped (with line references)
+## 4. Where our code *was* pipeline-shaped (the diagnosis that motivated changes #1–#3)
+
+> This section describes the **starting point** — the state that prompted the work. Changes #1–#3
+> (§5) have since moved each of these into a validated agent decision; kept here as the diagnosis.
 
 Our own SKILL.md is admirably honest that the skill makes no LLM call and delegates reasoning.
-The harness *is* the driving agent. But the **agency is bottlenecked into one slot.**
+The harness *is* the driving agent. But the **agency was bottlenecked into one slot.**
 
 The plan is **computed, not reasoned** — [`harness.py:124-126`](../skills/virtual-biotech-cso/harness.py#L124-L126):
 
@@ -129,39 +136,68 @@ fabricate), but its *control flow* is authored, not emergent.
 
 ## 5. What to change — move agency from `routing.yaml` into the roles we already have
 
-Four loops, in order of impact. We don't need to rebuild; we need to let the reasoning roles
-*decide*, with the deterministic substrate keeping them honest and reproducible.
+Four loops, in order of impact. We don't need to rebuild; we let the reasoning roles *decide*,
+with the deterministic substrate keeping them honest and reproducible. **Loops #1–#3 are
+implemented (changes #1–#3); #4 is deliberately not — see why below.**
 
-1. **Dynamic planning — the biggest lever (L2 → L3).**
-   Make the **plan an agent output.** Today `decompose_and_route` *generates* the plan; instead,
-   have the Chief-of-Staff / CSO role *propose* it, and turn `decompose_and_route` into a
-   **validator** that binds the proposed plan against `routing.yaml` (reject invented skills,
-   resolve each to a real division). Same guardrails, but the *shape* of the assessment now
-   varies with the query. This is the change that stops it being a pipeline.
+1. **Dynamic planning — the biggest lever (L2 → L3).** *(implemented — change #1)*
+   The **plan is an agent output.** `decompose_and_route` no longer generates the plan as the
+   primary path; the Chief-of-Staff / CSO role *proposes* it and `validate_and_bind_plan` is the
+   **validator** that binds it against `routing.yaml` (rejects invented divisions/intents/skills
+   and forward deps, resolves each to a real skill), falling back to `decompose_and_route` on any
+   failure. Same guardrails, but the *shape* of the assessment now varies with the query. This is
+   the change that stops it being a pipeline.
 
-2. **Unbounded review→reroute (bounded by budget).**
-   Lift the one-pass cap at [`harness.py:138`](../skills/virtual-biotech-cso/harness.py#L138) to
-   "loop until the reviewer returns `synthesize` **or** N rounds / token budget." Mirrors how
-   Co-Scientist and Sakana iterate rather than single-shot. Keep a hard cap to avoid the
-   unbounded-recursion failure mode the Gotchas warn about.
+2. **Bounded review→reroute loop.** *(implemented — change #2)*
+   Lift the one-pass cap to "loop until the reviewer returns `synthesize` **or** `MAX_REROUTES`."
+   The reviewer re-audits the *grown* evidence each pass; successive reroutes are numbered
+   `step_06/07/08`. Mirrors how Co-Scientist and Sakana iterate rather than single-shot, with a
+   hard cap to avoid the unbounded-recursion failure mode the Gotchas warn about.
 
-3. **Hypothesis-driven tool selection.**
-   Let the reviewer/CSO *choose* which catalog skill fills a gap, rather than reading
-   `route_to` off a fixed gap template. Closer to TxAgent's ToolRAG and Biomni's open
-   tool-selection — selection becomes reasoning, not a constant.
+3. **Hypothesis-driven tool selection.** *(implemented — change #3)*
+   The reviewer *chooses* which skill fills a gap; `_reroute_task` validates that choice against
+   `catalog_skills(routing)` and degrades an invented target to the designated fallback. Closer
+   to TxAgent's ToolRAG and Biomni's open tool-selection — selection becomes reasoning, not a
+   constant, but still bound to real skills.
 
-4. **Memory across runs — the real frontier.**
-   Neither we nor TxAgent has this; Kosmos does. A standing "virtual biotech" should remember
-   that B7-H3 specificity came back stromal-not-malignant last time and not re-derive it. This
-   is where the [[kg-pareto-provenance-design]] KG becomes the substrate: persisted, provenance-
-   tagged findings the planner can read before deciding what to run. Hardest, highest ceiling.
+4. **Memory across runs — *not* the next move for this system.**
+   It's tempting to read "Kosmos accumulates state, so we should too" as the path to a higher
+   tier. That reasoning is wrong, and the reason is worth stating because it's a general rule:
 
-**Recommended first move:** #1. Turning `decompose_and_route` into a *validator of an
-agent-proposed plan* converts "a pipeline that calls an LLM in three slots" into "an agent that
-plans, over a substrate that keeps it reproducible and refuses to fabricate" — which is a better
+   **Cross-run memory is forced by *task horizon*, not by *capability*.** A system pays for
+   memory to solve two specific problems — (a) the run is too long to fit in one context window,
+   and (b) an open-ended loop won't *converge* unless each cycle builds on the last. Kosmos has
+   both: it runs hundreds of sequential discover-cycles over an **unbounded** space with no plan
+   known up front, so persisted state is a mechanical necessity *and* the accumulated trajectory
+   **is** the deliverable. Notably, **TxAgent — a sophisticated agent — has no cross-run memory
+   either**, because it answers *bounded* questions in one reasoning episode. Capability isn't the
+   axis; horizon is.
+
+   Our queries are the bounded kind: a self-contained `(target, disease)` go/no-go over four
+   known divisions, one pass plus ≤`MAX_REROUTES`, the whole run fits in context, and it converges
+   by construction. None of the forcing functions apply. Worse, **planner memory would fight our
+   strongest property** — the reproducibility contract (byte-stable dossiers, a `reproducibility/`
+   bundle). A planner that "remembers B7-H3 was stromal last time and skips the specificity step"
+   is *less* auditable, not more, and risks serving stale data when the underlying source has moved.
+
+   The genuine cross-target value (Pareto ranking across targets, "what did we nominate this
+   quarter") is a **queryable store, decoupled from the planning loop** — persist each run's
+   provenance-tagged findings into the [[kg-pareto-provenance-design]] KG and *query* it for
+   comparative/portfolio questions, while every single assessment still runs **cold and
+   reproducible**. That's a new query mode (rank N targets in one run), not planner memory. Build
+   that; do **not** let the store short-circuit an assessment's evidence pull.
+
+**Where this leaves us.** Changes #1–#3 converted "a pipeline that calls an LLM in three slots"
+into "an agent that plans, iterates, and selects tools — over a substrate that keeps it
+reproducible and refuses to fabricate." Plan shape, iteration count, and reroute target are now
+agent decisions, each validated against `routing.yaml` before it can act. That is a better
 architecture than TxAgent's for our goals, because we keep provenance and the no-fabrication
-contract while gaining emergent control flow. See [[agentic-workflow-ideas]] and
-[[agentic-hypothesis-optimization]] for adjacent design notes.
+contract while gaining emergent control flow — a solid **L3** on bounded assessment queries.
+
+**Next move is *not* #4.** The forward value is a **comparative/portfolio query mode** (rank N
+targets in one run, Pareto over the persisted [[kg-pareto-provenance-design]] KG), which is a new
+query type over a queryable store — explicitly *not* planner memory, for the reasons in #4. See
+[[agentic-workflow-ideas]] and [[agentic-hypothesis-optimization]] for adjacent design notes.
 
 ---
 
