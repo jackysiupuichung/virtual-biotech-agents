@@ -255,13 +255,46 @@ def validate_and_bind_plan(
     return subtasks
 
 
-def _reroute_task(gap: dict[str, Any]) -> Subtask:
-    """Build a follow-up Subtask from a reviewer gap."""
+def catalog_skills(routing: dict[str, Any]) -> set[str]:
+    """Every skill name reachable in routing.yaml (primary ``skill`` + ``also`` lists).
+
+    Used to validate an *agent-chosen* reroute target — the reviewer may only route
+    to a skill that actually exists in the catalog, never an invented one.
+    """
+    skills: set[str] = set()
+    for intents in routing.values():
+        if not isinstance(intents, dict):
+            continue
+        for entry in intents.values():
+            if isinstance(entry, dict):
+                if isinstance(entry.get("skill"), str):
+                    skills.add(entry["skill"])
+                skills.update(s for s in entry.get("also", []) if isinstance(s, str))
+    return skills
+
+
+REROUTE_FALLBACK_SKILL = "lit-synthesizer"  # the routing.yaml-designated reroute target
+
+
+def _reroute_task(gap: dict[str, Any], routing: dict[str, Any] | None = None,
+                  step_n: int = 6) -> Subtask:
+    """Build a follow-up Subtask from a reviewer gap (change #3: validated target).
+
+    The reviewer *chooses* ``route_to``; we keep it honest — if it names a skill that
+    isn't in the catalog (or names none), fall back to the routing.yaml-designated
+    reroute target rather than executing an invented skill. ``step_n`` lets the
+    bounded review loop (change #2) number successive reroutes step_06, step_07, ….
+    """
+    chosen = gap.get("route_to")
+    if routing is not None and chosen not in catalog_skills(routing):
+        chosen = REROUTE_FALLBACK_SKILL
+    elif not chosen:
+        chosen = REROUTE_FALLBACK_SKILL
     return Subtask(
-        step="step_06_reroute",
+        step=f"step_{step_n:02d}_reroute",
         division="target_id_and_prioritization",
         question=f"Reviewer follow-up: {gap.get('missing', 'fill gap')} — {gap.get('why', '')}".strip(),
-        skill=gap.get("route_to", "scrna-orchestrator"),
+        skill=chosen,
     )
 
 

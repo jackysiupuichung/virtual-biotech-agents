@@ -26,8 +26,14 @@ class FakeRunner:
     name = "fake"
     model = "fake-1"
 
-    def __init__(self, verdict="synthesize"):
+    def __init__(self, verdict="synthesize", reroute_times=None, route_to="scrna-orchestrator"):
+        # verdict: the steady-state verdict. reroute_times: if set, re-route exactly
+        # this many times then return 'synthesize' (lets us test loop convergence).
+        # route_to: the skill the reviewer chooses (to exercise catalog validation).
         self._verdict = verdict
+        self._reroute_times = reroute_times
+        self._route_to = route_to
+        self._reviews = 0
         self.calls = []
 
     def run(self, prompt, context, schema):
@@ -51,10 +57,15 @@ class FakeRunner:
             return {"context": "ctx", "data_availability": [], "priority_questions": ["q"],
                     "feasibility_flags": []}
         if "Scientific Reviewer" in title:
-            return {"verdict": self._verdict,
+            self._reviews += 1
+            if self._reroute_times is not None:
+                verdict = "re-route" if self._reviews <= self._reroute_times else "synthesize"
+            else:
+                verdict = self._verdict
+            return {"verdict": verdict,
                     "scores": {"relevance": 5, "evidence": 4, "thoroughness": 3},
-                    "gaps": [{"missing": "spatial", "route_to": "scrna-orchestrator",
-                              "why": "lost context"}] if self._verdict == "re-route" else [],
+                    "gaps": [{"missing": "spatial", "route_to": self._route_to,
+                              "why": "lost context"}] if verdict == "re-route" else [],
                     "experiments": []}
         if "Orchestrator" in title:
             return {"decision": "CONDITIONAL_GO", "confidence": "medium",
@@ -123,6 +134,42 @@ def test_live_reroute_adds_sixth_step(monkeypatch, tmp_path):
     steps = [e["step"] for e in data["evidence"]]
     assert "step_06_reroute" in steps, steps
     assert out["summary"]["reviewer_verdict"] == "re-route"
+
+
+# --------------------- bounded review loop (change #2) -------------------- #
+def _reroute_steps(out):
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    return [e["step"] for e in data["evidence"] if "reroute" in e["step"]]
+
+
+def test_live_loop_converges_when_reviewer_synthesizes(monkeypatch, tmp_path):
+    # re-route twice, then synthesize → exactly two follow-up steps, numbered.
+    out = _run(monkeypatch, FakeRunner(reroute_times=2), tmp_path)
+    assert _reroute_steps(out) == ["step_06_reroute", "step_07_reroute"], _reroute_steps(out)
+
+
+def test_live_loop_is_bounded_at_max_reroutes(monkeypatch, tmp_path):
+    # a reviewer that never stops is capped at MAX_REROUTES follow-ups.
+    out = _run(monkeypatch, FakeRunner("re-route"), tmp_path)
+    assert len(_reroute_steps(out)) == harness.MAX_REROUTES
+
+
+# --------------------- agent-chosen reroute target (change #3) ------------ #
+def test_invented_reroute_target_falls_back_to_catalog_skill(monkeypatch, tmp_path):
+    # scrna-orchestrator is NOT a routing.yaml skill → validated to the fallback.
+    out = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="scrna-orchestrator"), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    skill = next(e["skill"] for e in data["evidence"] if "reroute" in e["step"])
+    import cso  # noqa: E402
+    assert skill == cso.REROUTE_FALLBACK_SKILL
+
+
+def test_valid_reroute_target_is_honored(monkeypatch, tmp_path):
+    # lit-synthesizer IS in the catalog → the reviewer's choice is kept.
+    out = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="lit-synthesizer"), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    skill = next(e["skill"] for e in data["evidence"] if "reroute" in e["step"])
+    assert skill == "lit-synthesizer"
 
 
 def test_synthesize_verdict_has_no_reroute(monkeypatch, tmp_path):

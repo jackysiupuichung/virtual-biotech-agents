@@ -175,3 +175,34 @@ def test_validate_rejects_forward_dependency():
 def test_validate_rejects_empty_plan():
     with pytest.raises(PlanValidationError, match="empty"):
         validate_and_bind_plan([], ROUTING)
+
+
+# --------------------- catalog_skills + validated reroute (changes #2/#3) -- #
+from cso import catalog_skills, REROUTE_FALLBACK_SKILL  # noqa: E402
+
+
+def test_catalog_skills_includes_primary_and_also():
+    skills = catalog_skills(ROUTING)
+    assert "gwas-lookup" in skills                 # primary skill
+    assert "lit-synthesizer" in skills             # reroute target
+    assert "gwas-catalog-region-fetch" in skills   # from an `also:` list
+    assert "scrna-orchestrator" not in skills       # only a reference, not routable
+
+
+def test_reroute_validates_invented_target():
+    gap = {"missing": "x", "route_to": "made-up-skill", "why": "y"}
+    t = _reroute_task(gap, ROUTING)
+    assert t.skill == REROUTE_FALLBACK_SKILL
+
+
+def test_reroute_keeps_valid_target_and_numbers_step():
+    gap = {"missing": "recency", "route_to": "lit-synthesizer", "why": "stale"}
+    t = _reroute_task(gap, ROUTING, step_n=7)
+    assert t.skill == "lit-synthesizer"
+    assert t.step == "step_07_reroute"
+
+
+def test_reroute_without_routing_is_backward_compatible():
+    # no routing passed → no validation → caller's choice honored (legacy demo path)
+    gap = {"missing": "spatial", "route_to": "scrna-orchestrator", "why": "z"}
+    assert _reroute_task(gap).skill == "scrna-orchestrator"

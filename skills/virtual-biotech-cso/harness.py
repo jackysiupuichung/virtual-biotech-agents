@@ -66,6 +66,7 @@ SYNTHESIS_SCHEMA = {
 }
 
 AGENT_SOURCE = "agent (live)"  # provenance tag for agent-produced slots
+MAX_REROUTES = 3  # change #2: bound the review→reroute loop (avoid unbounded recursion)
 
 
 def _read_prompt(path: Path) -> str:
@@ -145,6 +146,48 @@ def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, 
         return subtasks, cso.DELEGATE
 
 
+def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
+                 routing: dict[str, Any], results: list[dict[str, Any]],
+                 demo: bool, live: bool) -> dict[str, Any]:
+    """Run reviewer→reroute until `synthesize` or MAX_REROUTES (changes #2 + #3).
+
+    Each iteration re-runs the reviewer over the *current* evidence (so a re-route's
+    new step is itself reviewable), and on a `re-route` verdict executes one follow-up
+    bound to the reviewer's chosen skill — validated against the catalog, with a
+    numbered step id so successive re-routes don't collide. Returns the *last*
+    reviewer payload (the one the synthesis sees), with its source tag set.
+    """
+    review: dict[str, Any] = {}
+    for i in range(MAX_REROUTES + 1):  # initial review + up to MAX_REROUTES follow-ups
+        review, review_src = _agent_or_stub(
+            trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
+            _evidence_context(results), REVIEW_SCHEMA,
+            stub=cso.load_review(query, case, results, demo=False))
+        review.setdefault("source", review_src)
+
+        if review.get("verdict") != "re-route":
+            trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
+            break
+        if i == MAX_REROUTES:
+            trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
+                       "synthesizing with residual gaps")
+            break
+
+        gap = (review.get("gaps") or [{}])[0]
+        followup = cso._reroute_task(gap, routing, step_n=6 + i)
+        trace.step("🔁", f"reroute {i + 1}/{MAX_REROUTES} → {followup.skill} "
+                   f"({gap.get('missing', 'gap')})")
+        results.append(cso.execute_skill(followup, case, demo, live))
+
+        # A cached/stub reviewer can't re-evaluate the new evidence — its verdict is
+        # fixed, so looping would just append duplicate re-routes. Only a *live*
+        # reviewer genuinely re-reviews; honor exactly one re-route otherwise.
+        if review_src != AGENT_SOURCE:
+            trace.step("✅", "reviewer (cached/stub) → one re-route, then synthesize")
+            break
+    return review
+
+
 def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         demo: bool, live: bool, argv: list[str]) -> dict[str, Any]:
     case = cso.case_key(query)
@@ -166,20 +209,11 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     # 3 — EXECUTE DIVISIONS (deterministic data layer; concurrent where free) #
     results = _execute_concurrent(subtasks, case, demo, live, trace)
 
-    # 4 — REVIEW (live agent role; verdict drives control flow) ------------- #
-    review, review_src = _agent_or_stub(
-        trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
-        _evidence_context(results), REVIEW_SCHEMA,
-        stub=cso.load_review(query, case, results, demo=False))
-    review.setdefault("source", review_src)
-
-    if review.get("verdict") == "re-route":
-        gap = (review.get("gaps") or [{}])[0]
-        followup = cso._reroute_task(gap)
-        trace.step("🔁", f"reviewer re-routed → {followup.skill} ({gap.get('missing', 'gap')})")
-        results.append(cso.execute_skill(followup, case, demo, live))
-    else:
-        trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
+    # 4 — REVIEW → RE-ROUTE loop (change #2: bounded; verdict drives control flow) #
+    #     The reviewer re-runs after each re-route until it returns `synthesize` or
+    #     MAX_REROUTES is hit. Each re-route target is the reviewer's *chosen* skill,
+    #     validated against the catalog (change #3) before execution.
+    review = _review_loop(trace, runner, query, case, routing, results, demo, live)
 
     # 5 — SYNTHESIZE (live agent role) -------------------------------------- #
     syn_context = (
