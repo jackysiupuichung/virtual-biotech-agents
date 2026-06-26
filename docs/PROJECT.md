@@ -76,6 +76,15 @@ agents + live databases + Prometheux on the same loop.
 
 ---
 
+## 🎤 Pitch deck & demo
+
+- **Slides:** [`docs/loom-slides.md`](loom-slides.md) — a [Marp](https://marp.app/) deck
+  (problem → solution → multi-agent architecture → live demo). Render to HTML/PDF with
+  `marp docs/loom-slides.md`.
+- **Demo script:** [`docs/loom-script-3min.md`](loom-script-3min.md) — the 3-minute walkthrough.
+
+---
+
 ## How it maps to the judging criteria
 
 | Criterion | How this project answers it |
