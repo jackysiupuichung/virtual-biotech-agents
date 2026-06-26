@@ -350,21 +350,27 @@ def _axis_min(reviews: list[dict[str, Any]], axis: str) -> int | None:
 
 def aggregate_panel_review(lens_reviews: list[tuple[str, dict[str, Any]]],
                            routing: dict[str, Any] | None = None,
-                           min_votes: int = PANEL_REROUTE_MIN_VOTES) -> dict[str, Any]:
+                           min_votes: int = PANEL_REROUTE_MIN_VOTES,
+                           extra_gaps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Fold N lens verdicts into one review payload (deterministic, testable).
 
     - verdict: ``re-route`` iff >= ``min_votes`` lenses returned ``re-route``; the
       panel is skeptical but not hair-trigger (one lone dissent doesn't reroute).
-    - gaps: union across lenses, deduped by (route_to, missing); each tagged with the
-      lenses that raised it. If ``routing`` is given, a gap whose ``route_to`` isn't in
-      the catalog is kept but its target will be validated downstream by _reroute_task.
+      **Exception:** any ``extra_gaps`` entry with ``forces_reroute`` (e.g. a
+      Prometheux-derived *structural* gap — a required axis with no evidence at all)
+      forces ``re-route`` regardless of the lens vote count. A proven missing axis is
+      a deductive fact, not a judgement, so the engine is a non-silenceable member.
+    - gaps: union across lenses **and** ``extra_gaps``, deduped by (route_to, missing);
+      each tagged with the lenses that raised it. ``extra_gaps`` are treated as a lens
+      whose key they carry (``["prometheux"]``). A forcing gap sorts first so
+      _review_loop reroutes on it. If ``routing`` is given, a gap whose ``route_to``
+      isn't in the catalog is kept but validated downstream by _reroute_task.
     - scores: min per axis across lenses (weakest link).
     - experiments: union across lenses.
     The ``lens`` provenance on each gap is what makes "survived N skeptics" auditable.
     """
     reviews = [r for _, r in lens_reviews]
     votes = sum(1 for r in reviews if r.get("verdict") == "re-route")
-    verdict = "re-route" if votes >= min_votes else "synthesize"
 
     seen: dict[tuple, dict[str, Any]] = {}
     for key, r in lens_reviews:
@@ -378,9 +384,25 @@ def aggregate_panel_review(lens_reviews: list[tuple[str, dict[str, Any]]],
                 g = dict(gap)
                 g["lenses"] = [key]
                 seen[sig] = g
+    for gap in extra_gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        sig = (gap.get("route_to"), gap.get("missing"))
+        if sig in seen:
+            # merge: keep the forcing flag + explanation, union the lens provenance
+            seen[sig].update({k: v for k, v in gap.items() if k != "lenses"})
+            for lk in gap.get("lenses", []):
+                if lk not in seen[sig].setdefault("lenses", []):
+                    seen[sig]["lenses"].append(lk)
+        else:
+            seen[sig] = dict(gap)
     gaps = list(seen.values())
-    # Surface the most-corroborated gap first so _review_loop reroutes on it.
-    gaps.sort(key=lambda g: len(g.get("lenses", [])), reverse=True)
+    # A proven structural gap forces re-route even without the min_votes lens majority.
+    forced = any(g.get("forces_reroute") for g in gaps)
+    verdict = "re-route" if (votes >= min_votes or forced) else "synthesize"
+    # Forcing gaps first, then most-corroborated, so _review_loop reroutes on them.
+    gaps.sort(key=lambda g: (bool(g.get("forces_reroute")), len(g.get("lenses", []))),
+              reverse=True)
 
     experiments = [e for _, r in lens_reviews for e in (r.get("experiments", []) or [])]
     return {
@@ -390,7 +412,7 @@ def aggregate_panel_review(lens_reviews: list[tuple[str, dict[str, Any]]],
         "gaps": gaps,
         "experiments": experiments,
         "panel": {"n_lenses": len(lens_reviews), "reroute_votes": votes,
-                  "min_votes": min_votes,
+                  "min_votes": min_votes, "forced_by_engine": forced,
                   "lenses": [k for k, _ in lens_reviews]},
     }
 
@@ -671,7 +693,8 @@ def _norm_liabilities(synthesis: dict[str, Any] | None) -> list[str]:
 
 def synthesize_report(query: str, case: str, briefing: dict[str, Any],
                       results: list[dict[str, Any]], review: dict[str, Any],
-                      synthesis: dict[str, Any] | None, demo: bool) -> str:
+                      synthesis: dict[str, Any] | None, demo: bool,
+                      decision_engine: dict[str, Any] | None = None) -> str:
     """Build a structured target-identification dossier from the assembled evidence."""
     syn = synthesis or {}
     symbol = (case or "target").upper()
@@ -685,10 +708,27 @@ def synthesize_report(query: str, case: str, briefing: dict[str, Any],
               "illustrative fixtures** (B7-H3 walkthrough), not live results.", ""]
 
     # 1 — Executive summary (decision + confidence + recommendation)
-    decision = syn.get("decision") or ("REVIEW" if executed else "REVIEW")
+    # The Prometheux decision layer derives the tier deductively from per-axis
+    # coverage; when present it is authoritative for the Decision field, and the
+    # agent's free-text becomes rationale. If the two disagree, both are shown and
+    # the divergence is flagged — the derived tier is never silently overridden.
+    agent_decision = syn.get("decision")
     confidence = syn.get("confidence") or ("see reviewer scores" if executed else "n/a")
-    L += ["## Executive summary", "",
-          f"- **Decision:** {decision}", f"- **Confidence:** {confidence}", ""]
+    L += ["## Executive summary", ""]
+    if decision_engine:
+        tier = decision_engine["tier"]
+        L += [f"- **Decision:** {tier} "
+              f"_(derived · coverage {decision_engine['score']}/{decision_engine['max_score']})_",
+              f"- **Confidence:** {confidence}",
+              f"- **Basis:** {decision_engine['explanation']}", ""]
+        if agent_decision and agent_decision != tier:
+            L += [f"> ⚠️ **Divergence:** the synthesis agent proposed **{agent_decision}**, "
+                  f"but the deductive decision layer derives **{tier}** from the evidence "
+                  "coverage. The derived tier is the Decision of record; the agent's "
+                  "rationale is below.", ""]
+    else:
+        decision = agent_decision or "REVIEW"
+        L += [f"- **Decision:** {decision}", f"- **Confidence:** {confidence}", ""]
     if syn.get("recommendation"):
         L += [str(syn["recommendation"]), ""]
     elif not executed:

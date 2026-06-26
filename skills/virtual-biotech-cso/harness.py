@@ -181,7 +181,8 @@ def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, 
 
 
 def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, Any]],
-                  routing: dict[str, Any], rec: TraceRecorder) -> dict[str, Any]:
+                  routing: dict[str, Any], rec: TraceRecorder,
+                  query: str = "") -> dict[str, Any]:
     """Fan out N lens-specialised reviewers concurrently, then aggregate (panel).
 
     Each lens is an independent agent call with the shared reviewer prompt plus its
@@ -211,13 +212,81 @@ def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, 
     with rec.span("review_panel", kind="loop", n_lenses=len(cso.REVIEWER_LENSES)) as panel_sp:
         with ThreadPoolExecutor(max_workers=len(cso.REVIEWER_LENSES)) as pool:
             lens_reviews = list(pool.map(_one, cso.REVIEWER_LENSES))
-        review = cso.aggregate_panel_review(lens_reviews, routing)
+        engine_gaps = _engine_gaps(trace, results, rec, query)
+        review = cso.aggregate_panel_review(lens_reviews, routing, extra_gaps=engine_gaps)
         panel = review["panel"]
-        panel_sp.set(verdict=review["verdict"], reroute_votes=panel["reroute_votes"])
+        panel_sp.set(verdict=review["verdict"], reroute_votes=panel["reroute_votes"],
+                     forced_by_engine=panel.get("forced_by_engine", False))
     review["source"] = AGENT_SOURCE
+    forced = " (engine-forced)" if panel.get("forced_by_engine") else ""
     trace.step("👥", f"reviewer panel: {panel['reroute_votes']}/{panel['n_lenses']} lenses "
-               f"flag re-route → verdict {review['verdict']}")
+               f"flag re-route → verdict {review['verdict']}{forced}")
     return review
+
+
+def _engine_gaps(trace: Trace, results: list[dict[str, Any]],
+                 rec: TraceRecorder, query: str = "") -> list[dict[str, Any]]:
+    """Prometheux gap-detector: derive *structural* gaps as a non-silenceable vote.
+
+    The reviewer panel's LLM lenses catch semantic gaps; the Vadalog engine catches
+    structural ones — a required prioritization axis with no graded evidence at all —
+    as a derived fact with a replayable explanation. Such a gap carries
+    ``forces_reroute`` so it re-routes on its own (the engine is load-bearing here).
+    Import is local + guarded so a missing module never breaks the panel.
+    """
+    with rec.span("prometheux_gaps", kind="agent", backend="prometheux") as sp:
+        try:
+            import re
+
+            import prometheux_reason as pr
+            # a target symbol for the gap explanation (e.g. "B7-H3" from the query)
+            m = re.search(r"\b([A-Z][A-Z0-9]{1,6}(?:-[A-Z0-9]+)?)\b", query or "")
+            target = m.group(1) if m else (query or "target")
+            graded = [{**e, "grade": cso._evidence_grade(e), "step": e.get("step")}
+                      for e in results]
+            gaps = pr.gaps_from_evidence(graded, target)
+            n_forcing = sum(1 for g in gaps if g.get("forces_reroute"))
+            sp.set(source="prometheux", n_gaps=len(gaps), forcing=n_forcing)
+            if gaps:
+                kind = (f"{n_forcing} structural" if n_forcing else f"{len(gaps)} weak")
+                trace.step("🔷", f"prometheux: {kind} gap(s) "
+                           f"→ {', '.join(g['route_to'] for g in gaps)}"
+                           + (" [forces re-route]" if n_forcing else ""))
+            return gaps
+        except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
+            sp.status = "stub"
+            sp.set(degraded="engine-unavailable", reason=str(exc))
+            return []
+
+
+def _engine_decision(trace: Trace, results: list[dict[str, Any]],
+                     rec: TraceRecorder, query: str = "") -> dict[str, Any] | None:
+    """Prometheux decision layer: derive a quantitative, replayable GO/NO-GO tier.
+
+    Runs the same graded evidence the gap-detector sees through the decision rules —
+    a weighted per-axis coverage score plus a non-negotiable safety hard-gate. The
+    derived tier is *authoritative* for the report's Decision field; the synthesis
+    agent's free-text becomes rationale (logic decides, the agent explains). Import
+    is local + guarded so a missing module never breaks synthesis — returns None.
+    """
+    with rec.span("prometheux_decision", kind="agent", backend="prometheux") as sp:
+        try:
+            import re
+
+            import prometheux_reason as pr
+            m = re.search(r"\b([A-Z][A-Z0-9]{1,6}(?:-[A-Z0-9]+)?)\b", query or "")
+            target = m.group(1) if m else (query or "target")
+            graded = [{**e, "grade": cso._evidence_grade(e), "step": e.get("step")}
+                      for e in results]
+            decision = pr.decide_from_evidence(graded, target)
+            sp.set(source="prometheux", tier=decision["tier"], score=decision["score"])
+            trace.step("🔷", f"prometheux decision: {decision['tier']} "
+                       f"(score {decision['score']}/{decision['max_score']})")
+            return decision
+        except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
+            sp.status = "stub"
+            sp.set(degraded="engine-unavailable", reason=str(exc))
+            return None
 
 
 def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
@@ -237,13 +306,22 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                   ) as loop_sp:
         for i in range(MAX_REROUTES + 1):  # initial review + up to MAX_REROUTES follow-ups
             if panel_capable:
-                review = _review_panel(trace, runner, results, routing, rec)
+                review = _review_panel(trace, runner, results, routing, rec, query)
                 review_src = AGENT_SOURCE
             else:
                 review, review_src = _agent_or_stub(
                     trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
                     _evidence_context(results), REVIEW_SCHEMA,
                     stub=cso.load_review(query, case, results, demo=False), rec=rec)
+                # The Prometheux gap-detector is deterministic — it runs on the stub
+                # path too, and a forcing structural gap re-routes even when no live
+                # reviewer panel is available (the engine is the non-silenceable voter).
+                engine_gaps = _engine_gaps(trace, results, rec, query)
+                if engine_gaps:
+                    merged = cso.aggregate_panel_review(
+                        [("scientific_reviewer", review)], routing, extra_gaps=engine_gaps)
+                    review = {**review, "verdict": merged["verdict"],
+                              "gaps": merged["gaps"], "panel": merged["panel"]}
             review.setdefault("source", review_src)
 
             if review.get("verdict") != "re-route":
@@ -306,12 +384,21 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     #     validated against the catalog (change #3) before execution.
     review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec)
 
+    # 4b — DECISION (Prometheux): derive the GO/NO-GO tier deductively from the final
+    #      evidence. Authoritative for the report's Decision field; the agent narrates.
+    decision = _engine_decision(trace, results, rec, query)
+
     # 5 — SYNTHESIZE (CSO integrates the division scientists' findings + review) -- #
+    decision_ctx = (f"\n\nDeductive decision (Prometheux, authoritative tier):\n"
+                    f"{json.dumps(decision, default=str)}\n"
+                    "Write your recommendation consistent with this tier; it is the "
+                    "Decision of record. If you disagree, argue it in the rationale."
+                    if decision else "")
     syn_context = (
         f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
         f"Division scientist findings:\n{json.dumps(division_findings, default=str)}\n\n"
         f"Evidence:\n{_evidence_context(results)}\n\n"
-        f"Reviewer:\n{json.dumps(review, default=str)}"
+        f"Reviewer:\n{json.dumps(review, default=str)}{decision_ctx}"
     )
     synthesis: dict[str, Any] | None
     synthesis, _ = _agent_or_stub(
@@ -321,14 +408,16 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         synthesis = None
 
     # 6 — ASSEMBLE (reuse cso's renderer + output contract) ----------------- #
-    report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis, demo)
+    report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis,
+                                      demo, decision_engine=decision)
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "report.md"
     report_path.write_text(report_md, encoding="utf-8")
 
     summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
                                     synthesis, runner, backend, demo, live,
-                                    division_findings=division_findings)
+                                    division_findings=division_findings,
+                                    decision_engine=decision)
     result_path = cso._write_result_json(out_dir, summary, data)
     cso._write_reproducibility(out_dir / "reproducibility", argv, [report_path, result_path])
 
@@ -428,7 +517,8 @@ def _run_divisions(subtasks: list[cso.Subtask], runner: runners.Runner, query: s
 
 
 def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
-                    runner, backend, demo, live, division_findings=None
+                    runner, backend, demo, live, division_findings=None,
+                    decision_engine=None
                     ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Mirror cso.run()'s result.json envelope, marking the live-agent loop."""
     syn = synthesis or {}
@@ -454,7 +544,12 @@ def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
         "n_steps": len(results),
         "reviewer_verdict": review.get("verdict", "synthesize"),
         "n_executed": len([e for e in results if e.get("source") in ("clawbio", cso.DEMO_SOURCE)]),
-        "decision": syn.get("decision", "REVIEW"),
+        # Derived tier is the decision of record when the engine ran; the agent's
+        # free-text is kept alongside so a divergence is auditable, not erased.
+        "decision": (decision_engine or {}).get("tier") or syn.get("decision", "REVIEW"),
+        "decision_source": "prometheux" if decision_engine else "agent",
+        "agent_decision": syn.get("decision"),
+        "decision_engine": decision_engine,
         "confidence": syn.get("confidence", "n/a"),
         "calls_llm": calls_llm,
     }
