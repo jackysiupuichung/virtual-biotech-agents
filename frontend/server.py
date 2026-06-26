@@ -35,6 +35,7 @@ import cso          # noqa: E402  (sibling skill module)
 import harness      # noqa: E402  (schemas + helpers)
 import runners      # noqa: E402
 import kg as KG      # noqa: E402  (persistent canonical knowledge graph)
+from tracing import TraceRecorder  # noqa: E402  (span recorder _agent_or_stub requires)
 
 # default config, overridable via CLI
 CONFIG = {"backend": "auto", "model": None}
@@ -143,8 +144,15 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
     return deltas
 
 
-def run_loop(query: str, *, demo: bool, live: bool):
-    """Generator yielding (event_name, payload) for each phase of the loop."""
+def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False):
+    """Generator yielding (event_name, payload) for each phase of the loop.
+
+    ``partial`` deliberately drops the safety step from the plan, so the safety axis
+    is never assessed. This makes the Prometheux gap-detector emit a *structural*
+    (forcing) gap that re-routes on its own, and — because the synthesis agent sees
+    only partial evidence — can surface a divergence between the agent's optimistic
+    tier and the engine's derived one. It exists to *show* the load-bearing engine
+    moments the full plan never triggers; it is clearly labelled in the UI."""
     case = cso.case_key(query)
     routing = cso.load_routing()
     run_id = f"run-{case}-{len(GRAPH.nodes)}"  # deterministic-ish; no RNG
@@ -158,6 +166,8 @@ def run_loop(query: str, *, demo: bool, live: bool):
     else:
         runner = runners.select_runner(CONFIG["backend"], CONFIG["model"])
     calls_llm = runner.name != "stub"
+    # span recorder _agent_or_stub requires; out_dir=None → no file, observe-only
+    rec = TraceRecorder(None, run_name=case, backend=runner.name, model=runner.model)
 
     yield "start", {
         "query": query, "case": case, "run_id": run_id, "entities": ents,
@@ -197,13 +207,18 @@ def run_loop(query: str, *, demo: bool, live: bool):
     briefing, brief_src = harness._agent_or_stub(
         _NullTrace(), "chief_of_staff", runner, cso.CHIEF_OF_STAFF_PROMPT,
         f"User query: {query}", harness.BRIEFING_SCHEMA,
-        stub=cso.load_briefing(query, case, demo=demo))
+        stub=cso.load_briefing(query, case, demo=demo), rec=rec)
     briefing.setdefault("source", brief_src)
     yield "briefing", {"briefing": briefing, "source": brief_src}
 
     # 2 — DECOMPOSE & ROUTE -------------------------------------------------- #
     subtasks = cso.decompose_and_route(query, case, routing)
-    yield "plan", {"subtasks": [t.as_plan_entry() for t in subtasks]}
+    if partial:
+        # drop the safety step so the safety axis is never assessed — the engine
+        # gap-detector will force a re-route, demonstrating the load-bearing role.
+        subtasks = [t for t in subtasks if "offtarget_safety" not in t.step
+                    and "safety" not in t.step]
+    yield "plan", {"subtasks": [t.as_plan_entry() for t in subtasks], "partial": partial}
 
     # 3 — EXECUTE DIVISIONS (stream each step as it completes) --------------- #
     results: list[dict] = []
@@ -223,14 +238,25 @@ def run_loop(query: str, *, demo: bool, live: bool):
     review, review_src = harness._agent_or_stub(
         _NullTrace(), "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
         harness._evidence_context(results), harness.REVIEW_SCHEMA,
-        stub=cso.load_review(query, case, results, demo=demo))
+        stub=cso.load_review(query, case, results, demo=demo), rec=rec)
     review.setdefault("source", review_src)
+
+    # 4b — PROMETHEUX gap-detector (load-bearing): derive structural gaps as a
+    #      non-silenceable reviewer voice. A proven missing axis forces a re-route
+    #      even if the LLM panel said synthesize. Surfaced to the UI as its own voice.
+    engine_gaps = _prometheux_gaps(results, ents["target"])
+    if engine_gaps:
+        review = cso.aggregate_panel_review(
+            [("scientific_reviewer", review)], routing, extra_gaps=engine_gaps)
+        review.setdefault("source", review_src)
+    yield "engine_gaps", {"gaps": engine_gaps,
+                          "forced": any(g.get("forces_reroute") for g in engine_gaps)}
     yield "review", {"review": review}
 
     # 5 — RE-ROUTE (one follow-up step if the reviewer flagged a gap) -------- #
     if review.get("verdict") == "re-route":
         gap = (review.get("gaps") or [{}])[0]
-        followup = cso._reroute_task(gap)
+        followup = cso._reroute_task(gap, routing)
         yield "phase", {"id": followup.step, "role": followup.skill, "kind": "skill",
                         "division": followup.division + " (re-route)", "title": followup.question,
                         "status": "running", "reroute": True,
@@ -253,27 +279,93 @@ def run_loop(query: str, *, demo: bool, live: bool):
     )
     synthesis, _ = harness._agent_or_stub(
         _NullTrace(), "cso_synthesis", runner, cso.ORCHESTRATOR_PROMPT,
-        syn_context, harness.SYNTHESIS_SCHEMA, stub=cso.load_synthesis(query, case, results, demo=demo))
+        syn_context, harness.SYNTHESIS_SCHEMA,
+        stub=cso.load_synthesis(query, case, results, demo=demo), rec=rec)
     yield "synthesis", {"synthesis": synthesis}
 
-    # stamp the hypothesis EDGE (Target ──TARGETS──> Disease) with its decision,
-    # then persist the whole graph
-    decision = (synthesis or {}).get("decision", "REVIEW")
+    # 6b — PROMETHEUX decision (load-bearing): derive the GO/NO-GO tier deductively
+    #      from per-axis coverage + a safety hard-gate. The derived tier is the
+    #      Decision of record; the agent's free-text is rationale. A divergence from
+    #      the agent's proposal is surfaced to the UI, never silently overridden.
+    decision_engine = _prometheux_decision(results, ents["target"])
+    agent_decision = (synthesis or {}).get("decision")
+    decision = (decision_engine or {}).get("tier") or agent_decision or "REVIEW"
     confidence = (synthesis or {}).get("confidence", "n/a")
+    yield "decision", {
+        "decision": decision,
+        "decision_source": "prometheux" if decision_engine else "agent",
+        "agent_decision": agent_decision,
+        "engine": decision_engine,
+        "diverges": bool(decision_engine and agent_decision
+                         and agent_decision != decision_engine["tier"]),
+        "confidence": confidence,
+    }
+
+    # stamp the hypothesis EDGE (Target ──TARGETS──> Disease) with the decision of
+    # record, then persist the whole graph
     GRAPH.upsert_edge(target_id, disease_id, "TARGETS",
                       decision=decision, confidence=confidence, run=run_id)
     GRAPH.commit()
 
     # 7 — DONE: assemble report.md + summary -------------------------------- #
-    report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis, demo)
+    # Explain-a-rank over the just-committed graph: only populated once a second
+    # target shares the graph, so the first run shows none and later runs explain
+    # how the new target ranks against the prior ones.
+    ranking_payload = _prometheux_ranking()
+    report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis,
+                                      demo, decision_engine=decision_engine,
+                                      ranking=ranking_payload["edges"])
     yield "done", {
         "report_md": report_md,
         "decision": decision,
+        "decision_source": "prometheux" if decision_engine else "agent",
         "confidence": confidence,
         "n_steps": len(results),
         "reviewer_verdict": review.get("verdict", "synthesize"),
+        "ranking": ranking_payload,
         "kg_nodes": len(GRAPH.nodes), "kg_edges": len(GRAPH.edges),
     }
+
+
+def _graded(results: list[dict], target: str) -> tuple[list[dict], str]:
+    """Attach the derived grade to each step + extract a target symbol (for the engine)."""
+    graded = [{**e, "grade": cso._evidence_grade(e), "step": e.get("step")} for e in results]
+    return graded, target
+
+
+def _prometheux_gaps(results: list[dict], target: str) -> list[dict]:
+    """Run the Prometheux gap-detector over the routed evidence (guarded)."""
+    try:
+        import prometheux_reason as pr
+        graded, tgt = _graded(results, target)
+        return pr.gaps_from_evidence(graded, tgt)
+    except Exception:  # noqa: BLE001 — degrade silently; the panel still works
+        return []
+
+
+def _prometheux_decision(results: list[dict], target: str) -> dict | None:
+    """Run the Prometheux decision layer over the routed evidence (guarded)."""
+    try:
+        import prometheux_reason as pr
+        graded, tgt = _graded(results, target)
+        return pr.decide_from_evidence(graded, tgt)
+    except Exception:  # noqa: BLE001 — degrade; agent decision stands
+        return None
+
+
+def _prometheux_ranking() -> dict:
+    """Explain-a-rank over the persistent graph: why one target ranks over another.
+
+    Reads the accumulated multi-run graph (not a single run's evidence), so the
+    leaderboard only becomes meaningful once two or more targets have been assessed.
+    Guarded — degrades to an empty board if the engine is unavailable.
+    """
+    try:
+        import prometheux_reason as pr
+        return {"leaderboard": pr.rank_targets(GRAPH),
+                "edges": pr.rank_explanations(GRAPH)}
+    except Exception:  # noqa: BLE001 — degrade; the ledger view still works
+        return {"leaderboard": [], "edges": []}
 
 
 def _evidence_event(env: dict) -> dict:
@@ -309,7 +401,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream(parse_qs(parsed.query))
         if parsed.path == "/api/ledger":
             return self._ledger()
+        if parsed.path == "/api/ranking":
+            return self._json(_prometheux_ranking())
         return self._static(parsed.path)
+
+    def _json(self, payload: dict):
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # --- accumulated-evidence ledger ------------------------------------- #
     def _ledger(self):
@@ -323,19 +426,14 @@ class Handler(BaseHTTPRequestHandler):
             "sources": [{"label": l, "url": u} for l, u in sources],
             "kg_nodes": len(GRAPH.nodes), "kg_edges": len(GRAPH.edges),
         }
-        body = json.dumps(payload, default=str).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json(payload)
 
     # --- streaming run --------------------------------------------------- #
     def _stream(self, qs):
         query = (qs.get("query", [""])[0] or cso.DEFAULT_QUERY).strip()
         demo = qs.get("demo", ["0"])[0] in ("1", "true")
         live = qs.get("live", ["0"])[0] in ("1", "true")
+        partial = qs.get("partial", ["0"])[0] in ("1", "true")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -343,7 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         try:
-            for event, data in run_loop(query, demo=demo, live=live):
+            for event, data in run_loop(query, demo=demo, live=live, partial=partial):
                 self.wfile.write(_sse(event, data))
                 self.wfile.flush()
         except BrokenPipeError:
@@ -382,7 +480,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser(description="Live server for the Virtual Biotech CSO frontend.")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--backend", choices=["auto", "anthropic", "openai", "claude-cli", "stub"],
+    p.add_argument("--backend", choices=["auto", "anthropic", "openai", "gemini", "claude-cli", "stub"],
                    default="auto", help="Agent backend (default: auto)")
     p.add_argument("--model", default=None, help="Override the model id")
     args = p.parse_args()

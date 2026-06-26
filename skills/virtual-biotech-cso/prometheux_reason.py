@@ -593,6 +593,69 @@ def reason(graph: KG.KnowledgeGraph | None = None, *, prefer: str = "auto") -> R
 
 
 # --------------------------------------------------------------------------- #
+# 5. Ranking explanations — surface the `differentiates` rule (explain-a-rank)
+# --------------------------------------------------------------------------- #
+def rank_explanations(graph: KG.KnowledgeGraph | None = None, *,
+                      prefer: str = "auto") -> list[dict[str, Any]]:
+    """Surface the ``differentiates`` rule as structured ranking edges.
+
+    ``differentiates(A, B, Ax)`` means *A ranks over B on axis Ax* — A has a strong
+    claim there and B has only weak evidence. The rule is already evaluated by
+    :func:`reason` (live Prometheux or the local fallback, same split); this function
+    just shapes its output into the explain-a-rank edges the report and the frontend
+    consume, one per (winner, loser, axis)::
+
+        {"winner": str, "loser": str, "axis": str,
+         "explanation": str,           # natural-language rule chain
+         "fact": "differentiates(A, B, Ax)"}
+
+    A target that wins on more axes is the better-supported one — but the value here
+    is the *why*, not a bare rank: every edge names the axis and the evidence
+    asymmetry that produced it. Returns ``[]`` when the graph has fewer than two
+    targets (nothing to differentiate).
+    """
+    result = reason(graph, prefer=prefer)
+    edges: list[dict[str, Any]] = []
+    for row in result.derived.get("differentiates", []):
+        if len(row) != 3:
+            continue
+        a, b, ax = row
+        edges.append({
+            "winner": _short(a), "loser": _short(b), "axis": ax,
+            "explanation": f"{_short(a)} ranks over {_short(b)} on {ax}: "
+                           f"{_short(a)} has a strong claim there, {_short(b)} does not",
+            "fact": f"differentiates({a}, {b}, {ax})",
+        })
+    return edges
+
+
+def rank_targets(graph: KG.KnowledgeGraph | None = None, *,
+                 prefer: str = "auto") -> list[dict[str, Any]]:
+    """Aggregate the ranking edges into a per-target leaderboard.
+
+    Counts the axes each target wins on (``differentiates`` edges where it is the
+    winner) minus the axes it loses on, giving a transparent net-wins score whose
+    every point traces back to a named axis in :func:`rank_explanations`. Sorted best
+    first; ties broken by fewer losses then name. Returns ``[]`` for a single target.
+    """
+    edges = rank_explanations(graph, prefer=prefer)
+    wins: dict[str, set[str]] = {}
+    losses: dict[str, set[str]] = {}
+    for e in edges:
+        wins.setdefault(e["winner"], set()).add(e["axis"])
+        losses.setdefault(e["loser"], set()).add(e["axis"])
+    targets = set(wins) | set(losses)
+    board = [{
+        "target": t,
+        "wins_on": sorted(wins.get(t, set())),
+        "loses_on": sorted(losses.get(t, set())),
+        "net_wins": len(wins.get(t, set())) - len(losses.get(t, set())),
+    } for t in targets]
+    board.sort(key=lambda r: (-r["net_wins"], len(r["loses_on"]), r["target"]))
+    return board
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv: list[str] | None = None) -> int:
@@ -602,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vada", action="store_true", help="print the compiled Vadalog program and exit")
     p.add_argument("--gaps", action="store_true", help="run the reviewer gap-detector and exit")
     p.add_argument("--decide", action="store_true", help="run the GO/NO-GO decision layer and exit")
+    p.add_argument("--rank", action="store_true", help="explain-a-rank: why target A ranks over B")
     p.add_argument("--target", default="", help="target symbol for --decide (else inferred from the graph)")
     p.add_argument("--json", action="store_true", help="emit the result as JSON")
     args = p.parse_args(argv)
@@ -630,6 +694,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         print(f"decision: {decision['tier']}  (score {decision['score']}/{decision['max_score']})")
         print(f"  {decision['explanation']}")
+        return 0
+
+    if args.rank:
+        edges = rank_explanations(graph, prefer=args.prefer)
+        board = rank_targets(graph, prefer=args.prefer)
+        if args.json:
+            print(json.dumps({"leaderboard": board, "edges": edges}, indent=2))
+            return 0
+        if not edges:
+            print("explain-a-rank — fewer than two comparable targets on the graph; "
+                  "nothing to differentiate yet.")
+            return 0
+        print(f"explain-a-rank — leaderboard ({len(board)} targets):")
+        for r in board:
+            print(f"  {r['net_wins']:+d}  {r['target']}  "
+                  f"(wins on {', '.join(r['wins_on']) or '—'})")
+        print(f"\nranking edges ({len(edges)}):")
+        for e in edges:
+            print(f"  • {e['explanation']}")
         return 0
 
     if args.gaps:

@@ -694,7 +694,8 @@ def _norm_liabilities(synthesis: dict[str, Any] | None) -> list[str]:
 def synthesize_report(query: str, case: str, briefing: dict[str, Any],
                       results: list[dict[str, Any]], review: dict[str, Any],
                       synthesis: dict[str, Any] | None, demo: bool,
-                      decision_engine: dict[str, Any] | None = None) -> str:
+                      decision_engine: dict[str, Any] | None = None,
+                      ranking: list[dict[str, Any]] | None = None) -> str:
     """Build a structured target-identification dossier from the assembled evidence."""
     syn = synthesis or {}
     symbol = (case or "target").upper()
@@ -737,6 +738,15 @@ def synthesize_report(query: str, case: str, briefing: dict[str, Any],
     else:
         L += ["_Recommendation is written by the driving agent from the evidence below "
               "(`prompts/orchestrator.md`)._", ""]
+
+    # 1b — Comparative ranking (Prometheux explain-a-rank, only with a rival on the graph)
+    if ranking:
+        L += ["## Comparative ranking", "",
+              "_Deductive explain-a-rank over the accumulated evidence graph: each edge "
+              "names the axis on which one target has a strong claim the other lacks._", ""]
+        for e in ranking:
+            L.append(f"- **{e['winner']} > {e['loser']}** on _{e['axis']}_ — {e['explanation']}")
+        L.append("")
 
     # 2 — Target overview
     L += ["## Target overview", "",

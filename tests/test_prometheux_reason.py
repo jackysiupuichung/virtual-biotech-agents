@@ -104,6 +104,32 @@ def test_full_coverage_yields_no_gaps() -> None:
     assert pr.gaps_from_evidence(results, "B7-H3") == []
 
 
+def test_rank_explanations_names_the_differentiating_axis(graph: KG.KnowledgeGraph) -> None:
+    """MET clears the strong gate on specificity; B7-H3 does not → a ranking edge."""
+    edges = pr.rank_explanations(graph, prefer="local")
+    spec = [e for e in edges if e["axis"] == "specificity"]
+    assert spec, "expected a specificity ranking edge"
+    e = spec[0]
+    assert e["winner"] == "met" and e["loser"] == "b7-h3"
+    assert "specificity" in e["explanation"]
+    assert e["fact"].startswith("differentiates(")
+
+
+def test_rank_targets_leaderboard_orders_by_net_wins(graph: KG.KnowledgeGraph) -> None:
+    board = pr.rank_targets(graph, prefer="local")
+    assert [r["target"] for r in board][0] == "met"  # MET wins specificity, loses none
+    assert "specificity" in board[0]["wins_on"]
+
+
+def test_rank_explanations_empty_for_single_target() -> None:
+    """Nothing to differentiate with one target → no ranking edges."""
+    g = KG.KnowledgeGraph(store=Path(tempfile.mktemp(suffix=".json")))
+    g.upsert_edge("target:solo", "disease:luad", "SPECIFIC_TO", conf=0.9,
+                  axis="specificity", run="r1")
+    assert pr.rank_explanations(g, prefer="local") == []
+    assert pr.rank_targets(g, prefer="local") == []
+
+
 def test_decision_go_requires_strong_safety_and_coverage() -> None:
     """Full coverage with a strong safety read clears the GO bar (score 3.0)."""
     results = [
