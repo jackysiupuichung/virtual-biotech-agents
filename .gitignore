@@ -8,6 +8,11 @@ __pycache__/
 # uv / venv
 .venv/
 
+# Secrets — never commit real env files (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
 # Generated skill / workflow output (runtime artifacts, not source)
 output/
 
