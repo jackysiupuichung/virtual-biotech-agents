@@ -302,7 +302,10 @@ class _LangfuseExporter:
             for sp in spans:  # already sorted parent-before-child by start time
                 parent = objs.get(sp.parent_id) or root_obs
                 obs = parent.start_observation(**self._obs_kwargs(sp))
-                self._emit_scores(sp, obs)  # judge verdict → Langfuse scores
+                try:
+                    self._emit_scores(sp, obs)  # judge verdict → Langfuse scores
+                except Exception:  # noqa: BLE001 — scoring is additive; keep the tree
+                    pass
                 obs.end()
                 objs[sp.span_id] = obs
 
