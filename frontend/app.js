@@ -1041,7 +1041,7 @@ function LoopGraph({
     rerouted
   } = useMemo(() => flowFromRun(run), [run]);
   const W = 1180,
-    H = 360;
+    H = 400;
   // column x-anchors across the canvas
   const X = {
     input: 30,
@@ -1074,6 +1074,8 @@ function LoopGraph({
   const csoY = H / 2 - 32,
     csoH = 64,
     csoW = 96;
+  const briefY = 14,
+    briefH = 36; // Chief-of-Staff node, anchored at the top with a return loop to CSO
   const revStep = cols.review[cols.review.length - 1];
   const synthStep = cols.synth[cols.synth.length - 1];
   const briefStep = cols.brief[0],
@@ -1140,11 +1142,11 @@ function LoopGraph({
     },
     label: "CSO",
     sub: "route"
-  }), flow(`M${X.cso + csoW} ${H / 2 - 14} C${X.brief - 40} ${H / 2 - 14} ${X.brief - 40} ${divY(0) - 60} ${X.brief - 4} ${divY(0) - 60}`, "cso-brief"), /*#__PURE__*/React.createElement(FlowNode, {
+  }), flow(`M${X.cso + csoW} ${H / 2 - 14} C${X.brief - 40} ${H / 2 - 14} ${X.brief - 40} ${briefY + briefH / 2} ${X.brief - 4} ${briefY + briefH / 2}`, "cso-brief"), flow(`M${X.brief - 8} ${briefY + briefH / 2 + 10} C${X.cso + csoW + 30} ${briefY + briefH / 2 + 10} ${X.cso + csoW + 30} ${H / 2 - 24} ${X.cso + csoW + 4} ${H / 2 - 24}`, "brief-cso", GSTATE.reroute.stroke, "5 4"), /*#__PURE__*/React.createElement(FlowNode, {
     x: X.brief,
-    y: divY(0) - 78,
+    y: briefY,
     w: 170,
-    h: 36,
+    h: briefH,
     step: briefStep,
     label: "Chief of Staff",
     sub: "brief · decompose",
@@ -1202,15 +1204,15 @@ function LoopGraph({
     label: (run.decision || "PENDING").replace("_", " ").split(" ")[0] || "PENDING",
     sub: run.decision === "PENDING" ? "awaiting" : "verdict"
   }), rerouted && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("path", {
-    d: `M${X.review} ${H / 2 + 30} C${X.review} ${H - 24} ${X.div} ${H - 24} ${X.cso + csoW / 2} ${H - 24} L${X.cso + csoW / 2} ${csoY + csoH + 2}`,
+    d: `M${X.review + 60} ${H / 2 + 30} C${X.review + 60} ${H - 12} ${X.review + 40} ${H - 12} ${X.review} ${H - 12} H${X.cso + csoW / 2 + 22} C${X.cso + csoW / 2} ${H - 12} ${X.cso + csoW / 2} ${H - 12} ${X.cso + csoW / 2} ${csoY + csoH + 2}`,
     fill: "none",
     stroke: GSTATE.reroute.stroke,
     strokeWidth: "1.7",
     strokeDasharray: "6 5",
     markerEnd: "url(#flowArrLoop)"
   }), /*#__PURE__*/React.createElement("rect", {
-    x: X.div - 10,
-    y: H - 36,
+    x: (X.cso + X.review) / 2 - 110,
+    y: H - 41,
     width: "240",
     height: "22",
     rx: "11",
@@ -1218,8 +1220,8 @@ function LoopGraph({
     stroke: GSTATE.reroute.stroke,
     strokeOpacity: "0.35"
   }), /*#__PURE__*/React.createElement("text", {
-    x: X.div + 110,
-    y: H - 21,
+    x: (X.cso + X.review) / 2 + 10,
+    y: H - 26,
     textAnchor: "middle",
     fontSize: "10",
     fontFamily: "'JetBrains Mono',monospace",
