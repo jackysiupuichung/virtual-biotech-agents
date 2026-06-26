@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="docs/assets/hero.png" alt="Virtual Biotech CSO — evidence graph over a protein target" width="100%" />
-
 # 🧬 Virtual Biotech CSO
 
 ### A multi-agent AI that nominates drug targets — and *shows its work*
