@@ -4,6 +4,7 @@ description: For a (target, disease) pair, fetch the Open Targets association sc
 license: MIT
 metadata:
   version: "0.1.0"
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Jacky Siu
   domain: target-discovery
   tags:

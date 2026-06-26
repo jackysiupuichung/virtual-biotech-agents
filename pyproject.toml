@@ -14,6 +14,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Live multi-agent loop for virtual-biotech-cso (skills/virtual-biotech-cso/harness.py).
+# Optional so the leaf skills and the offline cso.py --demo stay dependency-free.
+agents = [
+    "anthropic>=0.40",
+    "openai>=1.40",
+]
+# Optional hosted span UI for the harness trace (skills/virtual-biotech-cso/tracing.py).
+# The in-tree trace.jsonl needs nothing extra; this only enables the Langfuse mirror,
+# which activates when LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set. SDK v4 API.
+tracing = [
+    "langfuse>=4.0",
+]
+# Optional Vadalog reasoning over the evidence graph (frontend/prometheux_reason.py).
+# Activates the live hosted Prometheux engine when PMTX_TOKEN is set; absent it, the
+# in-process Datalog fallback runs the same rules with no dependency at all.
+reasoning = [
+    "prometheux_chain>=0.2.14",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

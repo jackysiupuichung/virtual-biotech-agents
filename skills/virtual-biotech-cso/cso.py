@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ DEMO_DATA_DIR = SKILL_DIR / "demo_data"
 ORCHESTRATOR_PROMPT = PROMPTS_DIR / "orchestrator.md"
 CHIEF_OF_STAFF_PROMPT = PROMPTS_DIR / "chief_of_staff.md"
 REVIEWER_PROMPT = PROMPTS_DIR / "reviewer.md"
+DIVISION_SCIENTIST_PROMPT = PROMPTS_DIR / "division_scientist.md"
 
 DEFAULT_QUERY = "Assess B7-H3 potential as a therapeutic target in lung cancer"
 DEMO_SOURCE = "cached demo (illustrative)"
@@ -86,6 +88,8 @@ SOURCE_REGISTRY: dict[str, dict[str, str]] = {
     "clinpgx": {"name": "ClinPGx (PharmGKB/CPIC)", "url": "https://www.clinpgx.org/"},
     "openfda-safety": {"name": "openFDA FAERS / drug label",
                        "url": "https://open.fda.gov/"},
+    "lit-synthesizer": {"name": "Tavily Search API (recent literature / competitive / safety)",
+                        "url": "https://tavily.com/"},
     "clinical-trial-finder": {"name": "ClinicalTrials.gov API v2 (+ EUCTR)",
                               "url": "https://clinicaltrials.gov/"},
     "equity-scorer": {"name": "population genetic references (HEIM)", "url": ""},
@@ -180,14 +184,245 @@ def decompose_and_route(query: str, case: str, routing: dict[str, Any]) -> list[
     ]
 
 
-def _reroute_task(gap: dict[str, Any]) -> Subtask:
-    """Build a follow-up Subtask from a reviewer gap."""
+class PlanValidationError(ValueError):
+    """An agent-proposed plan referenced a division/intent/dep that doesn't exist."""
+
+
+def _routable_intents(routing: dict[str, Any]) -> dict[str, set[str]]:
+    """Map each division → the set of intents it can route (from routing.yaml)."""
+    return {
+        division: {intent for intent, entry in intents.items() if isinstance(entry, dict)}
+        for division, intents in routing.items()
+        if isinstance(intents, dict)
+    }
+
+
+def validate_and_bind_plan(
+    proposed: list[dict[str, Any]], routing: dict[str, Any]
+) -> list[Subtask]:
+    """Validate an *agent-proposed* plan and bind each step to a real skill.
+
+    This is the inverse of ``decompose_and_route``: rather than generating the plan
+    deterministically, the driving agent (Chief of Staff / CSO role) proposes it and
+    this function keeps it honest — it is a **validator, not a generator**. It
+
+      * rejects divisions / intents that don't exist in ``routing.yaml`` (no invented
+        skills — the same no-fabrication contract the deterministic path enforces),
+      * resolves each ``(division, intent)`` to its real skill via ``_skill_for``,
+      * assigns stable ``step_NN_<intent>`` ids,
+      * validates that every ``depends_on`` names an earlier step in the plan.
+
+    A proposed step is a dict: ``{division, intent, question, depends_on?}``. Raises
+    :class:`PlanValidationError` on any unroutable reference so the harness can fall
+    back to the deterministic plan rather than execute something fabricated.
+    """
+    if not isinstance(proposed, list) or not proposed:
+        raise PlanValidationError("proposed plan is empty or not a list")
+
+    routable = _routable_intents(routing)
+    subtasks: list[Subtask] = []
+    seen_steps: set[str] = set()
+    for i, entry in enumerate(proposed, 1):
+        if not isinstance(entry, dict):
+            raise PlanValidationError(f"plan step {i} is not an object")
+        division = entry.get("division")
+        intent = entry.get("intent")
+        if division not in routable:
+            raise PlanValidationError(
+                f"plan step {i}: unknown division {division!r} "
+                f"(valid: {sorted(routable)})")
+        if intent not in routable[division]:
+            raise PlanValidationError(
+                f"plan step {i}: intent {intent!r} not routable under {division!r} "
+                f"(valid: {sorted(routable[division])})")
+
+        skill = _skill_for(routing, division, intent)
+        if skill == "unrouted-skill":
+            raise PlanValidationError(
+                f"plan step {i}: {division}/{intent} resolved to no skill")
+
+        step = f"step_{i:02d}_{intent}"
+        deps = entry.get("depends_on") or []
+        if not isinstance(deps, list):
+            raise PlanValidationError(f"plan step {i}: depends_on must be a list")
+        for dep in deps:
+            if dep not in seen_steps:
+                raise PlanValidationError(
+                    f"plan step {i}: depends_on {dep!r} is not an earlier step")
+
+        question = entry.get("question") or f"{division}/{intent} for the target"
+        subtasks.append(Subtask(step=step, division=division, question=str(question),
+                                skill=skill, depends_on=list(deps)))
+        seen_steps.add(step)
+    return subtasks
+
+
+def catalog_skills(routing: dict[str, Any]) -> set[str]:
+    """Every skill name reachable in routing.yaml (primary ``skill`` + ``also`` lists).
+
+    Used to validate an *agent-chosen* reroute target — the reviewer may only route
+    to a skill that actually exists in the catalog, never an invented one.
+    """
+    skills: set[str] = set()
+    for intents in routing.values():
+        if not isinstance(intents, dict):
+            continue
+        for entry in intents.values():
+            if isinstance(entry, dict):
+                if isinstance(entry.get("skill"), str):
+                    skills.add(entry["skill"])
+                skills.update(s for s in entry.get("also", []) if isinstance(s, str))
+    return skills
+
+
+REROUTE_FALLBACK_SKILL = "lit-synthesizer"  # the routing.yaml-designated reroute target
+
+
+def group_by_division(subtasks: list[Subtask]) -> list[tuple[str, list[Subtask]]]:
+    """Group routed subtasks by division, preserving first-seen order.
+
+    Each group becomes one **division scientist agent** (Virtual Biotech structure:
+    the CSO delegates to domain-specialised scientist agents). Order-stable so the
+    trace and report are deterministic.
+    """
+    order: list[str] = []
+    groups: dict[str, list[Subtask]] = {}
+    for t in subtasks:
+        if t.division not in groups:
+            groups[t.division] = []
+            order.append(t.division)
+        groups[t.division].append(t)
+    return [(d, groups[d]) for d in order]
+
+
+def _reroute_task(gap: dict[str, Any], routing: dict[str, Any] | None = None,
+                  step_n: int = 6, executed: set[str] | None = None) -> Subtask:
+    """Build a follow-up Subtask from a reviewer gap (change #3: validated target).
+
+    The reviewer *chooses* ``route_to``; we keep it honest — if it names a skill that
+    isn't in the catalog (or names none), fall back to the routing.yaml-designated
+    reroute target rather than executing an invented skill. ``step_n`` lets the
+    bounded review loop (change #2) number successive reroutes step_06, step_07, ….
+
+    ``executed`` is the set of skills already run this assessment. It is used by
+    the caller for convergence (a reroute that names an already-run skill adds no
+    evidence, so the loop stops); we surface it here only so the returned Subtask
+    carries the chosen skill faithfully — we do **not** substitute an arbitrary
+    unrun skill, since an off-axis skill (e.g. a pharmacogenomics tool for a
+    specificity gap) is worse than not re-routing at all.
+    """
+    executed = executed or set()
+    chosen = gap.get("route_to")
+    if routing is not None and chosen not in catalog_skills(routing):
+        chosen = REROUTE_FALLBACK_SKILL
+    elif not chosen:
+        chosen = REROUTE_FALLBACK_SKILL
     return Subtask(
-        step="step_06_reroute",
+        step=f"step_{step_n:02d}_reroute",
         division="target_id_and_prioritization",
         question=f"Reviewer follow-up: {gap.get('missing', 'fill gap')} — {gap.get('why', '')}".strip(),
-        skill=gap.get("route_to", "scrna-orchestrator"),
+        skill=chosen,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer panel — N lens-specialised reviewers, deterministically aggregated
+# --------------------------------------------------------------------------- #
+# Each lens is an independent skeptic with a distinct focus. The harness fans
+# these out concurrently (one agent call each) and aggregate_panel_review folds
+# their verdicts into the single review payload _review_loop already consumes.
+REVIEWER_LENSES = [
+    {"key": "safety",
+     "focus": "off-target / broad-tissue expression and adverse-event risk. Flag any target "
+              "advanced without a safety read; a broad-expression target is a liability."},
+    {"key": "genetics",
+     "focus": "strength of germline/somatic support. Flag over-reach — correlational ORs or "
+              "weak associations stated as causal. Absent GWAS is non-disqualifying for IO."},
+    {"key": "specificity",
+     "focus": "cell-type and malignant-cell localization. For ADC/CAR-T, flag specificity that "
+              "is stromal rather than tumour-cell; that materially changes the conclusion."},
+    {"key": "clinical",
+     "focus": "trial precedent and translatability. Flag a recommendation with no clinical or "
+              "competitive-landscape context, or stale evidence needing a literature check."},
+]
+
+PANEL_REROUTE_MIN_VOTES = 2  # re-route when >= this many lenses flag a gap
+
+
+def _axis_min(reviews: list[dict[str, Any]], axis: str) -> int | None:
+    """Skeptical score aggregation: the weakest lens sets the panel score per axis."""
+    vals = [r.get("scores", {}).get(axis) for r in reviews]
+    nums = [v for v in vals if isinstance(v, (int, float))]
+    return int(min(nums)) if nums else None
+
+
+def aggregate_panel_review(lens_reviews: list[tuple[str, dict[str, Any]]],
+                           routing: dict[str, Any] | None = None,
+                           min_votes: int = PANEL_REROUTE_MIN_VOTES,
+                           extra_gaps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Fold N lens verdicts into one review payload (deterministic, testable).
+
+    - verdict: ``re-route`` iff >= ``min_votes`` lenses returned ``re-route``; the
+      panel is skeptical but not hair-trigger (one lone dissent doesn't reroute).
+      **Exception:** any ``extra_gaps`` entry with ``forces_reroute`` (e.g. a
+      Prometheux-derived *structural* gap — a required axis with no evidence at all)
+      forces ``re-route`` regardless of the lens vote count. A proven missing axis is
+      a deductive fact, not a judgement, so the engine is a non-silenceable member.
+    - gaps: union across lenses **and** ``extra_gaps``, deduped by (route_to, missing);
+      each tagged with the lenses that raised it. ``extra_gaps`` are treated as a lens
+      whose key they carry (``["prometheux"]``). A forcing gap sorts first so
+      _review_loop reroutes on it. If ``routing`` is given, a gap whose ``route_to``
+      isn't in the catalog is kept but validated downstream by _reroute_task.
+    - scores: min per axis across lenses (weakest link).
+    - experiments: union across lenses.
+    The ``lens`` provenance on each gap is what makes "survived N skeptics" auditable.
+    """
+    reviews = [r for _, r in lens_reviews]
+    votes = sum(1 for r in reviews if r.get("verdict") == "re-route")
+
+    seen: dict[tuple, dict[str, Any]] = {}
+    for key, r in lens_reviews:
+        for gap in r.get("gaps", []) or []:
+            if not isinstance(gap, dict):
+                continue
+            sig = (gap.get("route_to"), gap.get("missing"))
+            if sig in seen:
+                seen[sig].setdefault("lenses", []).append(key)
+            else:
+                g = dict(gap)
+                g["lenses"] = [key]
+                seen[sig] = g
+    for gap in extra_gaps or []:
+        if not isinstance(gap, dict):
+            continue
+        sig = (gap.get("route_to"), gap.get("missing"))
+        if sig in seen:
+            # merge: keep the forcing flag + explanation, union the lens provenance
+            seen[sig].update({k: v for k, v in gap.items() if k != "lenses"})
+            for lk in gap.get("lenses", []):
+                if lk not in seen[sig].setdefault("lenses", []):
+                    seen[sig]["lenses"].append(lk)
+        else:
+            seen[sig] = dict(gap)
+    gaps = list(seen.values())
+    # A proven structural gap forces re-route even without the min_votes lens majority.
+    forced = any(g.get("forces_reroute") for g in gaps)
+    verdict = "re-route" if (votes >= min_votes or forced) else "synthesize"
+    # Forcing gaps first, then most-corroborated, so _review_loop reroutes on them.
+    gaps.sort(key=lambda g: (bool(g.get("forces_reroute")), len(g.get("lenses", []))),
+              reverse=True)
+
+    experiments = [e for _, r in lens_reviews for e in (r.get("experiments", []) or [])]
+    return {
+        "verdict": verdict,
+        "scores": {axis: _axis_min(reviews, axis)
+                   for axis in ("relevance", "evidence", "thoroughness")},
+        "gaps": gaps,
+        "experiments": experiments,
+        "panel": {"n_lenses": len(lens_reviews), "reroute_votes": votes,
+                  "min_votes": min_votes, "forced_by_engine": forced,
+                  "lenses": [k for k, _ in lens_reviews]},
+    }
 
 
 def _agent_task(role: str, prompt_path: Path, context: str) -> dict[str, Any]:
@@ -239,14 +474,86 @@ def load_briefing(query: str, case: str, demo: bool) -> dict[str, Any]:
     }
 
 
-def _run_skill_live(skill: str) -> dict[str, Any]:
-    """Execute a routed skill through the ClawBio runtime (best-effort, no LLM).
+# In-repo leaf skills the CSO can execute directly (no external ClawBio runtime):
+# script path relative to REPO_ROOT/skills + the args that run its offline --demo.
+# Used as the first resolution for re-route/routed steps so a live run actually
+# executes (e.g. the reviewer re-routing to lit-synthesizer for current evidence).
+LOCAL_SKILLS: dict[str, str] = {
+    "lit-synthesizer": "lit-synthesizer/lit_synthesizer.py",
+    "openfda-safety": "openfda-safety/openfda_safety.py",
+    "celltype-specificity-profiler": "celltype-specificity-profiler/profiler.py",
+    "clinical-trial-finder": "clinical-trial-finder/clinical_trial_finder.py",
+}
 
-    Imports clawbio.py's run_skill (the bio-orchestrator pattern) and runs the
-    skill in its demo mode as a stand-in for a configured live run. Any failure
-    (skill not registered, needs input, no runtime) returns an honest envelope
-    rather than a fabricated result.
+
+def _local_skill_args(skill: str, live: bool, target: str | None) -> list[str]:
+    """CLI args for an in-repo leaf skill.
+
+    In ``--live`` we run the skill for real where it can: ``lit-synthesizer`` does a
+    **live Tavily search** for ``target`` (real-time current-evidence acquisition —
+    the sponsor-tool + autonomy path) when ``TAVILY_API_KEY`` is set. Everything else,
+    and any live skill lacking its key/input, falls back to the offline ``--demo`` so
+    the run still produces honest, labelled evidence rather than failing.
     """
+    if live and skill == "lit-synthesizer" and target and os.environ.get("TAVILY_API_KEY"):
+        return ["--target", target]
+    # clinical-trial-finder hits the public ClinicalTrials.gov API v2 — no key needed,
+    # so a live run queries real trials (and real NCT deep links) whenever a target is set.
+    if live and skill == "clinical-trial-finder" and target:
+        return ["--target", target]
+    return ["--demo"]
+
+
+def _run_local_skill(skill: str, live: bool = False,
+                     target: str | None = None) -> dict[str, Any] | None:
+    """Run an in-repo leaf skill via its own CLI. None if unknown.
+
+    Returns the skill's JSON envelope (its landscape.json/safety.json/etc.) so the
+    CSO can fold real routed-skill output into the evidence chain without an
+    external runtime. Honest 'not executed' on any failure; never fabricates.
+    """
+    if skill not in LOCAL_SKILLS:
+        return None
+    import subprocess
+    import tempfile
+
+    rel = LOCAL_SKILLS[skill]
+    args = _local_skill_args(skill, live, target)
+    script = REPO_ROOT / "skills" / rel
+    if not script.exists():
+        return {"status": "not executed", "reason": f"{skill}: script not found at {script}."}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            proc = subprocess.run(
+                [sys.executable, str(script), *args, "--output", td],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                return {"status": "not executed",
+                        "reason": f"{skill} exited {proc.returncode}: {proc.stderr.strip()[:200]}"}
+            via = f"{skill} {' '.join(args)}"  # e.g. 'lit-synthesizer --target B7-H3 ...'
+            # Fold the richest JSON artifact the skill wrote into the evidence row.
+            for name in ("landscape.json", "safety.json", "result.json", "profile.json"):
+                p = Path(td) / name
+                if p.exists():
+                    payload = json.loads(p.read_text())
+                    return {"status": "ok", "via": via, **payload}
+            return {"status": "ok", "via": via, "stdout": proc.stdout.strip()[:400]}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _run_skill_live(skill: str, target: str | None = None) -> dict[str, Any]:
+    """Execute a routed skill (best-effort, no LLM).
+
+    Resolution: an in-repo leaf skill via its own CLI first (LOCAL_SKILLS) — run live
+    where it can (e.g. lit-synthesizer → live Tavily for ``target``), else its offline
+    --demo — then fall back to an external clawbio.py run_skill runtime. Any failure
+    returns an honest envelope rather than a fabricated result.
+    """
+    local = _run_local_skill(skill, live=True, target=target)
+    if local is not None:
+        return local
     try:
         import importlib.util
 
@@ -262,11 +569,13 @@ def _run_skill_live(skill: str) -> dict[str, Any]:
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def execute_skill(task: Subtask, case: str, demo: bool, live: bool) -> dict[str, Any]:
+def execute_skill(task: Subtask, case: str, demo: bool, live: bool,
+                  target: str | None = None) -> dict[str, Any]:
     """STEP C: produce a result envelope for a routed skill.
 
     Resolution order: cached demo fixture → live ClawBio run → honest stub.
-    No LLM is involved at any point.
+    ``target`` (the query's "<gene> in <disease>") is passed to skills that take it
+    live — notably lit-synthesizer's real-time Tavily search. No LLM is involved.
     """
     envelope = {
         "step": task.step,
@@ -285,7 +594,7 @@ def execute_skill(task: Subtask, case: str, demo: bool, live: bool) -> dict[str,
         envelope["source"] = "unavailable"
         return envelope
     if live:
-        envelope["result"] = _run_skill_live(task.skill)
+        envelope["result"] = _run_skill_live(task.skill, target=target)
         envelope["source"] = "clawbio" if envelope["result"].get("status") == "ok" else "unavailable"
         return envelope
     envelope["result"] = {
@@ -364,6 +673,22 @@ def _evidence_grade(env: dict[str, Any]) -> str:
         src, "absent")
 
 
+_NCT_RE = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+_EUCTR_RE = re.compile(r"\b\d{4}-\d{6}-\d{2}\b")
+
+
+def _trial_deep_link(text: str) -> str:
+    """Deep link to the actual trial record if `text` names a registry id, else ""."""
+    m = _NCT_RE.search(text or "")
+    if m:
+        return f"https://clinicaltrials.gov/study/{m.group(0).upper()}"
+    m = _EUCTR_RE.search(text or "")
+    if m:
+        return ("https://www.clinicaltrialsregister.eu/ctr-search/search"
+                f"?query={m.group(0)}")
+    return ""
+
+
 def _evidence_reference(env: dict[str, Any]) -> str:
     """A traceable citation for one evidence step: registry source + harvested provenance."""
     skill = env.get("skill", "")
@@ -377,8 +702,12 @@ def _evidence_reference(env: dict[str, Any]) -> str:
         if res.get("source") and str(res["source"]) not in bits:
             bits.append(str(res["source"]))
     cite = "; ".join(_md_escape(str(b)) for b in bits if b)
-    if reg.get("url"):
-        cite += f" — {reg['url']}"
+    # Prefer a deep link to the *actual* trial record (NCT…/EUCTR id) over the
+    # registry homepage, so trial citations point at the study, not clinicaltrials.gov/.
+    deep = _trial_deep_link(json.dumps(res, default=str)) if isinstance(res, dict) else ""
+    url = deep or reg.get("url", "")
+    if url:
+        cite += f" — {url}"
     return cite
 
 
@@ -397,7 +726,9 @@ def _norm_liabilities(synthesis: dict[str, Any] | None) -> list[str]:
 
 def synthesize_report(query: str, case: str, briefing: dict[str, Any],
                       results: list[dict[str, Any]], review: dict[str, Any],
-                      synthesis: dict[str, Any] | None, demo: bool) -> str:
+                      synthesis: dict[str, Any] | None, demo: bool,
+                      decision_engine: dict[str, Any] | None = None,
+                      ranking: list[dict[str, Any]] | None = None) -> str:
     """Build a structured target-identification dossier from the assembled evidence."""
     syn = synthesis or {}
     symbol = (case or "target").upper()
@@ -411,10 +742,32 @@ def synthesize_report(query: str, case: str, briefing: dict[str, Any],
               "illustrative fixtures** (B7-H3 walkthrough), not live results.", ""]
 
     # 1 — Executive summary (decision + confidence + recommendation)
-    decision = syn.get("decision") or ("REVIEW" if executed else "REVIEW")
+    # The Prometheux decision layer derives the tier deductively from per-axis
+    # coverage; when present it is authoritative for the Decision field, and the
+    # agent's free-text becomes rationale. If the two disagree, both are shown and
+    # the divergence is flagged — the derived tier is never silently overridden.
+    agent_decision = syn.get("decision")
     confidence = syn.get("confidence") or ("see reviewer scores" if executed else "n/a")
-    L += ["## Executive summary", "",
-          f"- **Decision:** {decision}", f"- **Confidence:** {confidence}", ""]
+    L += ["## Executive summary", ""]
+    if decision_engine:
+        tier = decision_engine["tier"]
+        L += [f"- **Decision:** {tier} "
+              f"_(derived · coverage {decision_engine['score']}/{decision_engine['max_score']})_",
+              f"- **Confidence:** {confidence}",
+              f"- **Basis:** {decision_engine['explanation']}"]
+        absent = decision_engine.get("absent_axes") or []
+        if absent:
+            L += [f"- **No information on:** {', '.join(absent)} "
+                  "— absent (not weak evidence); the score reflects absence."]
+        L += [""]
+        if agent_decision and agent_decision != tier:
+            L += [f"> ⚠️ **Divergence:** the synthesis agent proposed **{agent_decision}**, "
+                  f"but the deductive decision layer derives **{tier}** from the evidence "
+                  "coverage. The derived tier is the Decision of record; the agent's "
+                  "rationale is below.", ""]
+    else:
+        decision = agent_decision or "REVIEW"
+        L += [f"- **Decision:** {decision}", f"- **Confidence:** {confidence}", ""]
     if syn.get("recommendation"):
         L += [str(syn["recommendation"]), ""]
     elif not executed:
@@ -423,6 +776,15 @@ def synthesize_report(query: str, case: str, briefing: dict[str, Any],
     else:
         L += ["_Recommendation is written by the driving agent from the evidence below "
               "(`prompts/orchestrator.md`)._", ""]
+
+    # 1b — Comparative ranking (Prometheux explain-a-rank, only with a rival on the graph)
+    if ranking:
+        L += ["## Comparative ranking", "",
+              "_Deductive explain-a-rank over the accumulated evidence graph: each edge "
+              "names the axis on which one target has a strong claim the other lacks._", ""]
+        for e in ranking:
+            L.append(f"- **{e['winner']} > {e['loser']}** on _{e['axis']}_ — {e['explanation']}")
+        L.append("")
 
     # 2 — Target overview
     L += ["## Target overview", "",

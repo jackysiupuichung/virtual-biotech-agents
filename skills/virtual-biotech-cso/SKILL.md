@@ -4,6 +4,7 @@ description: Multi-agent therapeutic-target-assessment orchestrator — a Chief-
 license: MIT
 metadata:
   version: "0.1.0"
+  role: orchestrator  # routes to and synthesizes capability skills (not a leaf skill)
   author: Jacky Siu
   domain: orchestration
   tags:
@@ -92,13 +93,49 @@ ClawBio has the specialist skills (genetics, single-cell, safety, clinical) but 
 - **With it**: One query yields a routed evidence chain plus a structured scaffold for the briefing, reviewer audit, and synthesis — in the standard `report.md` + `result.json` contract.
 - **Why ClawBio**: Routing stays declarative (`routing.yaml`), execution stays in the validated skills, and — like `lit-synthesizer` — the skill itself calls no model. The reasoning roles are delegated to the **driving agent** (e.g. Claude Code), which can fan them out into subagents using the prompts in `prompts/`. No API key, no fabricated biology.
 
+## Architecture (Virtual Biotech org chart)
+
+This skill is the **CSO orchestrator**, not a peer of the leaf skills it calls. It mirrors the
+Virtual Biotech (Zhang et al. 2026) organisation: a CSO delegates to **domain-specialised
+scientist agents**, each of which runs its capability skills *and interprets* their output; a
+**panel of reviewers** audits the findings; the CSO integrates. Agents run concurrently where free.
+
+```
+                          ┌─────────────────────────┐
+   query ───────────────► │  Chief of Staff (agent)  │  briefing
+                          └────────────┬─────────────┘
+                          ┌────────────▼─────────────┐
+                          │   Planner (agent)        │  proposes plan,
+                          │   → validate vs routing  │  validated to real skills
+                          └────────────┬─────────────┘
+        ┌──────────────── division scientists (parallel agents) ───────────────┐
+        │  Target ID 🧬     Target Safety 🛡     Modality 💊     Clinical 🩺     │
+        │  each agent: run its capability skills (tools) → interpret → finding  │
+        └──────────────────────────────┬───────────────────────────────────────┘
+                          ┌─────────────▼────────────┐
+                          │  Reviewer PANEL (4 agents)│  safety · genetics ·
+                          │  parallel, ≥2 votes → loop│  specificity · clinical
+                          └─────────────┬────────────┘ re-route → live Tavily, etc.
+                          ┌─────────────▼────────────┐
+                          │   CSO synthesis (agent)  │  integrate findings → GO/NO_GO
+                          └──────────────────────────┘
+   capability skills (leaf, no agents): gwas-lookup · celltype-specificity-profiler ·
+   lit-synthesizer (live Tavily) · openfda-safety · tcga-somatic-profiler · … (the tools)
+```
+
+**Two kinds of thing, deliberately:** *capability skills* are pure tools (input→data→output, no
+agents, callable standalone); this *orchestrator* has the agents and the control loop and consumes
+those tools. They share the `skills/` directory but are not the same level — `role: orchestrator`
+marks the distinction.
+
 ## Core Capabilities
 
 1. **Chief-of-Staff briefing**: structures the pre-analysis briefing (field context, data availability, priority sub-questions); the driving agent fills it from `prompts/chief_of_staff.md`.
 2. **Decompose & route**: split the query into division sub-questions (Target ID, Target Safety, Modality, Clinical) and bind each to a skill via `routing.yaml`.
 3. **Execute (delegate)**: obtain each step's result from a routed ClawBio skill — cached in `--demo`, real `clawbio run` in `--live`.
 4. **Scientific-Reviewer audit**: structures the audit; the agent scores relevance / evidence / thoroughness and, on a gap, sets `re-route` — the skill then runs **one** follow-up step.
-5. **Synthesis scaffold**: assembles the recommendation/liabilities scaffold for the agent to complete, and writes the `report.md` + `result.json` + `reproducibility/` bundle.
+5. **Prometheux gap-detector** *(load-bearing)*: alongside the LLM reviewer lenses, a Vadalog reasoning pass over the evidence (`prometheux_reason.py`) derives *structural* gaps as facts — a required prioritization axis (safety / specificity / genetics / tractability) that **no routed step assessed**. Such a gap carries `forces_reroute`: it re-routes on its own, regardless of the LLM panel vote, to the `routing.yaml` skill bound to that axis. A proven missing axis is a deductive fact, not a judgement — so the engine is a non-silenceable panel member that drives the control loop. Runs live on the hosted Prometheux engine when `PMTX_TOKEN` is set, else an in-process Datalog fallback runs the same rules (never fabricates).
+6. **Synthesis scaffold**: assembles the recommendation/liabilities scaffold for the agent to complete, and writes the `report.md` + `result.json` + `reproducibility/` bundle.
 
 ## Scope
 
@@ -193,11 +230,35 @@ reference resolved in the References section. *ClawBio is a research and educati
 output_directory/
 ├── report.md                 # target-ID dossier: exec summary, evidence-by-division, gaps, proposed experiments, references
 ├── result.json               # envelope incl. references, evidence_gaps, proposed_experiments, decision/confidence
+├── trace.jsonl               # (harness.py only) execution trace: one span per agent role + routed step,
+│                             #   parent-linked, with latency + token usage; root span rolls up totals
 └── reproducibility/
     ├── commands.sh
     ├── environment.yml
     └── checksums.sha256
 ```
+
+### Execution trace (observability)
+
+`harness.py` writes a `trace.jsonl` span tree alongside the report (`tracing.py`):
+brief → plan → execute (one span per routed step) → review→re-route loop (each
+reviewer pass + follow-up nested) → synthesize. Each agent span carries latency
+and token usage; degradation moments (no backend / agent failure) land as
+`status="stub"` spans, so the honest-fallback behaviour is visible too. Stdlib
+only — no dependency, no key, written every run.
+
+**Optional hosted UI (Langfuse):** install the extra and set keys to mirror the
+same span tree to Langfuse (SDK v4):
+
+```bash
+pip install -e '.[tracing]'          # or: pip install 'langfuse>=4.0'
+export LANGFUSE_PUBLIC_KEY=pk-...    # export LANGFUSE_SECRET_KEY=sk-...
+export LANGFUSE_HOST=https://...     # optional; self-hosted instance
+```
+
+Absent either key the exporter is a silent no-op (≈0.06 ms overhead); the
+`trace.jsonl` is written regardless. Agent spans map to Langfuse *generations*
+(so token cost renders); loop/step spans map to plain spans.
 
 ## Dependencies
 

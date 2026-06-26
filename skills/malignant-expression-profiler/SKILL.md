@@ -4,6 +4,7 @@ description: Given a gene and a tumour single-cell atlas (with a malignant-cell 
 license: MIT
 metadata:
   version: "0.1.0"
+  role: capability  # self-contained leaf skill (one job; invoked by orchestrators)
   author: Jacky Siu
   domain: single-cell
   tags:
