@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Regenerate frontend/data.js from the demo fixtures and recompile app.jsx -> app.js.
+"""Recompile frontend/app.jsx -> app.js (the data is now served live by server.py).
 
 Fully offline: uses the vendored Babel (vendor/babel.js) via headless Chrome, so no
-Node toolchain is required. Run after editing app.jsx or the demo fixtures.
+Node toolchain is required. Run after editing app.jsx.
 
     python3 frontend/build.py
 """
@@ -15,23 +15,7 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
-FIXTURES = ROOT / "skills/virtual-biotech-cso/demo_data/b7h3"
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
-FILES = [
-    "briefing", "step_01_gwas", "step_02_celltype_expression",
-    "step_03_celltype_specificity", "step_04_offtarget_safety",
-    "step_05_clinical_trials", "review", "step_06_reroute", "synthesis",
-]
-
-
-def build_data() -> None:
-    data = {f: json.loads((FIXTURES / f"{f}.json").read_text()) for f in FILES}
-    out = ("// AUTO-GENERATED from skills/virtual-biotech-cso/demo_data/b7h3/. "
-           "Do not edit by hand — run frontend/build.py.\n"
-           "window.CSO_DEMO = " + json.dumps(data, indent=2) + ";\n")
-    (HERE / "data.js").write_text(out)
-    print(f"  data.js  <- {len(FILES)} fixtures")
 
 
 def compile_jsx() -> None:
@@ -66,6 +50,5 @@ def compile_jsx() -> None:
 
 if __name__ == "__main__":
     print("building frontend...")
-    build_data()
     compile_jsx()
-    print("done. open frontend/index.html in a browser.")
+    print("done. start the server: python3 frontend/server.py")
