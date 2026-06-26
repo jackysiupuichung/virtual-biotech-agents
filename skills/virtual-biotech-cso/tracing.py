@@ -242,6 +242,42 @@ class _LangfuseExporter:
             kw["model"] = model
         return kw
 
+    def _emit_scores(self, sp: "Span", obs: Any) -> None:
+        """Post a span's LLM-as-a-judge verdict as Langfuse scores on its observation.
+
+        The reviewer panel folds N lenses into one verdict + per-axis 1–5 scores and
+        stashes them on the span attrs (``verdict``, ``scores``). We surface those as
+        proper Langfuse *scores* (not just metadata) so they land in the eval
+        dashboards alongside managed evaluators: each axis as a NUMERIC score and the
+        routing decision as a CATEGORICAL one. ``score_id`` is derived from the span
+        id so a re-export is idempotent rather than duplicating. Any span without
+        these attrs contributes nothing; any error disables scoring for this span
+        only (the trace export already swallows at the call site too).
+
+        IDs are read off the freshly-created observation object — ``start_observation``
+        does not set the OTEL *current* context (only ``start_as_current_observation``
+        would), so ``score_current_*`` wouldn't target this span. ``create_score``
+        with an explicit ``trace_id``/``observation_id`` is the context-free path."""
+        verdict = sp.attrs.get("verdict")
+        scores = sp.attrs.get("scores") or {}
+        if not verdict and not scores:
+            return
+        kw = {"trace_id": obs.trace_id, "observation_id": obs.id}
+        for axis, value in scores.items():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue  # non-numeric axis (e.g. a stub's empty string) → skip
+            self._client.create_score(
+                name=f"reviewer.{axis}", value=numeric, data_type="NUMERIC",
+                score_id=f"{sp.span_id}-{axis}", **kw)
+        if verdict:
+            self._client.create_score(
+                name="reviewer.verdict", value=str(verdict), data_type="CATEGORICAL",
+                comment=f"reroute_votes={sp.attrs.get('reroute_votes')} "
+                        f"forced_by_engine={sp.attrs.get('forced_by_engine')}",
+                score_id=f"{sp.span_id}-verdict", **kw)
+
     def export(self, root: "Span", spans: list["Span"]) -> None:
         """Create the trace + observation tree, then flush. Root-first ordering."""
         if self._client is None:
@@ -266,6 +302,7 @@ class _LangfuseExporter:
             for sp in spans:  # already sorted parent-before-child by start time
                 parent = objs.get(sp.parent_id) or root_obs
                 obs = parent.start_observation(**self._obs_kwargs(sp))
+                self._emit_scores(sp, obs)  # judge verdict → Langfuse scores
                 obs.end()
                 objs[sp.span_id] = obs
 

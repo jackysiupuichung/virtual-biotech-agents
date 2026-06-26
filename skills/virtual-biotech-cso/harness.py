@@ -290,7 +290,8 @@ def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, 
         review = cso.aggregate_panel_review(lens_reviews, routing, extra_gaps=engine_gaps)
         panel = review["panel"]
         panel_sp.set(verdict=review["verdict"], reroute_votes=panel["reroute_votes"],
-                     forced_by_engine=panel.get("forced_by_engine", False))
+                     forced_by_engine=panel.get("forced_by_engine", False),
+                     scores=review.get("scores", {}))
     review["source"] = AGENT_SOURCE
     forced = " (engine-forced)" if panel.get("forced_by_engine") else ""
     trace.step("👥", f"reviewer panel: {panel['reroute_votes']}/{panel['n_lenses']} lenses "
