@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -429,60 +430,75 @@ def load_briefing(query: str, case: str, demo: bool) -> dict[str, Any]:
 # script path relative to REPO_ROOT/skills + the args that run its offline --demo.
 # Used as the first resolution for re-route/routed steps so a live run actually
 # executes (e.g. the reviewer re-routing to lit-synthesizer for current evidence).
-LOCAL_SKILLS: dict[str, tuple[str, list[str]]] = {
-    "lit-synthesizer": ("lit-synthesizer/lit_synthesizer.py", ["--demo"]),
-    "openfda-safety": ("openfda-safety/openfda_safety.py", ["--demo"]),
-    "celltype-specificity-profiler": ("celltype-specificity-profiler/profiler.py", ["--demo"]),
+LOCAL_SKILLS: dict[str, str] = {
+    "lit-synthesizer": "lit-synthesizer/lit_synthesizer.py",
+    "openfda-safety": "openfda-safety/openfda_safety.py",
+    "celltype-specificity-profiler": "celltype-specificity-profiler/profiler.py",
 }
 
 
-def _run_local_skill(skill: str) -> dict[str, Any] | None:
-    """Run an in-repo leaf skill via its own CLI (offline --demo). None if unknown.
+def _local_skill_args(skill: str, live: bool, target: str | None) -> list[str]:
+    """CLI args for an in-repo leaf skill.
+
+    In ``--live`` we run the skill for real where it can: ``lit-synthesizer`` does a
+    **live Tavily search** for ``target`` (real-time current-evidence acquisition —
+    the sponsor-tool + autonomy path) when ``TAVILY_API_KEY`` is set. Everything else,
+    and any live skill lacking its key/input, falls back to the offline ``--demo`` so
+    the run still produces honest, labelled evidence rather than failing.
+    """
+    if live and skill == "lit-synthesizer" and target and os.environ.get("TAVILY_API_KEY"):
+        return ["--target", target]
+    return ["--demo"]
+
+
+def _run_local_skill(skill: str, live: bool = False,
+                     target: str | None = None) -> dict[str, Any] | None:
+    """Run an in-repo leaf skill via its own CLI. None if unknown.
 
     Returns the skill's JSON envelope (its landscape.json/safety.json/etc.) so the
     CSO can fold real routed-skill output into the evidence chain without an
     external runtime. Honest 'not executed' on any failure; never fabricates.
     """
-    entry = LOCAL_SKILLS.get(skill)
-    if entry is None:
+    if skill not in LOCAL_SKILLS:
         return None
     import subprocess
     import tempfile
 
-    rel, demo_args = entry
+    rel = LOCAL_SKILLS[skill]
+    args = _local_skill_args(skill, live, target)
     script = REPO_ROOT / "skills" / rel
     if not script.exists():
         return {"status": "not executed", "reason": f"{skill}: script not found at {script}."}
     try:
         with tempfile.TemporaryDirectory() as td:
             proc = subprocess.run(
-                [sys.executable, str(script), *demo_args, "--output", td],
+                [sys.executable, str(script), *args, "--output", td],
                 capture_output=True, text=True, timeout=120,
             )
             if proc.returncode != 0:
                 return {"status": "not executed",
                         "reason": f"{skill} exited {proc.returncode}: {proc.stderr.strip()[:200]}"}
+            via = f"{skill} {' '.join(args)}"  # e.g. 'lit-synthesizer --target B7-H3 ...'
             # Fold the richest JSON artifact the skill wrote into the evidence row.
             for name in ("landscape.json", "safety.json", "result.json", "profile.json"):
                 p = Path(td) / name
                 if p.exists():
                     payload = json.loads(p.read_text())
-                    return {"status": "ok", "via": f"{skill} --demo", **payload}
-            return {"status": "ok", "via": f"{skill} --demo",
-                    "stdout": proc.stdout.strip()[:400]}
+                    return {"status": "ok", "via": via, **payload}
+            return {"status": "ok", "via": via, "stdout": proc.stdout.strip()[:400]}
     except Exception as exc:  # pragma: no cover - defensive
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def _run_skill_live(skill: str) -> dict[str, Any]:
+def _run_skill_live(skill: str, target: str | None = None) -> dict[str, Any]:
     """Execute a routed skill (best-effort, no LLM).
 
-    Resolution: an in-repo leaf skill via its own CLI first (LOCAL_SKILLS), else
-    fall back to an external clawbio.py run_skill runtime. Any failure (skill not
-    registered, needs input, no runtime) returns an honest envelope rather than a
-    fabricated result.
+    Resolution: an in-repo leaf skill via its own CLI first (LOCAL_SKILLS) — run live
+    where it can (e.g. lit-synthesizer → live Tavily for ``target``), else its offline
+    --demo — then fall back to an external clawbio.py run_skill runtime. Any failure
+    returns an honest envelope rather than a fabricated result.
     """
-    local = _run_local_skill(skill)
+    local = _run_local_skill(skill, live=True, target=target)
     if local is not None:
         return local
     try:
@@ -500,11 +516,13 @@ def _run_skill_live(skill: str) -> dict[str, Any]:
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def execute_skill(task: Subtask, case: str, demo: bool, live: bool) -> dict[str, Any]:
+def execute_skill(task: Subtask, case: str, demo: bool, live: bool,
+                  target: str | None = None) -> dict[str, Any]:
     """STEP C: produce a result envelope for a routed skill.
 
     Resolution order: cached demo fixture → live ClawBio run → honest stub.
-    No LLM is involved at any point.
+    ``target`` (the query's "<gene> in <disease>") is passed to skills that take it
+    live — notably lit-synthesizer's real-time Tavily search. No LLM is involved.
     """
     envelope = {
         "step": task.step,
@@ -523,7 +541,7 @@ def execute_skill(task: Subtask, case: str, demo: bool, live: bool) -> dict[str,
         envelope["source"] = "unavailable"
         return envelope
     if live:
-        envelope["result"] = _run_skill_live(task.skill)
+        envelope["result"] = _run_skill_live(task.skill, target=target)
         envelope["source"] = "clawbio" if envelope["result"].get("status") == "ok" else "unavailable"
         return envelope
     envelope["result"] = {

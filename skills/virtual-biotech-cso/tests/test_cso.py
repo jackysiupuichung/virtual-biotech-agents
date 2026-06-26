@@ -266,3 +266,29 @@ def test_panel_most_corroborated_gap_first():
 def test_four_lenses_defined():
     keys = [lens["key"] for lens in REVIEWER_LENSES]
     assert keys == ["safety", "genetics", "specificity", "clinical"]
+
+
+# --------------------- live Tavily routing (sponsor tool + autonomy) ------ #
+from cso import _local_skill_args  # noqa: E402
+
+
+def test_lit_synthesizer_goes_live_with_key(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    args = _local_skill_args("lit-synthesizer", live=True, target="B7-H3 in lung cancer")
+    assert args == ["--target", "B7-H3 in lung cancer"]  # real-time Tavily search
+
+
+def test_lit_synthesizer_falls_back_to_demo_without_key(monkeypatch):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    args = _local_skill_args("lit-synthesizer", live=True, target="B7-H3 in lung cancer")
+    assert args == ["--demo"]  # honest offline fallback, never fails
+
+
+def test_demo_mode_never_goes_live(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    assert _local_skill_args("lit-synthesizer", live=False, target="x") == ["--demo"]
+
+
+def test_non_tavily_skill_stays_demo(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    assert _local_skill_args("openfda-safety", live=True, target="x") == ["--demo"]

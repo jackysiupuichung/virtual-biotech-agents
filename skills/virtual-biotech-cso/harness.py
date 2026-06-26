@@ -253,7 +253,9 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                        f"({gap.get('missing', 'gap')})")
             with rec.span(f"reroute:{followup.skill}", kind="tool", iteration=i + 1,
                           missing=gap.get("missing")):
-                results.append(cso.execute_skill(followup, case, demo, live))
+                # pass the query as the live target so a reroute to lit-synthesizer
+                # runs a real-time Tavily search for this target, not the cached demo.
+                results.append(cso.execute_skill(followup, case, demo, live, target=query))
 
             # A cached/stub reviewer can't re-evaluate the new evidence — its verdict is
             # fixed, so looping would just append duplicate re-routes. Only a *live*
@@ -286,7 +288,7 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
 
     # 3 — EXECUTE DIVISIONS (deterministic data layer; concurrent where free) #
     with rec.span("execute", kind="tool", n_subtasks=len(subtasks)):
-        results = _execute_concurrent(subtasks, case, demo, live, trace, rec)
+        results = _execute_concurrent(subtasks, case, demo, live, trace, rec, target=query)
 
     # 4 — REVIEW → RE-ROUTE loop (change #2: bounded; verdict drives control flow) #
     #     The reviewer re-runs after each re-route until it returns `synthesize` or
@@ -333,7 +335,8 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
 
 
 def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live: bool,
-                        trace: Trace, rec: TraceRecorder) -> list[dict[str, Any]]:
+                        trace: Trace, rec: TraceRecorder,
+                        target: str | None = None) -> list[dict[str, Any]]:
     """Run routed steps respecting depends_on; independent ones run in parallel.
 
     Each routed step is wrapped in a ``rec`` span so per-skill latency shows up in
@@ -352,7 +355,7 @@ def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live
 
             def _run_step(t: cso.Subtask) -> dict[str, Any]:
                 t0 = time.perf_counter()
-                env = cso.execute_skill(t, case, demo, live)
+                env = cso.execute_skill(t, case, demo, live, target=target)
                 timed[t.step] = (time.perf_counter() - t0) * 1000.0
                 return env
 
