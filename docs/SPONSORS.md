@@ -72,6 +72,24 @@ re-route to this skill when the reviewer panel needs deeper literature evidence.
 
 ---
 
+## 🖥️ Cursor — built in Cursor
+
+**[Cursor](https://cursor.com)** was our development environment — this entire multi-agent
+system was **built in Cursor**, from the agent harness and Vadalog reasoning layer to the
+frontend and tests.
+
+---
+
+## ✨ Gemini — LLM agent backend
+
+**[Google DeepMind](https://deepmind.google) Gemini** is one of the live LLM backends that
+power the scientist and reviewer agents. The harness
+([`harness.py`](../skills/virtual-biotech-cso/harness.py)) runs a provider-fallback chain
+(`Anthropic → OpenAI → Gemini → Claude CLI`) so the multi-agent loop stays running across
+providers; Gemini drives the live agent reasoning when selected.
+
+---
+
 ## 🧰 Tessl — host
 
 **[Tessl AI](https://tessl.io)** hosted the hackathon and set the brief: ship something real
