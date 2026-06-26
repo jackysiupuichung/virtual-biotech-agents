@@ -32,6 +32,11 @@ tracing = [
 reasoning = [
     "prometheux_chain>=0.2.14",
 ]
+# Local stdio MCP server that projects the single-cell .h5ad into EXPRESSED_IN facts
+# on demand (skills/dataset-projection/mcp_server.py). Wired into the loop via .mcp.json.
+mcp = [
+    "mcp>=1.2",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
