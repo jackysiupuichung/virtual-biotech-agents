@@ -46,7 +46,7 @@ the canonical CSV.
 |---|---|---|
 | scRNA matrix (`.h5ad`) | per-cell-type prevalence/mean (see `pbmc3k_expression.py`) | `EXPRESSED_IN` |
 | GWAS / association table | filter to significant rows | `GENETIC_LINK` |
-| documents (PDF/paper) | NER + relation extraction (or LLM), keep DOI provenance | varies |
+| documents (PDF/paper) | offline lexicon match, or `--llm` Gemini extractor (DOI provenance) | varies |
 | assay results | call/threshold outside, project the call | varies |
 
 ## Worked example (real data)
@@ -60,6 +60,20 @@ python3 extractors/pbmc3k_expression.py --genes CD8A,MS4A1,CD14,NKG7,CD3D,FCGR3A
 
 yields canonical markers — `CD3D→T cells`, `MS4A1→B cells`, `NKG7→NK cells`,
 `CD14→monocytes` — as `EXPRESSED_IN` facts with confidence = expressing fraction.
+
+### LLM document extraction (`--llm`, verified live)
+
+`literature_claims.py --llm` uses **Gemini** via its OpenAI-compatible endpoint
+(`GEMINI_API_KEY`, JSON mode — the same backend the CSO harness uses). Verified on
+the sample abstracts: it out-performed the offline matcher — typed relations
+correctly (B7-H3 *overexpressed*→`EXPRESSED_IN` vs EGFR *mutated*→`GENETIC_LINK`),
+caught a claim the lexicon missed, and calibrated confidence (0.6 expression / 0.9
+direct genetic / 0.7 association) once the schema asked it to.
+
+**Known limitation:** the claim schema only offers `disease` as the object, so the
+model forces cell types / processes into disease slots (`disease:b-cells`). Extend
+`_CLAIM_SCHEMA` with an object-kind field (`disease` | `celltype` | `process`) when
+you need those distinguished.
 
 ## Reasoning across datasets (`bind.vada`)
 

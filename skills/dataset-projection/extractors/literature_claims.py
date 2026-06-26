@@ -8,9 +8,10 @@ DOI/PMID provenance pointer back to the source.
 
 Two extraction backends, same output:
 
-  * ``--llm``  — an Anthropic-Claude extractor (the latest model, claude-opus-4-8):
-                 one structured tool-call per document returning typed claims. Used
-                 when ``ANTHROPIC_API_KEY`` is set and ``--llm`` is passed.
+  * ``--llm``  — a Gemini extractor via its OpenAI-compatible endpoint (the same
+                 backend the CSO harness uses; ``GEMINI_API_KEY``, JSON mode). One
+                 structured JSON response per document returning typed claims. Used
+                 when ``GEMINI_API_KEY`` is set and ``--llm`` is passed.
   * default    — a dependency-free dictionary matcher over a small biomedical
                  lexicon (genes x relation-cues x diseases/cell-types). Deterministic,
                  offline, good enough to demo the contract and to fall back to.
@@ -19,7 +20,7 @@ Input is a JSONL of documents: ``{"id": "...", "text": "...", "doi"/"pmid": "...
 A tiny sample is shipped at ``../examples/abstracts.sample.jsonl``.
 
     python3 literature_claims.py --in ../examples/abstracts.sample.jsonl
-    ANTHROPIC_API_KEY=... python3 literature_claims.py --in docs.jsonl --llm
+    GEMINI_API_KEY=... python3 literature_claims.py --in docs.jsonl --llm
 """
 from __future__ import annotations
 
@@ -88,7 +89,12 @@ _CLAIM_SCHEMA = {
                     "relation": {"type": "string",
                                  "enum": ["GENETIC_LINK", "EXPRESSED_IN"]},
                     "evidence_sentence": {"type": "string"},
-                    "confidence": {"type": "number"},
+                    "confidence": {
+                        "type": "number", "minimum": 0.0, "maximum": 1.0,
+                        "description": "Calibrated strength of the assertion: ~0.9 "
+                        "for a direct causal/genetic statement, ~0.6 for an "
+                        "association or expression observation, lower if hedged. "
+                        "Do NOT default to 1.0."},
                 },
                 "required": ["gene", "disease", "relation", "evidence_sentence",
                              "confidence"],
@@ -99,25 +105,34 @@ _CLAIM_SCHEMA = {
 }
 
 
-def _llm_claims(doc: dict) -> list[Fact]:
-    import anthropic  # optional dep; only needed for --llm
+_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GEMINI_MODEL = "gemini-2.5-flash"
 
-    client = anthropic.Anthropic()
+
+def _llm_claims(doc: dict) -> list[Fact]:
+    from openai import OpenAI  # Gemini via its OpenAI-compatible endpoint
+
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    client = OpenAI(api_key=key, base_url=_GEMINI_BASE_URL)
+    model = os.environ.get("VBIO_MODEL") or _GEMINI_MODEL
     prov = doc.get("doi") or doc.get("pmid") or doc.get("id") or "unknown"
-    msg = client.messages.create(
-        model="claude-opus-4-8",       # latest, most capable extractor
-        max_tokens=2048,
-        tools=[{"name": "emit_claims",
-                "description": "Emit gene-disease/cell-type relational claims stated "
-                               "in the document. Only claims the text actually asserts.",
-                "input_schema": _CLAIM_SCHEMA}],
-        tool_choice={"type": "tool", "name": "emit_claims"},
-        messages=[{"role": "user",
-                   "content": "Extract relational biomedical claims from this "
-                              f"document as tool input.\n\n{doc.get('text','')}"}],
+    instruction = (
+        "Extract relational biomedical claims the document actually asserts. "
+        "Return ONLY JSON matching this schema (no prose):\n"
+        f"{json.dumps(_CLAIM_SCHEMA)}\n\n"
+        f"Document:\n{doc.get('text','')}"
     )
-    block = next((b for b in msg.content if getattr(b, "type", "") == "tool_use"), None)
-    claims = (block.input.get("claims", []) if block else [])
+    resp = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "You are a precise biomedical relation "
+             "extractor. Emit only claims the text states; never invent."},
+            {"role": "user", "content": instruction},
+        ],
+    )
+    raw = resp.choices[0].message.content or "{}"
+    claims = json.loads(raw).get("claims", [])
     facts: list[Fact] = []
     for c in claims:
         facts.append(Fact(
@@ -153,11 +168,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--in", dest="inp", type=Path, default=DEFAULT_IN)
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
     p.add_argument("--llm", action="store_true",
-                   help="use the Claude extractor (needs ANTHROPIC_API_KEY)")
+                   help="use the Gemini extractor (needs GEMINI_API_KEY)")
     args = p.parse_args(argv)
 
-    if args.llm and not os.environ.get("ANTHROPIC_API_KEY"):
-        print("--llm requires ANTHROPIC_API_KEY; falling back to offline matcher")
+    if args.llm and not (os.environ.get("GEMINI_API_KEY")
+                         or os.environ.get("GOOGLE_API_KEY")):
+        print("--llm requires GEMINI_API_KEY; falling back to offline matcher")
         args.llm = False
     facts = extract(args.inp, args.llm)
     n = write_facts(facts, args.out)
