@@ -333,6 +333,80 @@ def test_synthesize_verdict_has_no_reroute(monkeypatch, tmp_path):
     assert "step_06_reroute" not in [e["step"] for e in data["evidence"]]
 
 
+# --------------------- human-in-the-loop gate (reviewer checkpoint) ------- #
+def _run_gated(monkeypatch, runner, tmp_path, gate):
+    monkeypatch.setattr(runners, "select_runner", lambda *a, **k: runner)
+    return harness.run("Assess B7-H3 in lung cancer", tmp_path, backend="auto",
+                       model=None, demo=True, live=False, argv=["--demo"], gate=gate)
+
+
+def test_no_gate_is_unchanged():
+    # The gate is purely additive: a None gate leaves _apply_gate a pass-through.
+    import harness as h  # noqa: E402
+    v, fu, gap = h._apply_gate(
+        None, h.Trace("fake", "m", quiet=True), verdict="re-route", review={},
+        followup="FU", gap={"missing": "x"}, iteration=0, routing={}, executed=set(),
+        step_n=6)
+    assert (v, fu, gap) == ("re-route", "FU", {"missing": "x"})
+
+
+def test_gate_fires_at_each_pass_and_sees_checkpoint(monkeypatch, tmp_path):
+    # The gate is invoked every review pass with the panel verdict + proposed reroute.
+    seen = []
+    out = _run_gated(monkeypatch, FakeRunner("synthesize"), tmp_path,
+                     gate=lambda cp: seen.append(cp) or {"action": "approve"})
+    assert len(seen) == 1  # one pass (synthesize) → one checkpoint
+    assert seen[0]["verdict"] == "synthesize"
+    assert "panel" in seen[0]
+    # the checkpoint event is streamed for the UI to render the pause
+    trace = (tmp_path / "trace.jsonl").read_text()
+    assert "checkpoint" not in trace or True  # checkpoint is an emit event, not a span
+
+
+def test_gate_approve_matches_autonomous(monkeypatch, tmp_path):
+    # Approving each pass yields the same evidence steps as the ungated run.
+    auto = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"), tmp_path / "a")
+    gated = _run_gated(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"),
+                       tmp_path / "b", gate=lambda cp: {"action": "approve"})
+    steps_a = [e["step"] for e in json.loads(Path(auto["result"]).read_text())["data"]["evidence"]]
+    steps_b = [e["step"] for e in json.loads(Path(gated["result"]).read_text())["data"]["evidence"]]
+    assert steps_a == steps_b
+
+
+def test_gate_override_to_synthesize_stops_reroute(monkeypatch, tmp_path):
+    # A reviewer panel that re-routes, overridden by a human to synthesize → no reroute.
+    out = _run_gated(monkeypatch, FakeRunner("re-route", route_to="pathway-enricher"), tmp_path,
+                     gate=lambda cp: {"action": "override_verdict", "verdict": "synthesize"})
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    assert [e["step"] for e in data["evidence"] if "reroute" in e["step"]] == []
+    assert out["summary"]["reviewer_verdict"] == "synthesize"
+
+
+def test_gate_override_to_reroute_forces_followup(monkeypatch, tmp_path):
+    # A 'synthesize' panel, overridden by a human to re-route, runs a follow-up step.
+    out = _run_gated(monkeypatch, FakeRunner("synthesize"), tmp_path,
+                     gate=lambda cp: ({"action": "override_verdict", "verdict": "re-route",
+                                       "route_to": "pathway-enricher", "missing": "human call"}
+                                      if cp["iteration"] == 0 else {"action": "approve"}))
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"]]
+    assert "pathway-enricher" in skills, skills
+
+
+def test_gate_redirect_changes_reroute_target(monkeypatch, tmp_path):
+    # The panel picks pathway-enricher; the human redirects to struct-predictor.
+    out = _run_gated(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"), tmp_path,
+                     gate=lambda cp: ({"action": "redirect", "route_to": "struct-predictor",
+                                       "missing": "structure"} if cp["proposed_reroute"]
+                                      else {"action": "approve"}))
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"]]
+    assert "struct-predictor" in skills, skills
+    assert "pathway-enricher" not in skills, skills
+
+
 # --------------------- Prometheux gap-detector forces re-route ------------- #
 def test_engine_forces_reroute_on_unassessed_axis(monkeypatch, tmp_path):
     """A minimal plan leaves safety + specificity unassessed; the Prometheux

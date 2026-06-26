@@ -37,6 +37,16 @@ from typing import Any, Callable
 # one to stream the live loop as SSE; the CLI leaves it unset (console only).
 Emit = Callable[[str, dict[str, Any]], None]
 
+# Human-in-the-loop gate. Called once per review-loop pass *after* the reviewer
+# panel votes and a candidate follow-up is resolved, but *before* the loop acts on
+# it. Receives a checkpoint payload (verdict, panel, gaps, the proposed re-route)
+# and returns a decision dict the loop applies — letting a human approve, override
+# the verdict, redirect the re-route, or inject a gap. Returning ``None`` (or a
+# falsy/`{"action": "approve"}` value) keeps the autonomous behaviour unchanged.
+# When no gate is supplied the loop runs fully autonomously exactly as before, so
+# HITL is purely additive — the CLI and every existing test are unaffected.
+Gate = Callable[[dict[str, Any]], "dict[str, Any] | None"]
+
 import cso  # sibling module — reused, never modified
 import runners
 from tracing import TraceRecorder
@@ -401,10 +411,79 @@ def _project_decision_facts(trace: Trace, decision: dict[str, Any] | None,
         return None
 
 
+def _apply_gate(gate: "Gate | None", trace: Trace, *, verdict: str,
+                review: dict[str, Any], followup: "cso.Subtask | None",
+                gap: dict[str, Any] | None, iteration: int,
+                routing: dict[str, Any], executed: set[str], step_n: int
+                ) -> tuple[str, "cso.Subtask | None", dict[str, Any] | None]:
+    """Pause for a human at one review-loop checkpoint; apply their decision.
+
+    Called after the panel has voted and the loop has resolved its *proposed*
+    follow-up, but before anything executes. The gate (supplied by the UI) blocks
+    until the human responds, then returns a decision dict the loop honours:
+
+    - ``approve`` / falsy / no gate → keep the autonomous (verdict, followup).
+    - ``override_verdict`` + ``verdict`` → force ``synthesize`` or ``re-route``.
+    - ``redirect`` + ``route_to`` (and optional ``missing``/``why``) → re-route to
+      a human-chosen skill instead of the panel's pick.
+    - ``add_gap`` + ``missing``/``route_to`` → inject a new gap to chase; implies
+      ``re-route``.
+
+    Returns the (possibly amended) ``(verdict, followup, gap)``. With no gate this
+    is a pure pass-through, so the autonomous loop is unchanged.
+    """
+    if gate is None:
+        return verdict, followup, gap
+    checkpoint = {
+        "iteration": iteration,
+        "verdict": verdict,
+        "panel": review.get("panel", {}),
+        "scores": review.get("scores", {}),
+        "gaps": review.get("gaps", []),
+        "proposed_reroute": (
+            {"skill": followup.skill, "question": followup.question,
+             "missing": (gap or {}).get("missing", "")} if followup else None),
+    }
+    trace.event("checkpoint", checkpoint)
+    trace.step("⏸️", f"human checkpoint (pass {iteration + 1}): "
+               f"awaiting reviewer decision on verdict '{verdict}'")
+    decision = gate(checkpoint) or {}
+    action = decision.get("action", "approve")
+    if action == "approve" or not action:
+        return verdict, followup, gap
+    if action == "override_verdict":
+        new_verdict = decision.get("verdict", verdict)
+        trace.step("🧑‍⚖️", f"human override: verdict '{verdict}' → '{new_verdict}'")
+        if new_verdict != "re-route":
+            return new_verdict, None, None  # synthesize: drop any follow-up
+        # Forcing a re-route: if the panel proposed no follow-up (it had voted
+        # synthesize), build one from the human's route_to so the loop has a target.
+        if followup is None and decision.get("route_to"):
+            new_gap = {"missing": decision.get("missing") or "human-directed re-route",
+                       "route_to": decision["route_to"],
+                       "why": decision.get("why", "human-directed")}
+            followup = cso._reroute_task(new_gap, routing, step_n=step_n, executed=executed)
+            gap = new_gap
+        return new_verdict, followup, gap
+    if action in ("redirect", "add_gap"):
+        new_gap = {
+            "missing": decision.get("missing") or (gap or {}).get("missing", "human gap"),
+            "route_to": decision.get("route_to") or (gap or {}).get("route_to"),
+            "why": decision.get("why") or (gap or {}).get("why", "human-directed"),
+        }
+        new_followup = cso._reroute_task(new_gap, routing, step_n=step_n, executed=executed)
+        trace.step("🧑‍🔬", f"human {action} → {new_followup.skill} "
+                   f"({new_gap['missing']})")
+        return "re-route", new_followup, new_gap
+    trace.step("⚠️", f"human checkpoint: unknown action {action!r} → proceeding")
+    return verdict, followup, gap
+
+
 def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                  routing: dict[str, Any], results: list[dict[str, Any]],
                  demo: bool, live: bool, rec: TraceRecorder,
-                 token_budget: int | None = DEFAULT_TOKEN_BUDGET) -> dict[str, Any]:
+                 token_budget: int | None = DEFAULT_TOKEN_BUDGET,
+                 gate: "Gate | None" = None) -> dict[str, Any]:
     """Run reviewer→reroute until `synthesize`, the budget, or MAX_REROUTES.
 
     Each iteration re-runs the reviewer over the *current* evidence (so a re-route's
@@ -479,16 +558,7 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                     "forced": any(g.get("forces_reroute") for g in engine_gaps)})
                 trace.event("review", {"review": review})
             review.setdefault("source", review_src)
-
-            if review.get("verdict") != "re-route":
-                trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
-                break
-            # At the core cap, stop unless the budget still has room to chase the
-            # broader desired axes — the top-of-loop check then bounds those passes.
-            if i >= MAX_REROUTES and not _budget_room():
-                trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
-                           "synthesizing with residual gaps")
-                break
+            autonomous_verdict = review.get("verdict", "synthesize")
 
             # Convergence: a reroute adds evidence if it runs an un-run skill, OR
             # asks an already-run skill a *new* question (a deeper follow-up the
@@ -501,7 +571,7 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
             # and looping on it was the loop's old failure. If every gap is such a
             # repeat, stop and synthesize with the residual gaps.
             executed = {e.get("skill") for e in results if e.get("skill")}
-            followup = None
+            followup = gap = None
             for g in review.get("gaps") or []:
                 cand = cso._reroute_task(g, routing, step_n=6 + i, executed=executed)
                 missing = (g.get("missing") or "").strip()
@@ -515,13 +585,39 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                 deeper = (cand.skill in cso.QUESTION_SENSITIVE_SKILLS
                           and bool(missing) and sig not in rerouted_sigs)
                 if cand.skill not in executed or deeper:
-                    gap, followup, followup_sig = g, cand, sig
+                    gap, followup = g, cand
                     break
+
+            # HUMAN-IN-THE-LOOP checkpoint. Fires every pass — after the panel votes
+            # and the autonomous follow-up is resolved, before anything executes — so
+            # a human can approve, override the verdict (even force a re-route off a
+            # `synthesize`), redirect the skill, or inject a gap. No gate → pure
+            # pass-through (autonomous loop unchanged).
+            verdict, followup, gap = _apply_gate(
+                gate, trace, verdict=autonomous_verdict, review=review,
+                followup=followup, gap=gap, iteration=i, routing=routing,
+                executed=executed, step_n=6 + i)
+            # A human decision is the verdict of record: reflect it in ``review`` so
+            # the report / result.json carry the human-amended verdict, not the
+            # panel's superseded autonomous one.
+            if verdict != autonomous_verdict:
+                review["verdict"] = verdict
+                review["human_override"] = {"from": autonomous_verdict, "to": verdict}
+
+            if verdict != "re-route":
+                trace.step("✅", f"reviewer verdict: {verdict}")
+                break
+            # At the core cap, stop unless the budget still has room to chase the
+            # broader desired axes — the top-of-loop check then bounds those passes.
+            if i >= MAX_REROUTES and not _budget_room():
+                trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
+                           "synthesizing with residual gaps")
+                break
             if followup is None:
                 trace.step("✅", "no actionable gap left (every gap repeats a covered "
                            "skill+question) → synthesize with residual gaps")
                 break
-            rerouted_sigs.add(followup_sig)
+            rerouted_sigs.add((followup.skill, (gap.get("missing") or "").strip()))
             cap = MAX_REROUTES if within_core else "budget"
             trace.step("🔁", f"reroute {i + 1}/{cap} → {followup.skill} "
                        f"({gap.get('missing', 'gap')})")
@@ -553,8 +649,8 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
 
 def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
         demo: bool, live: bool, argv: list[str], emit: "Emit | None" = None,
-        quiet: bool = False, token_budget: int | None = DEFAULT_TOKEN_BUDGET
-        ) -> dict[str, Any]:
+        quiet: bool = False, token_budget: int | None = DEFAULT_TOKEN_BUDGET,
+        gate: "Gate | None" = None) -> dict[str, Any]:
     """Run the live multi-agent loop.
 
     ``emit`` is an optional structured-event sink: when set (the frontend supplies
@@ -562,6 +658,11 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
     the SAME loop the CLI prints, not a re-implementation. ``quiet`` suppresses the
     console trace (the server doesn't want it). ``out_dir=None`` skips writing the
     report/result files (the streaming caller renders from the events + final dict).
+
+    ``gate`` is an optional human-in-the-loop callback: when set, the review loop
+    pauses at each pass (after the panel votes, before it acts) and applies the
+    human's decision — approve, override the verdict, redirect the re-route, or
+    inject a gap. Unset → the loop runs fully autonomously, unchanged.
     """
     case = cso.case_key(query)
     routing = cso.load_routing()
@@ -608,7 +709,7 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
     #     MAX_REROUTES is hit. Each re-route target is the reviewer's *chosen* skill,
     #     validated against the catalog (change #3) before execution.
     review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec,
-                          token_budget=token_budget)
+                          token_budget=token_budget, gate=gate)
 
     # 4b — DECISION (Prometheux): derive the GO/NO-GO tier deductively from the final
     #      evidence. Authoritative for the report's Decision field; the agent narrates.
