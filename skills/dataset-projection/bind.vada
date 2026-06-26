@@ -1,0 +1,39 @@
+% bind.vada — join projected dataset facts against PrimeKG, derive across both.
+%
+% This is the payoff of the projection layer: the SAME hosted engine that holds
+% PrimeKG (`kg_csv`, ~3M rows, server-side CSV bind) also binds our projected
+% fact CSVs, so a single Vadalog program reasons ACROSS datasets — the stated goal.
+%
+% Two binds, one program:
+%   - kg_csv          : full PrimeKG (gene/protein - disease - drug - ... edges)
+%   - projected_facts : our normalized contract (facts.py / *.facts.csv), e.g. the
+%                       pbmc3k single-cell EXPRESSED_IN conclusions.
+%
+% PrimeKG bind: the verified server-side shape (12 capitalized columns).
+@bind("kg_csv","csv useHeaders='true'","disk/","kg.csv").
+
+% Our projected facts bind: the 7-column contract written by facts.write_facts.
+@bind("projected_facts","csv useHeaders='true'","disk/","projected_facts.csv").
+
+% --- normalize each source into a common `cell_marker` / `kg_edge` predicate ----
+% A projected single-cell conclusion: gene G is a marker of cell type C (conf S).
+cell_marker(G, C, S) :- projected_facts(G, "EXPRESSED_IN", C, _, S, _, _).
+
+% A PrimeKG edge between a gene/protein and any other node (by display relation).
+kg_edge(Rel, Xname, Yname) :-
+    kg_csv(_, Rel, _, _, "gene/protein", Xname, _, _, _, _, Yname, _).
+
+% --- the cross-dataset derivation: a strong single-cell marker that PrimeKG also
+% ties to a disease. This conclusion is impossible from EITHER source alone — it
+% only exists because both are bound in the same engine. ----------------------
+marker_disease_link(G, C, Disease) :-
+    cell_marker(G, C, S), S >= 0.8,
+    kg_csv(_, _, _, _, "gene/protein", G2, _, _, _, "disease", Disease, _),
+    G = G2.
+
+@model("marker_disease_link", "['G:string','C:string','Disease:string']",
+       "[G] is a strong single-cell marker of [C] (from projected scRNA facts) and "
+       "PrimeKG links [G] to disease [Disease] — a cross-dataset conclusion").
+
+@output("marker_disease_link").
+@explain("console").
