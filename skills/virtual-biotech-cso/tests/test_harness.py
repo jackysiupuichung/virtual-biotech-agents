@@ -287,3 +287,40 @@ def test_cli_runner_missing_binary_raises_no_backend(monkeypatch):
     monkeypatch.setattr(runners.shutil, "which", lambda _: None)
     with pytest.raises(runners.NoBackendError):
         runners.ClaudeCLIRunner()
+
+
+# --------------------- division scientist agents (Virtual Biotech) -------- #
+class DivRunner(FakeRunner):
+    """Adds a Division Scientist branch so the per-division agent path is exercised."""
+
+    def run(self, prompt, context, schema):
+        if "Division Scientist" in prompt.splitlines()[0]:
+            div = "clinical_officers" if "clinical" in context else "target_id_and_prioritization"
+            return {"division": div, "interpretation": f"{div} interp [step_01]",
+                    "confidence": "medium", "caveats": ["c"], "evidence_grade": "supporting"}
+        return super().run(prompt, context, schema)
+
+
+def test_division_scientists_run_and_interpret(monkeypatch, tmp_path):
+    out = _run(monkeypatch, DivRunner("synthesize"), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    findings = data["division_findings"]
+    # plan has target_id (germline) + clinical → two division scientist agents
+    divisions = sorted(f["division"] for f in findings)
+    assert divisions == ["clinical_officers", "target_id_and_prioritization"], findings
+    assert all(f["source"] == harness.AGENT_SOURCE for f in findings)
+    assert all(f["evidence_grade"] == "supporting" for f in findings)
+    # each scientist is its own trace span
+    trace = (tmp_path / "trace.jsonl").read_text()
+    assert "scientist:target_id_and_prioritization" in trace
+    assert "scientist:clinical_officers" in trace
+    # raw evidence steps still flow alongside the interpretations
+    assert len(data["evidence"]) == len(data["plan"])
+
+
+def test_division_findings_stub_without_backend_keep_evidence(monkeypatch, tmp_path):
+    out = _run(monkeypatch, NoBackendRunner(), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    # no backend → interpretations stubbed, but evidence still present (never fabricates)
+    assert all(f["source"] == "delegate-to-agent" for f in data["division_findings"])
+    assert len(data["evidence"]) >= 5

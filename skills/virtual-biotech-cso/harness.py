@@ -56,6 +56,13 @@ PLAN_SCHEMA = {
                   "intent": "string (an intent under that division)",
                   "question": "string", "depends_on": ["step_NN_intent"]}],
 }
+DIVISION_FINDING_SCHEMA = {
+    "division": "string",
+    "interpretation": "string (cite [step_NN])",
+    "confidence": "high|medium|low",
+    "caveats": ["string"],
+    "evidence_grade": "strong|supporting|weak",
+}
 SYNTHESIS_SCHEMA = {
     "decision": "GO|CONDITIONAL_GO|REVIEW|NO_GO",
     "confidence": "high|medium|low",
@@ -286,9 +293,12 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing, rec)
     trace.step("🧭", f"plan → {len(subtasks)} routed sub-tasks ({plan_src})")
 
-    # 3 — EXECUTE DIVISIONS (deterministic data layer; concurrent where free) #
+    # 3 — DIVISION SCIENTISTS (one agent per division; runs its skills + interprets) #
+    #     Virtual-Biotech structure: the CSO delegates each division to a domain
+    #     scientist agent, run concurrently. division_findings carry their reasoning.
     with rec.span("execute", kind="tool", n_subtasks=len(subtasks)):
-        results = _execute_concurrent(subtasks, case, demo, live, trace, rec, target=query)
+        results, division_findings = _run_divisions(
+            subtasks, runner, query, case, demo, live, trace, rec, target=query)
 
     # 4 — REVIEW → RE-ROUTE loop (change #2: bounded; verdict drives control flow) #
     #     The reviewer re-runs after each re-route until it returns `synthesize` or
@@ -296,9 +306,10 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     #     validated against the catalog (change #3) before execution.
     review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec)
 
-    # 5 — SYNTHESIZE (live agent role) -------------------------------------- #
+    # 5 — SYNTHESIZE (CSO integrates the division scientists' findings + review) -- #
     syn_context = (
         f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
+        f"Division scientist findings:\n{json.dumps(division_findings, default=str)}\n\n"
         f"Evidence:\n{_evidence_context(results)}\n\n"
         f"Reviewer:\n{json.dumps(review, default=str)}"
     )
@@ -316,7 +327,8 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
     report_path.write_text(report_md, encoding="utf-8")
 
     summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
-                                    synthesis, runner, backend, demo, live)
+                                    synthesis, runner, backend, demo, live,
+                                    division_findings=division_findings)
     result_path = cso._write_result_json(out_dir, summary, data)
     cso._write_reproducibility(out_dir / "reproducibility", argv, [report_path, result_path])
 
@@ -334,16 +346,12 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
             "trace": str(trace_path) if trace_path else None, "summary": summary}
 
 
-def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live: bool,
-                        trace: Trace, rec: TraceRecorder,
-                        target: str | None = None) -> list[dict[str, Any]]:
-    """Run routed steps respecting depends_on; independent ones run in parallel.
+def _execute_steps(subtasks: list[cso.Subtask], case: str, demo: bool, live: bool,
+                   target: str | None) -> dict[str, dict[str, Any]]:
+    """Run a division's routed steps respecting depends_on; independent ones parallel.
 
-    Each routed step is wrapped in a ``rec`` span so per-skill latency shows up in
-    the trace. Spans are opened sequentially after the concurrent batch resolves
-    (the recorder's stack is not thread-safe by design — agent reasoning is the
-    interesting timing; the deterministic data layer's wall-clock is captured by
-    the enclosing ``execute`` span)."""
+    Returns {step_id: evidence_envelope}. This is the *tool layer* a division
+    scientist agent drives — the deterministic data acquisition, no interpretation."""
     done: dict[str, dict[str, Any]] = {}
     remaining = list(subtasks)
     while remaining:
@@ -351,32 +359,77 @@ def _execute_concurrent(subtasks: list[cso.Subtask], case: str, demo: bool, live
         if not ready:  # safety: break dependency deadlock by running the rest
             ready = remaining
         with ThreadPoolExecutor(max_workers=max(1, len(ready))) as pool:
-            timed: dict[str, float] = {}
-
-            def _run_step(t: cso.Subtask) -> dict[str, Any]:
-                t0 = time.perf_counter()
-                env = cso.execute_skill(t, case, demo, live, target=target)
-                timed[t.step] = (time.perf_counter() - t0) * 1000.0
-                return env
-
-            for task, env in zip(ready, pool.map(_run_step, ready)):
+            for task, env in zip(ready, pool.map(
+                    lambda t: cso.execute_skill(t, case, demo, live, target=target), ready)):
                 done[task.step] = env
-                # Record a span per step (sequentially, post-join) for the trace. The
-                # step ran concurrently, so its true latency is carried as an attr
-                # (the span's own wall-clock here is just the bookkeeping cost).
-                with rec.span(f"step:{task.division}/{task.skill}", kind="tool",
-                              step=task.step, intent=getattr(task, "intent", None),
-                              source=env.get("source"),
-                              exec_ms=round(timed.get(task.step, 0.0), 2)):
-                    pass
-        trace.step("🔬", f"executed {len(ready)} division step(s): "
-                   + ", ".join(t.division for t in ready))
         remaining = [t for t in remaining if t.step not in done]
-    return [done[t.step] for t in subtasks]
+    return done
+
+
+def _run_divisions(subtasks: list[cso.Subtask], runner: runners.Runner, query: str,
+                   case: str, demo: bool, live: bool, trace: Trace, rec: TraceRecorder,
+                   target: str | None = None
+                   ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Virtual-Biotech structure: one **division scientist agent** per division.
+
+    The CSO delegates each division to a domain-specialised scientist agent that
+    (1) runs its routed skills (its tools, via _execute_steps) and (2) interprets the
+    raw output into a division finding. Divisions run **concurrently** — N parallel
+    scientist agents, mirroring the paper's cross-functional R&D org. Without a live
+    backend the interpretation degrades to an honest stub (raw evidence still flows).
+
+    Returns (evidence_steps, division_findings) — evidence preserves the existing
+    per-step contract the reviewer/report consume; findings are the agents' reasoning.
+    """
+    groups = cso.group_by_division(subtasks)
+    prompt = _read_prompt(cso.DIVISION_SCIENTIST_PROMPT)
+
+    def _scientist(division: str, tasks: list[cso.Subtask]
+                   ) -> tuple[str, dict[str, dict[str, Any]], dict[str, Any]]:
+        with rec.span(f"scientist:{division}", kind="agent", backend=runner.name,
+                      model=runner.model, n_skills=len(tasks)) as sp:
+            t0 = time.perf_counter()
+            done = _execute_steps(tasks, case, demo, live, target)  # the agent's tools
+            sp.set(exec_ms=round((time.perf_counter() - t0) * 1000.0, 2))
+            evidence_ctx = _evidence_context([done[t.step] for t in tasks])
+            ctx = (f"Your division: {division}\nUser query: {query}\n\n"
+                   f"Raw skill output for your division:\n{evidence_ctx}")
+            try:
+                finding = runners.run_with_retry(
+                    runner, prompt, ctx, DIVISION_FINDING_SCHEMA)
+                finding["division"] = division
+                finding["source"] = AGENT_SOURCE
+                sp.record_usage(**_usage_of(runner)).set(
+                    grade=finding.get("evidence_grade"))
+            except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
+                sp.status = "stub"
+                sp.set(degraded="no-backend" if isinstance(exc, runners.NoBackendError)
+                       else "agent-failed", reason=str(exc))
+                finding = {"division": division, "interpretation": None,
+                           "confidence": "n/a", "caveats": [], "evidence_grade": None,
+                           "source": cso.DELEGATE}
+            return division, done, finding
+
+    with rec.span("divisions", kind="loop", n_divisions=len(groups)):
+        with ThreadPoolExecutor(max_workers=max(1, len(groups))) as pool:
+            results = list(pool.map(lambda g: _scientist(*g), groups))
+
+    merged: dict[str, dict[str, Any]] = {}
+    findings: list[dict[str, Any]] = []
+    for division, done, finding in results:
+        merged.update(done)
+        findings.append(finding)
+        live_tag = "🧪 stub" if finding.get("source") == cso.DELEGATE else \
+            f"{finding.get('evidence_grade', '?')}"
+        trace.step("🔬", f"division scientist [{division}]: {len(done)} skill(s) "
+                   f"→ {live_tag}")
+    evidence = [merged[t.step] for t in subtasks]
+    return evidence, findings
 
 
 def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
-                    runner, backend, demo, live) -> tuple[dict[str, Any], dict[str, Any]]:
+                    runner, backend, demo, live, division_findings=None
+                    ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Mirror cso.run()'s result.json envelope, marking the live-agent loop."""
     syn = synthesis or {}
     references = [
@@ -408,6 +461,7 @@ def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
     data = {
         "briefing": briefing,
         "plan": [t.as_plan_entry() for t in subtasks],
+        "division_findings": division_findings or [],
         "evidence": results,
         "review": review,
         "synthesis": synthesis,

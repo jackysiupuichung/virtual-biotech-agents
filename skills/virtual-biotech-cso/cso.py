@@ -53,6 +53,7 @@ DEMO_DATA_DIR = SKILL_DIR / "demo_data"
 ORCHESTRATOR_PROMPT = PROMPTS_DIR / "orchestrator.md"
 CHIEF_OF_STAFF_PROMPT = PROMPTS_DIR / "chief_of_staff.md"
 REVIEWER_PROMPT = PROMPTS_DIR / "reviewer.md"
+DIVISION_SCIENTIST_PROMPT = PROMPTS_DIR / "division_scientist.md"
 
 DEFAULT_QUERY = "Assess B7-H3 potential as a therapeutic target in lung cancer"
 DEMO_SOURCE = "cached demo (illustrative)"
@@ -275,6 +276,23 @@ def catalog_skills(routing: dict[str, Any]) -> set[str]:
 
 
 REROUTE_FALLBACK_SKILL = "lit-synthesizer"  # the routing.yaml-designated reroute target
+
+
+def group_by_division(subtasks: list[Subtask]) -> list[tuple[str, list[Subtask]]]:
+    """Group routed subtasks by division, preserving first-seen order.
+
+    Each group becomes one **division scientist agent** (Virtual Biotech structure:
+    the CSO delegates to domain-specialised scientist agents). Order-stable so the
+    trace and report are deterministic.
+    """
+    order: list[str] = []
+    groups: dict[str, list[Subtask]] = {}
+    for t in subtasks:
+        if t.division not in groups:
+            groups[t.division] = []
+            order.append(t.division)
+        groups[t.division].append(t)
+    return [(d, groups[d]) for d in order]
 
 
 def _reroute_task(gap: dict[str, Any], routing: dict[str, Any] | None = None,

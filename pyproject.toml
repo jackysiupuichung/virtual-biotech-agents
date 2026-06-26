@@ -20,6 +20,12 @@ agents = [
     "anthropic>=0.40",
     "openai>=1.40",
 ]
+# Optional hosted span UI for the harness trace (skills/virtual-biotech-cso/tracing.py).
+# The in-tree trace.jsonl needs nothing extra; this only enables the Langfuse mirror,
+# which activates when LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set. SDK v4 API.
+tracing = [
+    "langfuse>=4.0",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",

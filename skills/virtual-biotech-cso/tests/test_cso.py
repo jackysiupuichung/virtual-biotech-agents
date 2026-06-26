@@ -292,3 +292,20 @@ def test_demo_mode_never_goes_live(monkeypatch):
 def test_non_tavily_skill_stays_demo(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "test-key")
     assert _local_skill_args("openfda-safety", live=True, target="x") == ["--demo"]
+
+
+# --------------------- division grouping (Virtual Biotech structure) ------ #
+from cso import group_by_division, Subtask  # noqa: E402
+
+
+def test_group_by_division_preserves_order_and_groups():
+    tasks = [
+        Subtask("step_01_a", "target_id_and_prioritization", "q", "gwas-lookup"),
+        Subtask("step_02_b", "clinical_officers", "q", "clinical-trial-finder"),
+        Subtask("step_03_c", "target_id_and_prioritization", "q", "celltype-specificity-profiler"),
+    ]
+    groups = group_by_division(tasks)
+    assert [d for d, _ in groups] == ["target_id_and_prioritization", "clinical_officers"]
+    # the two target_id steps are grouped under one scientist agent
+    assert [t.step for t in groups[0][1]] == ["step_01_a", "step_03_c"]
+    assert [t.step for t in groups[1][1]] == ["step_02_b"]

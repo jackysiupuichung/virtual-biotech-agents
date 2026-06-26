@@ -11,10 +11,16 @@ adds that, staying true to the project's ethos:
     run's ``out_dir``, alongside ``report.md`` / ``result.json``. Stdlib only.
   * **Inspectable in-repo** — one JSON object per line, parent/child linked by
     span id, so the existing React UI (or ``jq``) can render the span tree.
-  * **Langfuse-ready** — if ``LANGFUSE_PUBLIC_KEY`` / ``LANGFUSE_SECRET_KEY`` are
-    set *and* the ``langfuse`` SDK is importable, each span is mirrored to a
-    hosted nested trace. Absent either, the exporter is a no-op — the JSONL trace
-    is unaffected. Never a hard dependency, never fabricates timing.
+  * **Langfuse mirror (optional)** — if ``LANGFUSE_PUBLIC_KEY`` /
+    ``LANGFUSE_SECRET_KEY`` are set *and* the ``langfuse`` SDK (v4) is importable,
+    the whole span tree is mirrored to a hosted nested trace on ``close()``.
+    Absent either, the exporter is a no-op — the JSONL trace is unaffected. Never
+    a hard dependency, never fabricates timing. Install with::
+
+        pip install 'langfuse>=4.0'   # or: pip install -e '.[tracing]'
+
+    then set LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and LANGFUSE_HOST for a
+    self-hosted instance). See _LangfuseExporter for the v4 API specifics.
 
 Usage::
 
@@ -107,6 +113,7 @@ class TraceRecorder:
         self.run_id = uuid.uuid4().hex[:12]
         self._out_dir = out_dir
         self._records: list[dict[str, Any]] = []
+        self._spans: list[Span] = []  # closed spans, in start order, for tree export
         self._stack: list[Span] = []
         self._totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         self._root = Span(
@@ -142,7 +149,7 @@ class TraceRecorder:
             for k in self._totals:
                 self._totals[k] += sp.usage.get(k, 0)
             self._records.append(sp.to_record())
-            self._lf.emit(sp)
+            self._spans.append(sp)  # Langfuse export happens root-first in close()
 
     def close(self, **summary_attrs: Any) -> Path | None:
         """Finalise the root span, write ``trace.jsonl``, flush Langfuse.
@@ -155,7 +162,12 @@ class TraceRecorder:
         self._root.attrs.update(summary_attrs)
         # Root first so the file reads as a tree from the top.
         lines = [self._root.to_record()] + self._records
-        self._lf.finish(self._root)
+        # Export to Langfuse root-first (parents before children) so each child can
+        # attach to its already-created parent observation. Spans were buffered in
+        # close order (innermost first); a stable sort by start time restores
+        # parent-before-child order for the whole tree.
+        ordered = sorted(self._spans, key=lambda s: s.started_at)
+        self._lf.export(self._root, ordered)
 
         if self._out_dir is None:
             return None
@@ -172,52 +184,95 @@ class TraceRecorder:
 
 
 class _LangfuseExporter:
-    """Best-effort mirror of spans to Langfuse. No-op unless configured.
+    """Best-effort mirror of the span tree to Langfuse. No-op unless configured.
+
+    Targets the **Langfuse Python SDK v4** (the March-2026 OpenTelemetry rewrite):
+    observations are created with ``start_observation(as_type=...)`` and children
+    are created on the parent object (``parent.start_observation(...)``); every
+    observation must be ``.end()``-ed and the client ``.flush()``-ed. See
+    https://langfuse.com/docs/observability/sdk/python/instrumentation.
 
     Activates only when both ``LANGFUSE_PUBLIC_KEY`` and ``LANGFUSE_SECRET_KEY``
-    are present and ``import langfuse`` succeeds. Any error during setup or emit
-    silently disables the exporter — observability must never break the run.
+    are set *and* ``langfuse`` (v4) imports. Any setup/emit error silently
+    disables the exporter — observability must never break or slow the run. The
+    in-tree ``trace.jsonl`` is always written regardless.
+
+    Export is deferred to ``export()`` (called from ``close()``) and walks the
+    tree root-first, so each child attaches to an already-created parent.
     """
 
     def __init__(self, name: str, run_id: str, meta: dict[str, Any]) -> None:
         self._client = None
-        self._trace = None
-        self._spans: dict[str, Any] = {}
+        self._name = name
+        self._run_id = run_id
+        self._meta = meta
         if not (os.environ.get("LANGFUSE_PUBLIC_KEY")
                 and os.environ.get("LANGFUSE_SECRET_KEY")):
             return
         try:
-            from langfuse import Langfuse  # type: ignore
+            from langfuse import get_client  # type: ignore  # v4 entrypoint
 
-            self._client = Langfuse()  # reads LANGFUSE_* env (incl. _HOST)
-            self._trace = self._client.trace(name=name, id=run_id, metadata=meta)
+            self._client = get_client()  # reads LANGFUSE_* env (incl. _HOST)
         except Exception:  # noqa: BLE001 — disable, never break the run
             self._client = None
-            self._trace = None
 
-    def emit(self, sp: Span) -> None:
-        if self._trace is None:
-            return
-        try:
-            parent = self._spans.get(sp.parent_id) or self._trace
-            node = parent.span(
-                name=sp.name, start_time=None, metadata={"kind": sp.kind, **sp.attrs},
-                status_message=sp.error, level="ERROR" if sp.status == "error" else "DEFAULT")
-            if sp.usage:
-                node.update(usage={
-                    "input": sp.usage.get("input_tokens", 0),
-                    "output": sp.usage.get("output_tokens", 0)})
-            node.end()
-            self._spans[sp.span_id] = node
-        except Exception:  # noqa: BLE001 — disable on first failure
-            self._trace = None
+    @staticmethod
+    def _as_type(kind: str) -> str:
+        # Agent spans carry token usage → model them as generations so Langfuse
+        # renders cost; everything else is a plain span.
+        return "generation" if kind == "agent" else "span"
 
-    def finish(self, root: Span) -> None:
+    def _obs_kwargs(self, sp: "Span") -> dict[str, Any]:
+        """Map a Span to start_observation() kwargs (v4 accepts these directly)."""
+        kw: dict[str, Any] = {
+            "name": sp.name,
+            "as_type": self._as_type(sp.kind),
+            "metadata": {"kind": sp.kind, "status": sp.status, **sp.attrs},
+        }
+        if sp.usage:
+            kw["usage_details"] = {
+                "input": sp.usage.get("input_tokens", 0),
+                "output": sp.usage.get("output_tokens", 0),
+            }
+        if sp.status == "error" and sp.error:
+            kw["level"] = "ERROR"
+            kw["status_message"] = sp.error
+        model = sp.attrs.get("model")
+        if self._as_type(sp.kind) == "generation" and model:
+            kw["model"] = model
+        return kw
+
+    def export(self, root: "Span", spans: list["Span"]) -> None:
+        """Create the trace + observation tree, then flush. Root-first ordering."""
         if self._client is None:
             return
         try:
-            if self._trace is not None:
-                self._trace.update(metadata={**root.attrs, "usage": root.usage})
+            objs: dict[str, Any] = {}
+            # Root observation anchors the trace; its name/metadata become the trace's.
+            root_obs = self._client.start_observation(
+                name=root.name, as_type="span",
+                metadata={"kind": "run", **self._meta, **root.attrs,
+                          "usage": root.usage})
+            objs[root.span_id] = root_obs
+            # Name the trace itself when this SDK build exposes the current-trace API
+            # (update_trace lives on the client in v4, only while a span is active).
+            updater = getattr(self._client, "update_current_trace", None)
+            if callable(updater):
+                try:
+                    updater(name=self._name, metadata={**self._meta, "usage": root.usage})
+                except Exception:  # noqa: BLE001 — needs an active span on some builds
+                    pass
+
+            for sp in spans:  # already sorted parent-before-child by start time
+                parent = objs.get(sp.parent_id) or root_obs
+                obs = parent.start_observation(**self._obs_kwargs(sp))
+                obs.end()
+                objs[sp.span_id] = obs
+
+            root_obs.end()
             self._client.flush()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 — partial trace is fine; never break the run
+            try:
+                self._client.flush()
+            except Exception:  # noqa: BLE001
+                pass
