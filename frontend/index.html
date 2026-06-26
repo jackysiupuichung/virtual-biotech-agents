@@ -9,17 +9,66 @@
   <script src="./vendor/react-dom.js"></script>
   <script src="./vendor/tailwind.js"></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif; background: #0a0e1a; }
-    .mono { font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+    :root {
+      --bio-bg: #070b16;
+      --bio-cyan: #22d3ee;
+      --bio-teal: #2dd4bf;
+    }
+    html, body { min-height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif;
+      color: #e2e8f0;
+      background-color: #070b16;
+      background-image:
+        radial-gradient(70% 55% at 50% -8%, rgba(34,211,238,0.10), transparent 60%),
+        radial-gradient(60% 50% at 92% 8%, rgba(45,212,191,0.08), transparent 55%),
+        radial-gradient(55% 45% at 4% 100%, rgba(99,102,241,0.07), transparent 60%),
+        linear-gradient(rgba(148,163,184,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148,163,184,0.035) 1px, transparent 1px),
+        linear-gradient(180deg, #080d1a 0%, #070b16 100%);
+      background-size: auto, auto, auto, 38px 38px, 38px 38px, auto;
+      background-attachment: fixed;
+    }
+    .mono { font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace; font-feature-settings: "ss01","cv01"; letter-spacing: -0.01em; }
+    h1, h2, h3 { letter-spacing: -0.018em; }
+    ::-webkit-scrollbar { width: 9px; height: 9px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1b2740; border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+    ::-webkit-scrollbar-thumb:hover { background: #2b3c5e; background-clip: padding-box; }
+
     @keyframes fadeUp { from { opacity:0; transform: translateY(8px);} to {opacity:1; transform:none;} }
     .fade-up { animation: fadeUp .4s ease both; }
-    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(56,189,248,.5);} 70%{box-shadow:0 0 0 10px rgba(56,189,248,0);} 100%{box-shadow:0 0 0 0 rgba(56,189,248,0);} }
+    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(34,211,238,.5);} 70%{box-shadow:0 0 0 9px rgba(34,211,238,0);} 100%{box-shadow:0 0 0 0 rgba(34,211,238,0);} }
     .pulse-ring { animation: pulse-ring 1.8s infinite; }
+
+    /* gentle streaming shimmer for in-progress phases */
+    @keyframes bioShimmer { 0%{background-position: -180% 0;} 100%{background-position: 180% 0;} }
+    .bio-shimmer {
+      background-image: linear-gradient(100deg, transparent 20%, rgba(34,211,238,0.16) 50%, transparent 80%);
+      background-size: 220% 100%;
+      animation: bioShimmer 2.2s linear infinite;
+    }
+    @keyframes bioBreath { 0%,100%{opacity:.55;} 50%{opacity:1;} }
+    .bio-breath { animation: bioBreath 2.4s ease-in-out infinite; }
+
+    /* reusable glass + accent-bar treatments (applied via className additions) */
+    .bio-glass { backdrop-filter: blur(10px) saturate(120%); -webkit-backdrop-filter: blur(10px) saturate(120%); }
+    .bio-panel {
+      position: relative;
+      box-shadow: 0 1px 0 rgba(148,163,184,0.04) inset, 0 18px 40px -28px rgba(0,0,0,0.9);
+    }
+    .bio-accent-top::before {
+      content: ""; position: absolute; left: 14px; right: 14px; top: 0; height: 2px; border-radius: 2px;
+      background: linear-gradient(90deg, transparent, var(--bio-cyan), var(--bio-teal), transparent);
+      opacity: 0.8;
+    }
+    .bio-accent-amber::before { background: linear-gradient(90deg, transparent, #fbbf24, #f59e0b, transparent); }
+    .bio-accent-rose::before  { background: linear-gradient(90deg, transparent, #fb7185, #f43f5e, transparent); }
+    .bio-accent-emerald::before { background: linear-gradient(90deg, transparent, #34d399, #10b981, transparent); }
+    .bio-accent-fuchsia::before { background: linear-gradient(90deg, transparent, #e879f9, #c026d3, transparent); }
   </style>
 </head>
-<body class="text-slate-200">
+<body class="text-slate-200 antialiased">
   <div id="root"></div>
   <!-- Precompiled from app.jsx (classic React.createElement runtime) — no Babel needed at runtime. -->
   <script src="./app.js"></script>

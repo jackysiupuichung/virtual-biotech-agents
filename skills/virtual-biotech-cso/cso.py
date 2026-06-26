@@ -693,6 +693,49 @@ def _run_local_skill(skill: str, live: bool = False,
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
+# When a routed skill's dataset/runtime isn't available, we patch its axis with a
+# Tavily literature search. Each skill maps to the *question its axis answers*, so the
+# search chases the right evidence (genetic support, essentiality, off-tumour
+# expression, …) rather than a bare gene query. Skills not listed get a generic probe.
+_LITERATURE_PROXY_INTENT: dict[str, str] = {
+    "gwas-lookup": "germline genetic association and GWAS evidence for the disease",
+    "gwas-catalog-region-fetch": "GWAS catalog associations in the locus",
+    "crispr-screen-triage": "CRISPR dependency / essentiality in cancer cell lines (DepMap)",
+    "scrna-embedding": "single-cell expression and cell-type specificity",
+    "malignant-expression-profiler": "expression on malignant vs normal / stromal cells",
+    "omics-target-evidence-mapper": "multi-omics target-disease association evidence",
+    "pathway-enricher": "pathway and biological-process involvement",
+    "struct-predictor": "protein structure, druggability and tractability",
+    "opentargets-target-factors": "target prioritisation, tractability and safety liabilities",
+    "opentargets-association-evidence": "target-disease association evidence by datatype",
+}
+
+
+def _patch_with_literature(skill: str, target: str | None = None,
+                           focus: str | None = None) -> dict[str, Any] | None:
+    """Patch an unavailable skill's axis with a live Tavily literature search.
+
+    The skill's dataset/runtime isn't here, so instead of leaving the axis blank we run
+    ``lit-synthesizer`` (live Tavily) steered at the *question that skill's axis answers*
+    (``_LITERATURE_PROXY_INTENT``). Returns the search envelope tagged so the report
+    shows it is a **literature proxy** for the missing dataset — never passed off as the
+    real source. ``None`` when no patch is possible (no target, or Tavily not available
+    — ``_run_local_skill`` then falls back to --demo, so we'd be patching a real axis
+    with illustrative data; better to stay honestly "unavailable" in that case).
+    """
+    if not target or not os.environ.get("TAVILY_API_KEY"):
+        return None  # no live search to patch with → keep the honest "unavailable"
+    intent = _LITERATURE_PROXY_INTENT.get(skill, f"evidence relevant to {skill}")
+    # Steer the search at the axis; a reviewer ``focus`` (deeper re-route) narrows it.
+    probe = f"{intent} — {focus}" if focus else intent
+    env = _run_local_skill("lit-synthesizer", live=True, target=target, focus=probe)
+    if not env or env.get("status") != "ok":
+        return None
+    env["via"] = f"lit-synthesizer (literature patch for unavailable {skill})"
+    env["literature_proxy_for"] = skill  # downstream: grade/label as a proxy, not the dataset
+    return env
+
+
 def _run_skill_live(skill: str, target: str | None = None,
                     focus: str | None = None) -> dict[str, Any]:
     """Execute a routed skill (best-effort, no LLM).
@@ -712,7 +755,14 @@ def _run_skill_live(skill: str, target: str | None = None,
     # counterpart, or no installed runtime, returns a clean "unavailable" envelope —
     # never a raw FileNotFoundError.
     clawbio_name = CLAWBIO_SKILL_MAP.get(skill, skill)
-    return _run_clawbio_skill(skill, clawbio_name)
+    result = _run_clawbio_skill(skill, clawbio_name)
+    if result.get("status") == "ok":
+        return result
+    # Patch: the dataset/runtime for this axis isn't here, so rather than leave the
+    # axis blank ("unavailable"), fall back to a live Tavily literature search steered
+    # at *that axis's* question — a labelled literature proxy, never the real dataset.
+    patched = _patch_with_literature(skill, target=target, focus=focus)
+    return patched if patched is not None else result
 
 
 # Our routing skill names → the installed ClawBio catalog's names. Only entries with a

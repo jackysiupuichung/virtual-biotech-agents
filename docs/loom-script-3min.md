@@ -21,15 +21,18 @@ Choosing the right target is the most expensive guess in biotech.
 
 **[Slide: architecture.svg — the three layers]**
 
-"So we built a **virtual biotech** — a real, running multi-agent system that does target
-selection end to end.
+"So we introduce the **Virtual Biotech** — a coordinated team of AI agents that mirrors the
+structure of human therapeutic research organizations to support end-to-end computational
+discovery. It's a real, running multi-agent system that does target selection end to end.
 
 A **CSO orchestrator** plans and routes; it runs no analysis itself. **Four scientist
 divisions** each call real bioinformatics tools over live public databases — Open Targets,
 CELLxGENE, TCGA, DepMap, openFDA, ClinicalTrials.gov. And you bring your **own** experimental
 data the same way: plug in an **MCP server** — a CRISPR screen, an in-house single-cell run, an
-internal assay — and the loop **projects it into cited facts** that reason right alongside the
-public knowledge graph. A **reviewer panel** audits the evidence and can *force the org back to
+internal assay — and the loop **projects it into cited facts** that reason right alongside
+**PrimeKG**, the public biomedical knowledge graph we store as the canonical evidence base —
+78,000 targets, 39,000 diseases, millions of relationships. A **reviewer panel** audits the
+evidence and can *force the org back to
 do more work* — and at every one of those review passes, a **human can join the panel**: approve,
 override, or steer the next experiment. The org runs fully autonomous, or with a scientist in the
 loop — same machinery.
@@ -86,8 +89,8 @@ a replayable trace, so the whole run reproduces bit-for-bit."
 "Every layer here runs on the sponsor stack. **Prometheux** is the heart of it — its Vadalog
 engine **derives the verdict**, and it's also the *non-silenceable reviewer*: a provably-missing
 axis becomes a deductive fact that forces the org to re-work. **Tavily** powers the live
-literature search the scientists call. The whole org is assembled on the **ClawBio** skill
-platform — we reuse its bioinformatics skills as the agents' tools. And **Langfuse** mirrors the
+literature search the scientists call. We use **Gemini** to write the codebase and to power the
+agents' reasoning. And **Langfuse** mirrors the
 entire loop as a hosted, replayable trace. Every one is optional — the workflow always degrades
 to an offline, reproducible path."
 

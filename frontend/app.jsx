@@ -6,6 +6,7 @@ const PROV = {
   retrieved: { icon: "🗄️", label: "retrieved — public API" },
   computed:  { icon: "🔧", label: "computed — ClawBio skill" },
   web:       { icon: "🌐", label: "agent web / literature" },
+  primekg:   { icon: "🧬", label: "PrimeKG — curated relation" },
   gap:       { icon: "⚪", label: "gap — not available" },
 };
 // map cso.py provenance icons (🧪 demo, 🔧 clawbio, 🌐 web, ⚪ absent) to a prov key
@@ -23,11 +24,11 @@ const gradeStyle = (g) => ({
 }[g] || "text-slate-400 border-slate-600/40 bg-slate-700/20");
 
 const DECISION = {
-  GO:             { c: "bg-emerald-500 text-emerald-950", ring:"ring-emerald-400/40" },
-  CONDITIONAL_GO: { c: "bg-amber-400 text-amber-950",     ring:"ring-amber-300/40" },
-  REVIEW:         { c: "bg-sky-400 text-sky-950",         ring:"ring-sky-300/40" },
-  NO_GO:          { c: "bg-rose-500 text-rose-950",       ring:"ring-rose-400/40" },
-  PENDING:        { c: "bg-slate-600 text-slate-100",     ring:"ring-slate-500/40" },
+  GO:             { c: "bg-gradient-to-br from-emerald-400 to-teal-500 text-emerald-950 shadow-lg shadow-emerald-500/30", ring:"ring-emerald-400/40", glow:"shadow-emerald-500/25", accent:"emerald" },
+  CONDITIONAL_GO: { c: "bg-gradient-to-br from-amber-300 to-orange-500 text-amber-950 shadow-lg shadow-amber-500/30",     ring:"ring-amber-300/40", glow:"shadow-amber-500/25", accent:"amber" },
+  REVIEW:         { c: "bg-gradient-to-br from-sky-400 to-cyan-500 text-sky-950 shadow-lg shadow-cyan-500/30",            ring:"ring-cyan-300/40", glow:"shadow-cyan-500/25", accent:"top" },
+  NO_GO:          { c: "bg-gradient-to-br from-rose-400 to-red-600 text-rose-50 shadow-lg shadow-rose-500/30",           ring:"ring-rose-400/40", glow:"shadow-rose-500/25", accent:"rose" },
+  PENDING:        { c: "bg-slate-700 text-slate-200",     ring:"ring-slate-500/40", glow:"shadow-slate-900/40", accent:"top" },
 };
 
 const EXAMPLES = [
@@ -181,7 +182,7 @@ const NODE_STYLE = {
   Drug:      { fill:"#7c3aed", stroke:"#c4b5fd" },
   Pathway:   { fill:"#ca8a04", stroke:"#fde68a" },
 };
-const PROV_EDGE = { retrieved:"#38bdf8", computed:"#34d399", web:"#a78bfa", gap:"#64748b" };
+const PROV_EDGE = { retrieved:"#38bdf8", computed:"#34d399", web:"#a78bfa", primekg:"#fbbf24", gap:"#64748b" };
 
 // radial layout centred on the Target (the biological hub); entities ring outward
 const layout = (g, W, H) => {
@@ -219,7 +220,7 @@ function EvidenceGraphSVG({ g, selNode, selEdge, onNode, onEdge, complete }) {
           <g key={"e"+i} className="cursor-pointer fade-up" onClick={(x)=>{x.stopPropagation();onEdge(i);}}>
             <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth="14"/>
             <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={col} strokeWidth={sel?3.5:1.6}
-              strokeOpacity={sel?1:op} strokeDasharray={e.conf<0.2?"4 3":"none"}/>
+              strokeOpacity={sel?1:op} strokeDasharray={e.prov==="primekg"?"2 3":e.conf<0.2?"4 3":"none"}/>
             {sel && <text x={(a.x+b.x)/2} y={(a.y+b.y)/2-4} fill="#e2e8f0" fontSize="9" textAnchor="middle" className="mono">{e.type}</text>}
           </g>
         );
@@ -418,12 +419,12 @@ function GraphView({ run }) {
         </Chip>
       </div>
       <div className="grid lg:grid-cols-[1fr_300px] gap-4">
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-2" onClick={()=>{setSelNode(null);setSelEdge(null);}}>
+        <div className="relative overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/40 bio-glass bio-panel bio-accent-top p-2" onClick={()=>{setSelNode(null);setSelEdge(null);}}>
           <EvidenceGraphSVG g={g} selNode={selNode} selEdge={selEdge} complete={complete}
             onNode={(id)=>{setSelNode(id===selNode?null:id);setSelEdge(null);}}
             onEdge={(i)=>{setSelEdge(i===selEdge?null:i);setSelNode(null);}}/>
         </div>
-        <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-4 self-start">
+        <div className="relative overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-900/55 bio-glass bio-panel bio-accent-top p-4 self-start">
           <GraphInspector g={g} selNode={selNode} selEdge={selEdge} stepsById={stepsById}/>
         </div>
       </div>
@@ -442,7 +443,7 @@ function Chip({children, cls=""}) {
 function LoopStep({step, idx, last, active, onClick, engineGaps, engineForced, panel}) {
   const ev = step.evidence;
   const running = step.status === "running";
-  const kindCls = step.kind === "agent" ? "border-violet-500/40 bg-violet-500/5" : "border-slate-700 bg-slate-900/60";
+  const kindCls = step.kind === "agent" ? "border-violet-500/40 bg-violet-500/[0.06]" : "border-slate-700/70 bg-slate-900/55 bio-glass";
   const res = ev?.result || {};
   const metrics = res.tau != null ? { "τ (tau)": res.tau, "bimodality": res.bimodality_coefficient } : null;
   return (
@@ -457,7 +458,8 @@ function LoopStep({step, idx, last, active, onClick, engineGaps, engineForced, p
         </div>
         {!last && <div className={`w-0.5 flex-1 my-1 ${step.reroute?"bg-amber-500/40":"bg-slate-700"}`} style={{minHeight:"1rem"}}/>}
       </div>
-      <div className={`flex-1 mb-3 rounded-xl border p-4 transition ${kindCls} ${active?"ring-1 ring-sky-400/50":""} ${ev?"cursor-pointer hover:border-sky-500/50":""}`} onClick={ev?onClick:undefined}>
+      <div className={`relative overflow-hidden flex-1 mb-3 rounded-xl border p-4 transition bio-panel ${kindCls} ${running?"ring-1 ring-cyan-400/40":""} ${active?"ring-1 ring-cyan-400/60":""} ${ev?"cursor-pointer hover:border-cyan-500/50":""}`} onClick={ev?onClick:undefined}>
+        {running && <div className="absolute inset-x-0 top-0 h-[3px] bio-shimmer"/>}
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-2">
             <Chip cls={step.kind==="agent"?"border-violet-500/40 text-violet-300 bg-violet-500/10":"border-slate-600 text-slate-300 bg-slate-800"}>{step.kind==="agent"?"AGENT":"SKILL"}</Chip>
@@ -504,11 +506,11 @@ function LoopStep({step, idx, last, active, onClick, engineGaps, engineForced, p
           </div>
         )}
         {step.id==="review" && panel && panel.lenses && panel.lenses.length>0 && (
-          <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">4-lens reviewer panel</div>
+          <div className="mt-3 relative overflow-hidden rounded-xl border border-slate-700/70 bg-slate-950/50 bio-glass bio-panel bio-accent-top p-3.5">
+            <div className="text-[10px] uppercase tracking-[0.18em] text-cyan-300/80 mb-2.5">4-lens reviewer panel</div>
             <div className="flex flex-wrap gap-1.5">
               {panel.lenses.map((l,i)=>(
-                <span key={i} className={`px-2 py-0.5 rounded-md text-xs border ${l.verdict==="re-route"?"text-rose-300 border-rose-500/40 bg-rose-500/10":"text-emerald-300 border-emerald-500/40 bg-emerald-500/10"}`}>
+                <span key={i} className={`px-2.5 py-1 rounded-lg text-xs font-medium border shadow-sm ${l.verdict==="re-route"?"text-rose-200 border-rose-500/40 bg-rose-500/10 shadow-rose-900/30":"text-emerald-200 border-emerald-500/40 bg-emerald-500/10 shadow-emerald-900/30"}`}>
                   {l.key} {l.verdict==="re-route"?"✗ re-route":"✓"}
                 </span>
               ))}
@@ -627,8 +629,8 @@ function LoopGraph({ run, active, setActive }) {
   const briefStep = cols.brief[0], planStep = cols.plan[0];
 
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden"
-         style={{ background:"radial-gradient(120% 90% at 80% -10%, rgba(56,189,248,0.06), transparent 55%), #0c1322" }}>
+    <div className="relative rounded-2xl border border-slate-800/80 bio-panel bio-accent-top overflow-hidden"
+         style={{ background:"radial-gradient(120% 90% at 80% -10%, rgba(34,211,238,0.08), transparent 55%), #0a1120" }}>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ display:"block", width:"100%", height:"auto" }}>
         <defs>
           <marker id="flowArr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -732,7 +734,7 @@ function LoopTrace({run}) {
       {run.decisionEngine && <PrometheuxDecision run={run} className="mb-5"/>}
       {view==="graph" && <LoopGraph run={run} active={active} setActive={setActive}/>}
       {view==="timeline" && (
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+      <div className="relative overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/40 bio-glass bio-panel bio-accent-top p-5">
         {run.steps.map((s,i)=>(
           <LoopStep key={s.id+"_"+i} step={s} idx={i} last={i===run.steps.length-1}
             active={active===s.id} onClick={()=>setActive(active===s.id?null:s.id)}
@@ -771,11 +773,11 @@ function PrometheuxDecision({run, className}) {
   const dec = DECISION[e.tier] || DECISION.REVIEW;
   const axes = e.axes || {};
   return (
-    <div className={`rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/5 p-5 ${className||""}`}>
+    <div className={`relative overflow-hidden rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/[0.06] bio-glass bio-panel bio-accent-top bio-accent-fuchsia p-5 ${className||""}`}>
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         <span className="px-2 py-0.5 rounded-md font-bold text-xs bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40">◆ PROMETHEUX</span>
         <span className="text-xs uppercase tracking-widest text-fuchsia-200/80">deductive decision</span>
-        <span className={`ml-auto px-3 py-1 rounded-lg font-extrabold text-sm ${dec.c}`}>{(e.tier||"REVIEW").replace("_"," ")}</span>
+        <span className={`ml-auto px-3 py-1 rounded-lg font-extrabold text-sm uppercase ${dec.c}`}>{(e.tier||"REVIEW").replace("_"," ")}</span>
       </div>
       <div className="text-sm text-slate-200">
         coverage score <span className="mono font-bold text-fuchsia-200">{e.score}</span>
@@ -811,8 +813,9 @@ function PrometheuxDecision({run, className}) {
 //  Report (from live synthesis)
 // ======================================================================================
 function Panel({title, accent, children}) {
-  const a = {rose:"text-rose-300", amber:"text-amber-300", sky:"text-sky-300"}[accent] || "text-slate-300";
-  return <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-5"><div className={`text-xs uppercase tracking-widest mb-3 ${a}`}>{title}</div>{children}</div>;
+  const a = {rose:"text-rose-300", amber:"text-amber-300", sky:"text-cyan-300"}[accent] || "text-slate-300";
+  const bar = {rose:"bio-accent-rose", amber:"bio-accent-amber", sky:""}[accent] || "";
+  return <div className={`rounded-2xl border border-slate-700/70 bg-slate-900/50 bio-glass bio-panel bio-accent-top ${bar} p-5`}><div className={`text-xs uppercase tracking-widest mb-3 ${a}`}>{title}</div>{children}</div>;
 }
 
 // Collect the per-run evidence edges, grouped by validity axis (druggability,
@@ -893,12 +896,12 @@ function ReportOverview({run, s}) {
   const dec = DECISION[decTier] || DECISION.REVIEW;
   return (
     <div className="space-y-5">
-      <div className={`rounded-2xl border border-slate-700 bg-slate-900/60 p-6 ring-1 ${dec.ring}`}>
-        <div className="text-xs uppercase tracking-widest text-slate-500 mb-2">Executive summary</div>
+      <div className={`relative overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-900/55 bio-glass bio-panel bio-accent-top bio-accent-${dec.accent} p-6 ring-1 ${dec.ring}`}>
+        <div className="text-[11px] uppercase tracking-[0.2em] text-slate-400 mb-3">Executive summary · CSO verdict</div>
         <div className="flex items-center gap-3 flex-wrap">
-          <span className={`px-4 py-1.5 rounded-lg font-extrabold text-sm ${dec.c}`}>{decTier.replace("_"," ")}</span>
+          <span className={`px-5 py-2 rounded-xl font-extrabold text-base tracking-tight uppercase ${dec.c}`}>{decTier.replace("_"," ")}</span>
           {run.decisionSource==="prometheux" && <Chip cls="border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10">◆ derived</Chip>}
-          <Chip cls="border-slate-600 text-slate-300 bg-slate-800">confidence: {s.confidence||run.confidence}</Chip>
+          <Chip cls="border-slate-600 text-slate-300 bg-slate-800 mono">confidence: {s.confidence||run.confidence}</Chip>
         </div>
         <p className="mt-4 text-sm text-slate-200 leading-relaxed">{s.recommendation}</p>
         {s.target_overview && <p className="mt-3 text-xs text-slate-400 leading-relaxed border-t border-slate-800 pt-3">{s.target_overview}</p>}
@@ -944,9 +947,9 @@ function Report({run}) {
   return (
     <div className="space-y-5">
       {/* axis nav — the report is read either as the synthesis (overview) or per validity axis */}
-      <div className="flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 border border-slate-800">
+      <div className="flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 bio-glass border border-slate-800">
         <button onClick={()=>setSub("overview")}
-          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${active==="overview"?"bg-sky-500 text-white":"text-slate-400 hover:text-slate-200"}`}>
+          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${active==="overview"?"bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25":"text-slate-400 hover:text-slate-200"}`}>
           Report
         </button>
         {axisKeys.map(ax=>{
@@ -954,7 +957,7 @@ function Report({run}) {
           const absent = entry.meta?.grade==="absent" || entry.rows.length===0;
           return (
             <button key={ax} onClick={()=>setSub(ax)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active===ax?"bg-sky-500 text-white":"text-slate-400 hover:text-slate-200"}`}>
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active===ax?"bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25":"text-slate-400 hover:text-slate-200"}`}>
               <span className="capitalize">{ax}</span>
               <span className={`text-[10px] ${active===ax?"opacity-80":absent?"text-rose-400/80":"text-slate-500"}`}>
                 {absent?"⚪":entry.rows.length}
@@ -992,19 +995,21 @@ function QueryScreen({onRun}) {
   const [budget, setBudget] = useState("thorough");
   return (
     <div className="max-w-2xl mx-auto px-4 py-20 fade-up">
-      <div className="text-xs text-sky-400 mono mb-2">virtual-biotech-cso · multi-agent harness</div>
-      <h1 className="text-3xl sm:text-4xl font-extrabold text-white">Ask the Virtual CSO.</h1>
+      <div className="inline-flex items-center gap-2 text-[11px] text-cyan-300 mono mb-3 px-2.5 py-1 rounded-full border border-cyan-500/25 bg-cyan-500/[0.06]">
+        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 bio-breath"/>virtual-biotech-cso · multi-agent harness
+      </div>
+      <h1 className="text-4xl sm:text-5xl font-extrabold text-white bg-gradient-to-br from-white via-slate-100 to-cyan-200 bg-clip-text text-transparent">Ask the Virtual CSO.</h1>
       <p className="text-slate-400 mt-3">Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time.</p>
       <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents, BUDGETS.find(b=>b.key===budget).tokens, hitl);}}>
         <textarea value={q} onChange={(e)=>setQ(e.target.value)} rows={3}
-          className="w-full rounded-xl bg-slate-900/70 border border-slate-700 focus:border-sky-500 outline-none p-4 text-slate-100 text-sm resize-none"
+          className="w-full rounded-xl bg-slate-900/60 bio-glass border border-slate-700 focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 outline-none p-4 text-slate-100 text-sm resize-none transition"
           placeholder="e.g. Assess B7-H3 potential as a therapeutic target in lung cancer"/>
         <div className="flex items-center justify-between gap-3 mt-3 flex-wrap">
           <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
             <input type="checkbox" checked={demo} onChange={(e)=>setDemo(e.target.checked)} className="accent-sky-500"/>
             demo mode <span className="text-slate-600">(cached data for the routed skills — reliable for a stage)</span>
           </label>
-          <button type="submit" className="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm">Run assessment →</button>
+          <button type="submit" className="px-5 py-2 rounded-xl bg-gradient-to-br from-sky-500 to-cyan-500 hover:from-sky-400 hover:to-cyan-400 text-white font-semibold text-sm shadow-lg shadow-cyan-500/25 transition">Run assessment →</button>
         </div>
         <label className="flex items-center gap-2 text-sm text-emerald-300/90 cursor-pointer mt-3">
           <input type="checkbox" checked={agents} onChange={(e)=>setAgents(e.target.checked)} className="accent-emerald-500"/>
@@ -1022,7 +1027,7 @@ function QueryScreen({onRun}) {
       <div className="mt-8">
         <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-2">try an example</div>
         <div className="flex flex-col gap-2">
-          {EXAMPLES.map((ex,i)=><button key={i} onClick={()=>setQ(ex)} className="text-left text-sm text-slate-300 rounded-lg border border-slate-800 hover:border-slate-600 bg-slate-900/40 px-3 py-2">{ex}</button>)}
+          {EXAMPLES.map((ex,i)=><button key={i} onClick={()=>setQ(ex)} className="text-left text-sm text-slate-300 rounded-lg border border-slate-800 hover:border-cyan-500/40 hover:text-slate-100 bg-slate-900/40 hover:bg-slate-900/70 px-3 py-2 transition">{ex}</button>)}
         </div>
       </div>
     </div>
@@ -1038,7 +1043,7 @@ function CheckpointModal({ cp, onDecide }) {
   const verdict = cp.verdict;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm fade-up">
-      <div className="max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900 p-6 shadow-2xl">
+      <div className="relative overflow-hidden max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900/95 bio-glass bio-panel bio-accent-top bio-accent-amber p-6 shadow-2xl ring-1 ring-amber-400/20">
         <div className="text-xs text-amber-300 mono mb-1">🧑‍⚖️ human in the loop · reviewer pass {(cp.iteration ?? 0) + 1}</div>
         <h3 className="text-lg font-bold text-white">The panel voted <span className={verdict==="re-route"?"text-amber-300":"text-emerald-300"}>{verdict}</span>.</h3>
         <p className="text-sm text-slate-400 mt-1">
@@ -1153,9 +1158,9 @@ function App() {
 
       {run.status==="error" && <div className="mb-5 rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200">⚠️ {run.error}</div>}
 
-      <div className="flex gap-1 p-1 rounded-xl bg-slate-900/60 border border-slate-800 w-fit mb-6">
+      <div className="flex gap-1 p-1 rounded-xl bg-slate-900/60 bio-glass border border-slate-800 w-fit mb-6">
         {[["loop","Loop trace"],["graph","Evidence graph"],["ledger","Evidence ledger"],["report","Report"]].map(([k,l])=>(
-          <button key={k} onClick={()=>setTab(k)} className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${tab===k?"bg-sky-500 text-white":"text-slate-400 hover:text-slate-200"}`}>
+          <button key={k} onClick={()=>setTab(k)} className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${tab===k?"bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25":"text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"}`}>
             {l}{k==="report" && run.status!=="done" && <span className="ml-1 text-[10px] opacity-60">pending</span>}
           </button>
         ))}
@@ -1173,6 +1178,6 @@ function App() {
   );
 }
 
-function Stat({n,l,small}){return <div className="px-3 py-2 rounded-xl bg-slate-900/60 border border-slate-800"><div className={`font-bold text-white ${small?"text-sm":"text-xl"}`}>{n}</div><div className="text-[10px] uppercase tracking-wide text-slate-500">{l}</div></div>;}
+function Stat({n,l,small}){return <div className="px-3 py-2 rounded-xl bg-slate-900/55 bio-glass border border-slate-800 bio-panel"><div className={`font-bold text-white ${small?"text-sm":"text-xl"} ${small?"":"mono"}`}>{n}</div><div className="text-[10px] uppercase tracking-wide text-slate-500">{l}</div></div>;}
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App/>);

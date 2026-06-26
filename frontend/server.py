@@ -324,6 +324,12 @@ def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
         raise box["error"]
     result = box.get("result", {})
 
+    # --- PrimeKG enrichment: propagate curated relations between the run's own --- #
+    #     resolved entities. Context-only corroborating edges (prov="primekg", not
+    #     scored), guarded so it's a no-op offline / without a live Prometheux token.
+    for ev_name, payload in _primekg_enrich(run_id):
+        yield ev_name, payload
+
     # persist the graph, then explain-a-rank over it (meaningful from run #2 on)
     GRAPH.commit()
     ranking_payload = _prometheux_ranking()
@@ -337,6 +343,21 @@ def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
         "ranking": ranking_payload,
         "kg_nodes": len(GRAPH.nodes), "kg_edges": len(GRAPH.edges),
     }
+
+
+def _primekg_enrich(run_id: str):
+    """Add PrimeKG corroborating edges between the run's resolved entities (guarded).
+
+    Yields ``("edge", edge)`` for each curated PrimeKG relation found between two of
+    the run's own entity nodes, so the UI draws them as the graph settles. A no-op
+    (yields nothing) offline / without a live Prometheux token — never fabricates."""
+    try:
+        import primekg_enrich
+        added = primekg_enrich.enrich(GRAPH, run_id)
+    except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+        return
+    for edge in added:
+        yield "edge", edge
 
 
 def _graded(results: list[dict], target: str) -> tuple[list[dict], str]:

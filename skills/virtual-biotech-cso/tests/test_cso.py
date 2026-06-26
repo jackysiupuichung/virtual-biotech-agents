@@ -311,3 +311,56 @@ def test_group_by_division_preserves_order_and_groups():
     # the two target_id steps are grouped under one scientist agent
     assert [t.step for t in groups[0][1]] == ["step_01_a", "step_03_c"]
     assert [t.step for t in groups[1][1]] == ["step_02_b"]
+
+
+# --------------------- literature patch for unavailable axes --------------- #
+from cso import _patch_with_literature, _LITERATURE_PROXY_INTENT, execute_skill  # noqa: E402
+
+
+def test_patch_requires_tavily_key(monkeypatch):
+    # No key → no patch; the axis stays honestly "unavailable" rather than being
+    # filled by lit-synthesizer's offline --demo fixture (which would be illustrative).
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    assert _patch_with_literature("gwas-lookup", target="B7-H3 in lung cancer") is None
+
+
+def test_patch_requires_target(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    assert _patch_with_literature("gwas-lookup", target=None) is None
+
+
+def test_patch_steers_search_at_axis_intent_and_tags_proxy(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    seen = {}
+
+    def fake_local(skill, live=False, target=None, focus=None):
+        seen["skill"], seen["focus"] = skill, focus
+        return {"status": "ok", "via": "lit", "summary": "s", "references": []}
+
+    monkeypatch.setattr("cso._run_local_skill", fake_local)
+    env = _patch_with_literature("crispr-screen-triage", target="B7-H3 in lung cancer")
+    assert seen["skill"] == "lit-synthesizer"  # routed through the live Tavily search
+    assert "essentiality" in seen["focus"].lower() or "depmap" in seen["focus"].lower()
+    assert env["literature_proxy_for"] == "crispr-screen-triage"  # labelled, not the real dataset
+    assert "literature patch" in env["via"]
+
+
+def test_patch_reviewer_focus_narrows_intent(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    seen = {}
+    monkeypatch.setattr("cso._run_local_skill",
+                        lambda skill, live=False, target=None, focus=None:
+                        (seen.update(focus=focus) or {"status": "ok"}))
+    _patch_with_literature("gwas-lookup", target="B7-H3", focus="African ancestry cohorts")
+    assert "African ancestry cohorts" in seen["focus"]  # deeper re-route steers the patch
+
+
+def test_unavailable_external_skill_stays_honest_without_key(monkeypatch):
+    # End-to-end: a live external skill with no Tavily key reports unavailable, not a
+    # fabricated or demo-backed result.
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    t = Subtask("step_01_gwas", "target_id_and_prioritization",
+                "germline support?", "gwas-lookup")
+    env = execute_skill(t, case="b7h3", demo=False, live=True, target="B7-H3 in lung cancer")
+    assert env["source"] == "unavailable"
+    assert env["result"]["status"] != "ok"

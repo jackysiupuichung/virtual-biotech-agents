@@ -20,6 +20,10 @@ const PROV = {
     icon: "🌐",
     label: "agent web / literature"
   },
+  primekg: {
+    icon: "🧬",
+    label: "PrimeKG — curated relation"
+  },
   gap: {
     icon: "⚪",
     label: "gap — not available"
@@ -45,24 +49,34 @@ const gradeStyle = g => ({
 })[g] || "text-slate-400 border-slate-600/40 bg-slate-700/20";
 const DECISION = {
   GO: {
-    c: "bg-emerald-500 text-emerald-950",
-    ring: "ring-emerald-400/40"
+    c: "bg-gradient-to-br from-emerald-400 to-teal-500 text-emerald-950 shadow-lg shadow-emerald-500/30",
+    ring: "ring-emerald-400/40",
+    glow: "shadow-emerald-500/25",
+    accent: "emerald"
   },
   CONDITIONAL_GO: {
-    c: "bg-amber-400 text-amber-950",
-    ring: "ring-amber-300/40"
+    c: "bg-gradient-to-br from-amber-300 to-orange-500 text-amber-950 shadow-lg shadow-amber-500/30",
+    ring: "ring-amber-300/40",
+    glow: "shadow-amber-500/25",
+    accent: "amber"
   },
   REVIEW: {
-    c: "bg-sky-400 text-sky-950",
-    ring: "ring-sky-300/40"
+    c: "bg-gradient-to-br from-sky-400 to-cyan-500 text-sky-950 shadow-lg shadow-cyan-500/30",
+    ring: "ring-cyan-300/40",
+    glow: "shadow-cyan-500/25",
+    accent: "top"
   },
   NO_GO: {
-    c: "bg-rose-500 text-rose-950",
-    ring: "ring-rose-400/40"
+    c: "bg-gradient-to-br from-rose-400 to-red-600 text-rose-50 shadow-lg shadow-rose-500/30",
+    ring: "ring-rose-400/40",
+    glow: "shadow-rose-500/25",
+    accent: "rose"
   },
   PENDING: {
-    c: "bg-slate-600 text-slate-100",
-    ring: "ring-slate-500/40"
+    c: "bg-slate-700 text-slate-200",
+    ring: "ring-slate-500/40",
+    glow: "shadow-slate-900/40",
+    accent: "top"
   }
 };
 const EXAMPLES = ["Assess B7-H3 potential as a therapeutic target in lung cancer", "Evaluate MET as a target in lung adenocarcinoma", "Is CEACAM5 a viable ADC target in NSCLC?"];
@@ -304,6 +318,7 @@ const PROV_EDGE = {
   retrieved: "#38bdf8",
   computed: "#34d399",
   web: "#a78bfa",
+  primekg: "#fbbf24",
   gap: "#64748b"
 };
 
@@ -386,7 +401,7 @@ function EvidenceGraphSVG({
       stroke: col,
       strokeWidth: sel ? 3.5 : 1.6,
       strokeOpacity: sel ? 1 : op,
-      strokeDasharray: e.conf < 0.2 ? "4 3" : "none"
+      strokeDasharray: e.prov === "primekg" ? "2 3" : e.conf < 0.2 ? "4 3" : "none"
     }), sel && /*#__PURE__*/React.createElement("text", {
       x: (a.x + b.x) / 2,
       y: (a.y + b.y) / 2 - 4,
@@ -728,7 +743,7 @@ function GraphView({
   }, complete ? `graph complete · ${g.nodes.length} nodes` : `building… ${g.nodes.length} nodes`)), /*#__PURE__*/React.createElement("div", {
     className: "grid lg:grid-cols-[1fr_300px] gap-4"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "rounded-2xl border border-slate-800 bg-slate-900/30 p-2",
+    className: "relative overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/40 bio-glass bio-panel bio-accent-top p-2",
     onClick: () => {
       setSelNode(null);
       setSelEdge(null);
@@ -747,7 +762,7 @@ function GraphView({
       setSelNode(null);
     }
   })), /*#__PURE__*/React.createElement("div", {
-    className: "rounded-2xl border border-slate-700 bg-slate-900/60 p-4 self-start"
+    className: "relative overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-900/55 bio-glass bio-panel bio-accent-top p-4 self-start"
   }, /*#__PURE__*/React.createElement(GraphInspector, {
     g: g,
     selNode: selNode,
@@ -781,7 +796,7 @@ function LoopStep({
 }) {
   const ev = step.evidence;
   const running = step.status === "running";
-  const kindCls = step.kind === "agent" ? "border-violet-500/40 bg-violet-500/5" : "border-slate-700 bg-slate-900/60";
+  const kindCls = step.kind === "agent" ? "border-violet-500/40 bg-violet-500/[0.06]" : "border-slate-700/70 bg-slate-900/55 bio-glass";
   const res = ev?.result || {};
   const metrics = res.tau != null ? {
     "τ (tau)": res.tau,
@@ -800,9 +815,11 @@ function LoopStep({
       minHeight: "1rem"
     }
   })), /*#__PURE__*/React.createElement("div", {
-    className: `flex-1 mb-3 rounded-xl border p-4 transition ${kindCls} ${active ? "ring-1 ring-sky-400/50" : ""} ${ev ? "cursor-pointer hover:border-sky-500/50" : ""}`,
+    className: `relative overflow-hidden flex-1 mb-3 rounded-xl border p-4 transition bio-panel ${kindCls} ${running ? "ring-1 ring-cyan-400/40" : ""} ${active ? "ring-1 ring-cyan-400/60" : ""} ${ev ? "cursor-pointer hover:border-cyan-500/50" : ""}`,
     onClick: ev ? onClick : undefined
-  }, /*#__PURE__*/React.createElement("div", {
+  }, running && /*#__PURE__*/React.createElement("div", {
+    className: "absolute inset-x-0 top-0 h-[3px] bio-shimmer"
+  }), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center justify-between gap-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2"
@@ -856,14 +873,14 @@ function LoopStep({
   }, "→ ", g.route_to))), /*#__PURE__*/React.createElement("div", {
     className: "mt-2 text-[10px] text-slate-500"
   }, "A proven missing axis is a fact, not a judgement — so the engine re-routes even if the LLM panel said synthesize.")), step.id === "review" && panel && panel.lenses && panel.lenses.length > 0 && /*#__PURE__*/React.createElement("div", {
-    className: "mt-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3"
+    className: "mt-3 relative overflow-hidden rounded-xl border border-slate-700/70 bg-slate-950/50 bio-glass bio-panel bio-accent-top p-3.5"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "text-[10px] uppercase tracking-wide text-slate-500 mb-2"
+    className: "text-[10px] uppercase tracking-[0.18em] text-cyan-300/80 mb-2.5"
   }, "4-lens reviewer panel"), /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-1.5"
   }, panel.lenses.map((l, i) => /*#__PURE__*/React.createElement("span", {
     key: i,
-    className: `px-2 py-0.5 rounded-md text-xs border ${l.verdict === "re-route" ? "text-rose-300 border-rose-500/40 bg-rose-500/10" : "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"}`
+    className: `px-2.5 py-1 rounded-lg text-xs font-medium border shadow-sm ${l.verdict === "re-route" ? "text-rose-200 border-rose-500/40 bg-rose-500/10 shadow-rose-900/30" : "text-emerald-200 border-emerald-500/40 bg-emerald-500/10 shadow-emerald-900/30"}`
   }, l.key, " ", l.verdict === "re-route" ? "✗ re-route" : "✓"))), panel.n_lenses != null && /*#__PURE__*/React.createElement("div", {
     className: "mt-2 text-xs text-slate-400"
   }, panel.reroute_votes, "/", panel.n_lenses, " lenses flag re-route")), active && ev && res.top_cell_types && /*#__PURE__*/React.createElement("table", {
@@ -1089,9 +1106,9 @@ function LoopGraph({
   const briefStep = cols.brief[0],
     planStep = cols.plan[0];
   return /*#__PURE__*/React.createElement("div", {
-    className: "rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden",
+    className: "relative rounded-2xl border border-slate-800/80 bio-panel bio-accent-top overflow-hidden",
     style: {
-      background: "radial-gradient(120% 90% at 80% -10%, rgba(56,189,248,0.06), transparent 55%), #0c1322"
+      background: "radial-gradient(120% 90% at 80% -10%, rgba(34,211,238,0.08), transparent 55%), #0a1120"
     }
   }, /*#__PURE__*/React.createElement("svg", {
     viewBox: `0 0 ${W} ${H}`,
@@ -1270,7 +1287,7 @@ function LoopTrace({
     active: active,
     setActive: setActive
   }), view === "timeline" && /*#__PURE__*/React.createElement("div", {
-    className: "rounded-2xl border border-slate-800 bg-slate-900/30 p-5"
+    className: "relative overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/40 bio-glass bio-panel bio-accent-top p-5"
   }, run.steps.map((s, i) => /*#__PURE__*/React.createElement(LoopStep, {
     key: s.id + "_" + i,
     step: s,
@@ -1316,7 +1333,7 @@ function PrometheuxDecision({
   const dec = DECISION[e.tier] || DECISION.REVIEW;
   const axes = e.axes || {};
   return /*#__PURE__*/React.createElement("div", {
-    className: `rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/5 p-5 ${className || ""}`
+    className: `relative overflow-hidden rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/[0.06] bio-glass bio-panel bio-accent-top bio-accent-fuchsia p-5 ${className || ""}`
   }, /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2 mb-3 flex-wrap"
   }, /*#__PURE__*/React.createElement("span", {
@@ -1324,7 +1341,7 @@ function PrometheuxDecision({
   }, "◆ PROMETHEUX"), /*#__PURE__*/React.createElement("span", {
     className: "text-xs uppercase tracking-widest text-fuchsia-200/80"
   }, "deductive decision"), /*#__PURE__*/React.createElement("span", {
-    className: `ml-auto px-3 py-1 rounded-lg font-extrabold text-sm ${dec.c}`
+    className: `ml-auto px-3 py-1 rounded-lg font-extrabold text-sm uppercase ${dec.c}`
   }, (e.tier || "REVIEW").replace("_", " "))), /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-slate-200"
   }, "coverage score ", /*#__PURE__*/React.createElement("span", {
@@ -1365,10 +1382,15 @@ function Panel({
   const a = {
     rose: "text-rose-300",
     amber: "text-amber-300",
-    sky: "text-sky-300"
+    sky: "text-cyan-300"
   }[accent] || "text-slate-300";
+  const bar = {
+    rose: "bio-accent-rose",
+    amber: "bio-accent-amber",
+    sky: ""
+  }[accent] || "";
   return /*#__PURE__*/React.createElement("div", {
-    className: "rounded-2xl border border-slate-700 bg-slate-900/60 p-5"
+    className: `rounded-2xl border border-slate-700/70 bg-slate-900/50 bio-glass bio-panel bio-accent-top ${bar} p-5`
   }, /*#__PURE__*/React.createElement("div", {
     className: `text-xs uppercase tracking-widest mb-3 ${a}`
   }, title), children);
@@ -1483,17 +1505,17 @@ function ReportOverview({
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, /*#__PURE__*/React.createElement("div", {
-    className: `rounded-2xl border border-slate-700 bg-slate-900/60 p-6 ring-1 ${dec.ring}`
+    className: `relative overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-900/55 bio-glass bio-panel bio-accent-top bio-accent-${dec.accent} p-6 ring-1 ${dec.ring}`
   }, /*#__PURE__*/React.createElement("div", {
-    className: "text-xs uppercase tracking-widest text-slate-500 mb-2"
-  }, "Executive summary"), /*#__PURE__*/React.createElement("div", {
+    className: "text-[11px] uppercase tracking-[0.2em] text-slate-400 mb-3"
+  }, "Executive summary · CSO verdict"), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-3 flex-wrap"
   }, /*#__PURE__*/React.createElement("span", {
-    className: `px-4 py-1.5 rounded-lg font-extrabold text-sm ${dec.c}`
+    className: `px-5 py-2 rounded-xl font-extrabold text-base tracking-tight uppercase ${dec.c}`
   }, decTier.replace("_", " ")), run.decisionSource === "prometheux" && /*#__PURE__*/React.createElement(Chip, {
     cls: "border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10"
   }, "◆ derived"), /*#__PURE__*/React.createElement(Chip, {
-    cls: "border-slate-600 text-slate-300 bg-slate-800"
+    cls: "border-slate-600 text-slate-300 bg-slate-800 mono"
   }, "confidence: ", s.confidence || run.confidence)), /*#__PURE__*/React.createElement("p", {
     className: "mt-4 text-sm text-slate-200 leading-relaxed"
   }, s.recommendation), s.target_overview && /*#__PURE__*/React.createElement("p", {
@@ -1556,17 +1578,17 @@ function Report({
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 border border-slate-800"
+    className: "flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 bio-glass border border-slate-800"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => setSub("overview"),
-    className: `px-3 py-1.5 rounded-lg text-xs font-medium transition ${active === "overview" ? "bg-sky-500 text-white" : "text-slate-400 hover:text-slate-200"}`
+    className: `px-3 py-1.5 rounded-lg text-xs font-medium transition ${active === "overview" ? "bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25" : "text-slate-400 hover:text-slate-200"}`
   }, "Report"), axisKeys.map(ax => {
     const entry = byAxis[ax];
     const absent = entry.meta?.grade === "absent" || entry.rows.length === 0;
     return /*#__PURE__*/React.createElement("button", {
       key: ax,
       onClick: () => setSub(ax),
-      className: `px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active === ax ? "bg-sky-500 text-white" : "text-slate-400 hover:text-slate-200"}`
+      className: `px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active === ax ? "bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25" : "text-slate-400 hover:text-slate-200"}`
     }, /*#__PURE__*/React.createElement("span", {
       className: "capitalize"
     }, ax), /*#__PURE__*/React.createElement("span", {
@@ -1616,9 +1638,11 @@ function QueryScreen({
   return /*#__PURE__*/React.createElement("div", {
     className: "max-w-2xl mx-auto px-4 py-20 fade-up"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "text-xs text-sky-400 mono mb-2"
-  }, "virtual-biotech-cso · multi-agent harness"), /*#__PURE__*/React.createElement("h1", {
-    className: "text-3xl sm:text-4xl font-extrabold text-white"
+    className: "inline-flex items-center gap-2 text-[11px] text-cyan-300 mono mb-3 px-2.5 py-1 rounded-full border border-cyan-500/25 bg-cyan-500/[0.06]"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "w-1.5 h-1.5 rounded-full bg-cyan-400 bio-breath"
+  }), "virtual-biotech-cso · multi-agent harness"), /*#__PURE__*/React.createElement("h1", {
+    className: "text-4xl sm:text-5xl font-extrabold text-white bg-gradient-to-br from-white via-slate-100 to-cyan-200 bg-clip-text text-transparent"
   }, "Ask the Virtual CSO."), /*#__PURE__*/React.createElement("p", {
     className: "text-slate-400 mt-3"
   }, "Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time."), /*#__PURE__*/React.createElement("form", {
@@ -1631,7 +1655,7 @@ function QueryScreen({
     value: q,
     onChange: e => setQ(e.target.value),
     rows: 3,
-    className: "w-full rounded-xl bg-slate-900/70 border border-slate-700 focus:border-sky-500 outline-none p-4 text-slate-100 text-sm resize-none",
+    className: "w-full rounded-xl bg-slate-900/60 bio-glass border border-slate-700 focus:border-cyan-500 focus:ring-2 focus:ring-cyan-500/20 outline-none p-4 text-slate-100 text-sm resize-none transition",
     placeholder: "e.g. Assess B7-H3 potential as a therapeutic target in lung cancer"
   }), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center justify-between gap-3 mt-3 flex-wrap"
@@ -1646,7 +1670,7 @@ function QueryScreen({
     className: "text-slate-600"
   }, "(cached data for the routed skills — reliable for a stage)")), /*#__PURE__*/React.createElement("button", {
     type: "submit",
-    className: "px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm"
+    className: "px-5 py-2 rounded-xl bg-gradient-to-br from-sky-500 to-cyan-500 hover:from-sky-400 hover:to-cyan-400 text-white font-semibold text-sm shadow-lg shadow-cyan-500/25 transition"
   }, "Run assessment →")), /*#__PURE__*/React.createElement("label", {
     className: "flex items-center gap-2 text-sm text-emerald-300/90 cursor-pointer mt-3"
   }, /*#__PURE__*/React.createElement("input", {
@@ -1683,7 +1707,7 @@ function QueryScreen({
   }, EXAMPLES.map((ex, i) => /*#__PURE__*/React.createElement("button", {
     key: i,
     onClick: () => setQ(ex),
-    className: "text-left text-sm text-slate-300 rounded-lg border border-slate-800 hover:border-slate-600 bg-slate-900/40 px-3 py-2"
+    className: "text-left text-sm text-slate-300 rounded-lg border border-slate-800 hover:border-cyan-500/40 hover:text-slate-100 bg-slate-900/40 hover:bg-slate-900/70 px-3 py-2 transition"
   }, ex)))));
 }
 
@@ -1700,7 +1724,7 @@ function CheckpointModal({
   return /*#__PURE__*/React.createElement("div", {
     className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm fade-up"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900 p-6 shadow-2xl"
+    className: "relative overflow-hidden max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900/95 bio-glass bio-panel bio-accent-top bio-accent-amber p-6 shadow-2xl ring-1 ring-amber-400/20"
   }, /*#__PURE__*/React.createElement("div", {
     className: "text-xs text-amber-300 mono mb-1"
   }, "🧑‍⚖️ human in the loop · reviewer pass ", (cp.iteration ?? 0) + 1), /*#__PURE__*/React.createElement("h3", {
@@ -1881,11 +1905,11 @@ function App() {
   }))), run.status === "error" && /*#__PURE__*/React.createElement("div", {
     className: "mb-5 rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200"
   }, "⚠️ ", run.error), /*#__PURE__*/React.createElement("div", {
-    className: "flex gap-1 p-1 rounded-xl bg-slate-900/60 border border-slate-800 w-fit mb-6"
+    className: "flex gap-1 p-1 rounded-xl bg-slate-900/60 bio-glass border border-slate-800 w-fit mb-6"
   }, [["loop", "Loop trace"], ["graph", "Evidence graph"], ["ledger", "Evidence ledger"], ["report", "Report"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
     key: k,
     onClick: () => setTab(k),
-    className: `px-4 py-1.5 rounded-lg text-sm font-medium transition ${tab === k ? "bg-sky-500 text-white" : "text-slate-400 hover:text-slate-200"}`
+    className: `px-4 py-1.5 rounded-lg text-sm font-medium transition ${tab === k ? "bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-md shadow-cyan-500/25" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"}`
   }, l, k === "report" && run.status !== "done" && /*#__PURE__*/React.createElement("span", {
     className: "ml-1 text-[10px] opacity-60"
   }, "pending")))), tab === "loop" && /*#__PURE__*/React.createElement(LoopTrace, {
@@ -1912,9 +1936,9 @@ function Stat({
   small
 }) {
   return /*#__PURE__*/React.createElement("div", {
-    className: "px-3 py-2 rounded-xl bg-slate-900/60 border border-slate-800"
+    className: "px-3 py-2 rounded-xl bg-slate-900/55 bio-glass border border-slate-800 bio-panel"
   }, /*#__PURE__*/React.createElement("div", {
-    className: `font-bold text-white ${small ? "text-sm" : "text-xl"}`
+    className: `font-bold text-white ${small ? "text-sm" : "text-xl"} ${small ? "" : "mono"}`
   }, n), /*#__PURE__*/React.createElement("div", {
     className: "text-[10px] uppercase tracking-wide text-slate-500"
   }, l));
