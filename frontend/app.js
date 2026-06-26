@@ -877,18 +877,389 @@ function LoopStep({
     className: "text-slate-500"
   }, "reference: "), ev.reference)));
 }
+
+// ======================================================================================
+//  Loop graph (live) — the execution rendered as a horizontal process flow, in the
+//  same visual language as the static system schematic (frontend/site/schematic.html),
+//  but built dynamically from run.steps as they stream in. Nodes light up by status.
+// ======================================================================================
+
+// Status → node colour. Mirrors the timeline's node states so the two views agree.
+const GSTATE = {
+  running: {
+    stroke: "#38bdf8",
+    glow: "#38bdf8",
+    fill: "#0c2030"
+  },
+  reroute: {
+    stroke: "#fbbf24",
+    glow: "#fbbf24",
+    fill: "#1c1607"
+  },
+  terminal: {
+    stroke: "#34d399",
+    glow: "#34d399",
+    fill: "#06231a"
+  },
+  done: {
+    stroke: "#475569",
+    glow: "#1e293b",
+    fill: "#0f1729"
+  },
+  pending: {
+    stroke: "#243049",
+    glow: "#1e293b",
+    fill: "#0b1120"
+  }
+};
+function gstate(step) {
+  if (!step) return GSTATE.pending;
+  if (step.status === "running") return GSTATE.running;
+  if (step.terminal) return GSTATE.terminal;
+  if (step.reroute) return GSTATE.reroute;
+  if (step.status === "done") return GSTATE.done;
+  return GSTATE.pending;
+}
+
+// Classify each streamed step into a schematic column. Division steps fan out in the
+// middle; the reviewer, synthesis and re-route steps get their own lanes.
+// routing keys → short, human labels for the division pills
+const DIV_LABEL = {
+  target_id_and_prioritization: "Target ID",
+  target_safety: "Target Safety",
+  modality_and_tractability: "Modality & Tractability",
+  clinical_officers: "Clinical",
+  literature_and_landscape: "Literature"
+};
+const prettyDiv = (d = "") => DIV_LABEL[d.replace(" (re-route)", "")] || d.replace(/_/g, " ").replace(" (re-route)", "");
+function stageOf(step) {
+  const id = step.id || "";
+  if (id === "brief" || id === "briefing" || step.role === "Chief of Staff") return "brief";
+  if (id === "plan" || id === "planner") return "plan";
+  if (id === "review") return "review";
+  if (id === "synthesize" || id === "synthesis" || id === "report") return "synth";
+  if (step.reroute) return "reroute";
+  return "division";
+}
+
+// Build the flow model: ordered columns, each holding the steps that landed in it,
+// plus whether the re-route loop ever fired (so we draw the feedback arc live).
+function flowFromRun(run) {
+  const cols = {
+    brief: [],
+    plan: [],
+    division: [],
+    reroute: [],
+    review: [],
+    synth: []
+  };
+  run.steps.forEach((s, i) => {
+    (cols[stageOf(s)] || cols.division).push({
+      ...s,
+      _i: i
+    });
+  });
+  const rerouted = cols.reroute.length > 0;
+  return {
+    cols,
+    rerouted
+  };
+}
+function FlowNode({
+  x,
+  y,
+  w,
+  h,
+  step,
+  label,
+  sub,
+  active,
+  onClick
+}) {
+  const st = gstate(step);
+  const clickable = step && step.evidence;
+  return /*#__PURE__*/React.createElement("g", {
+    onClick: clickable ? onClick : undefined,
+    style: {
+      cursor: clickable ? "pointer" : "default"
+    }
+  }, step && step.status === "running" && /*#__PURE__*/React.createElement("rect", {
+    x: x - 3,
+    y: y - 3,
+    width: w + 6,
+    height: h + 6,
+    rx: 13,
+    fill: "none",
+    stroke: st.glow,
+    strokeWidth: "1.2",
+    opacity: "0.5",
+    className: "pulse-ring"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: x,
+    y: y,
+    width: w,
+    height: h,
+    rx: 11,
+    fill: st.fill,
+    stroke: st.stroke,
+    strokeWidth: active ? 2 : 1.3,
+    opacity: step ? 1 : 0.45
+  }), active && /*#__PURE__*/React.createElement("rect", {
+    x: x,
+    y: y,
+    width: w,
+    height: h,
+    rx: 11,
+    fill: "none",
+    stroke: "#38bdf8",
+    strokeWidth: "1.5",
+    opacity: "0.7"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: x + w / 2,
+    y: y + h / 2 - 2,
+    textAnchor: "middle",
+    fontSize: "11",
+    fontFamily: "'Space Grotesk',sans-serif",
+    fontWeight: "600",
+    fill: step ? "#e2e8f0" : "#475569"
+  }, label), sub && /*#__PURE__*/React.createElement("text", {
+    x: x + w / 2,
+    y: y + h / 2 + 13,
+    textAnchor: "middle",
+    fontSize: "8",
+    fontFamily: "'JetBrains Mono',monospace",
+    fill: "#64748b"
+  }, sub));
+}
+function LoopGraph({
+  run,
+  active,
+  setActive
+}) {
+  const {
+    cols,
+    rerouted
+  } = useMemo(() => flowFromRun(run), [run]);
+  const W = 1180,
+    H = 360;
+  // column x-anchors across the canvas
+  const X = {
+    input: 30,
+    cso: 170,
+    brief: 330,
+    plan: 330,
+    div: 560,
+    review: 840,
+    synth: 990,
+    out: 1100
+  };
+  const flow = (d, key, color = "#475569", dash) => /*#__PURE__*/React.createElement("path", {
+    key: key,
+    d: d,
+    fill: "none",
+    stroke: color,
+    strokeWidth: "1.5",
+    strokeDasharray: dash,
+    markerEnd: `url(#${color === GSTATE.reroute.stroke ? "flowArrLoop" : "flowArr"})`
+  });
+
+  // division pills, vertically distributed
+  const divs = cols.division.concat(cols.reroute);
+  const dN = Math.max(divs.length, 1);
+  const dTop = 60,
+    dGap = Math.min(64, (H - 120) / dN),
+    dH = 40,
+    dW = 220;
+  const divY = i => dTop + i * dGap;
+  const csoY = H / 2 - 32,
+    csoH = 64,
+    csoW = 96;
+  const revStep = cols.review[cols.review.length - 1];
+  const synthStep = cols.synth[cols.synth.length - 1];
+  const briefStep = cols.brief[0],
+    planStep = cols.plan[0];
+  return /*#__PURE__*/React.createElement("div", {
+    className: "rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden",
+    style: {
+      background: "radial-gradient(120% 90% at 80% -10%, rgba(56,189,248,0.06), transparent 55%), #0c1322"
+    }
+  }, /*#__PURE__*/React.createElement("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    style: {
+      display: "block",
+      width: "100%",
+      height: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("defs", null, /*#__PURE__*/React.createElement("marker", {
+    id: "flowArr",
+    viewBox: "0 0 10 10",
+    refX: "8.5",
+    refY: "5",
+    markerWidth: "7",
+    markerHeight: "7",
+    orient: "auto-start-reverse"
+  }, /*#__PURE__*/React.createElement("path", {
+    d: "M0 1 L9 5 L0 9",
+    fill: "none",
+    stroke: "#64748b",
+    strokeWidth: "1.6",
+    strokeLinecap: "round",
+    strokeLinejoin: "round"
+  })), /*#__PURE__*/React.createElement("marker", {
+    id: "flowArrLoop",
+    viewBox: "0 0 10 10",
+    refX: "8.5",
+    refY: "5",
+    markerWidth: "8",
+    markerHeight: "8",
+    orient: "auto-start-reverse"
+  }, /*#__PURE__*/React.createElement("path", {
+    d: "M0 1 L9 5 L0 9",
+    fill: "none",
+    stroke: "#fbbf24",
+    strokeWidth: "1.7",
+    strokeLinecap: "round",
+    strokeLinejoin: "round"
+  }))), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.input,
+    y: H / 2 - 26,
+    w: 110,
+    h: 52,
+    step: run.meta ? {
+      status: "done"
+    } : null,
+    label: "QUERY",
+    sub: "target question"
+  }), flow(`M${X.input + 110} ${H / 2} H${X.cso - 4}`, "in-cso"), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.cso,
+    y: csoY,
+    w: csoW,
+    h: csoH,
+    step: {
+      status: run.status === "running" && run.steps.length < 2 ? "running" : "done"
+    },
+    label: "CSO",
+    sub: "route"
+  }), flow(`M${X.cso + csoW} ${H / 2 - 14} C${X.brief - 40} ${H / 2 - 14} ${X.brief - 40} ${divY(0) - 60} ${X.brief - 4} ${divY(0) - 60}`, "cso-brief"), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.brief,
+    y: divY(0) - 78,
+    w: 170,
+    h: 36,
+    step: briefStep,
+    label: "Chief of Staff",
+    sub: "brief · decompose",
+    active: !!briefStep && active === briefStep.id,
+    onClick: () => briefStep && setActive(active === briefStep.id ? null : briefStep.id)
+  }), divs.map((s, i) => /*#__PURE__*/React.createElement(React.Fragment, {
+    key: "e" + i
+  }, flow(`M${X.cso + csoW} ${H / 2} C${X.div - 60} ${H / 2} ${X.div - 60} ${divY(i) + dH / 2} ${X.div - 4} ${divY(i) + dH / 2}`, "cso-div" + i, s.reroute ? GSTATE.reroute.stroke : "#475569", s.reroute ? "5 4" : undefined), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.div,
+    y: divY(i),
+    w: dW,
+    h: dH,
+    step: s,
+    label: prettyDiv(s.division) + (s.reroute ? " ↺" : ""),
+    sub: s.role,
+    active: active === s.id,
+    onClick: () => setActive(active === s.id ? null : s.id)
+  }))), divs.length === 0 && /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.div,
+    y: divY(0),
+    w: dW,
+    h: dH,
+    step: null,
+    label: "divisions",
+    sub: "awaiting routing…"
+  }), flow(`M${X.div + dW} ${divY(Math.floor((dN - 1) / 2)) + dH / 2} C${X.review - 50} ${H / 2} ${X.review - 50} ${H / 2} ${X.review - 4} ${H / 2}`, "div-rev"), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.review,
+    y: H / 2 - 30,
+    w: 120,
+    h: 60,
+    step: revStep,
+    label: "Reviewer",
+    sub: "gap-gate · panel",
+    active: active === "review",
+    onClick: () => revStep && setActive(active === "review" ? null : "review")
+  }), flow(`M${X.review + 120} ${H / 2} H${X.synth - 4}`, "rev-synth"), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.synth,
+    y: H / 2 - 26,
+    w: 90,
+    h: 52,
+    step: synthStep || (run.synthesis ? {
+      status: "done"
+    } : null),
+    label: "CSO",
+    sub: "synthesis"
+  }), flow(`M${X.synth + 90} ${H / 2} H${X.out - 4}`, "synth-out"), /*#__PURE__*/React.createElement(FlowNode, {
+    x: X.out,
+    y: H / 2 - 26,
+    w: 70,
+    h: 52,
+    step: run.decision && run.decision !== "PENDING" ? {
+      status: "done",
+      terminal: run.decision === "GO"
+    } : null,
+    label: (run.decision || "PENDING").replace("_", " ").split(" ")[0] || "PENDING",
+    sub: run.decision === "PENDING" ? "awaiting" : "verdict"
+  }), rerouted && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("path", {
+    d: `M${X.review} ${H / 2 + 30} C${X.review} ${H - 24} ${X.div} ${H - 24} ${X.cso + csoW / 2} ${H - 24} L${X.cso + csoW / 2} ${csoY + csoH + 2}`,
+    fill: "none",
+    stroke: GSTATE.reroute.stroke,
+    strokeWidth: "1.7",
+    strokeDasharray: "6 5",
+    markerEnd: "url(#flowArrLoop)"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: X.div - 10,
+    y: H - 36,
+    width: "240",
+    height: "22",
+    rx: "11",
+    fill: "#0c1322",
+    stroke: GSTATE.reroute.stroke,
+    strokeOpacity: "0.35"
+  }), /*#__PURE__*/React.createElement("text", {
+    x: X.div + 110,
+    y: H - 21,
+    textAnchor: "middle",
+    fontSize: "10",
+    fontFamily: "'JetBrains Mono',monospace",
+    fill: GSTATE.reroute.stroke
+  }, "re-route to fill missing gaps · ", cols.reroute.length))), active && run.steps.find(s => s.id === active) && /*#__PURE__*/React.createElement("div", {
+    className: "border-t border-slate-800 p-4"
+  }, /*#__PURE__*/React.createElement(LoopStep, {
+    step: run.steps.find(s => s.id === active),
+    idx: run.steps.findIndex(s => s.id === active),
+    last: true,
+    active: true,
+    onClick: () => setActive(null),
+    engineGaps: run.engineGaps,
+    engineForced: run.engineForced,
+    panel: run.panel
+  })));
+}
 function LoopTrace({
   run
 }) {
   const [active, setActive] = useState(null);
+  const [view, setView] = useState("graph"); // "graph" (process flow) | "timeline"
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-3 mb-5 text-xs text-slate-400 flex-wrap"
   }, Object.entries(PROV).map(([k, p]) => /*#__PURE__*/React.createElement("span", {
     key: k
-  }, p.icon, " ", p.label))), run.decisionEngine && /*#__PURE__*/React.createElement(PrometheuxDecision, {
+  }, p.icon, " ", p.label)), /*#__PURE__*/React.createElement("div", {
+    className: "ml-auto inline-flex rounded-lg border border-slate-700 overflow-hidden"
+  }, [["graph", "⬡ Process flow"], ["timeline", "☰ Timeline"]].map(([k, l]) => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    onClick: () => setView(k),
+    className: `px-3 py-1 text-xs ${view === k ? "bg-slate-700 text-slate-100" : "text-slate-400 hover:text-slate-200"}`
+  }, l)))), run.decisionEngine && /*#__PURE__*/React.createElement(PrometheuxDecision, {
     run: run,
     className: "mb-5"
-  }), /*#__PURE__*/React.createElement("div", {
+  }), view === "graph" && /*#__PURE__*/React.createElement(LoopGraph, {
+    run: run,
+    active: active,
+    setActive: setActive
+  }), view === "timeline" && /*#__PURE__*/React.createElement("div", {
     className: "rounded-2xl border border-slate-800 bg-slate-900/30 p-5"
   }, run.steps.map((s, i) => /*#__PURE__*/React.createElement(LoopStep, {
     key: s.id + "_" + i,

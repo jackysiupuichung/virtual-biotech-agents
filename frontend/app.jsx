@@ -521,14 +521,208 @@ function LoopStep({step, idx, last, active, onClick, engineGaps, engineForced, p
   );
 }
 
+// ======================================================================================
+//  Loop graph (live) — the execution rendered as a horizontal process flow, in the
+//  same visual language as the static system schematic (frontend/site/schematic.html),
+//  but built dynamically from run.steps as they stream in. Nodes light up by status.
+// ======================================================================================
+
+// Status → node colour. Mirrors the timeline's node states so the two views agree.
+const GSTATE = {
+  running:  { stroke:"#38bdf8", glow:"#38bdf8", fill:"#0c2030" },
+  reroute:  { stroke:"#fbbf24", glow:"#fbbf24", fill:"#1c1607" },
+  terminal: { stroke:"#34d399", glow:"#34d399", fill:"#06231a" },
+  done:     { stroke:"#475569", glow:"#1e293b", fill:"#0f1729" },
+  pending:  { stroke:"#243049", glow:"#1e293b", fill:"#0b1120" },
+};
+function gstate(step) {
+  if (!step) return GSTATE.pending;
+  if (step.status === "running") return GSTATE.running;
+  if (step.terminal) return GSTATE.terminal;
+  if (step.reroute) return GSTATE.reroute;
+  if (step.status === "done") return GSTATE.done;
+  return GSTATE.pending;
+}
+
+// Classify each streamed step into a schematic column. Division steps fan out in the
+// middle; the reviewer, synthesis and re-route steps get their own lanes.
+// routing keys → short, human labels for the division pills
+const DIV_LABEL = {
+  target_id_and_prioritization: "Target ID",
+  target_safety: "Target Safety",
+  modality_and_tractability: "Modality & Tractability",
+  clinical_officers: "Clinical",
+  literature_and_landscape: "Literature",
+};
+const prettyDiv = (d="") => DIV_LABEL[d.replace(" (re-route)","")] || d.replace(/_/g," ").replace(" (re-route)","");
+
+function stageOf(step) {
+  const id = step.id || "";
+  if (id === "brief" || id === "briefing" || step.role === "Chief of Staff") return "brief";
+  if (id === "plan" || id === "planner") return "plan";
+  if (id === "review") return "review";
+  if (id === "synthesize" || id === "synthesis" || id === "report") return "synth";
+  if (step.reroute) return "reroute";
+  return "division";
+}
+
+// Build the flow model: ordered columns, each holding the steps that landed in it,
+// plus whether the re-route loop ever fired (so we draw the feedback arc live).
+function flowFromRun(run) {
+  const cols = { brief:[], plan:[], division:[], reroute:[], review:[], synth:[] };
+  run.steps.forEach((s, i) => { (cols[stageOf(s)] || cols.division).push({ ...s, _i:i }); });
+  const rerouted = cols.reroute.length > 0;
+  return { cols, rerouted };
+}
+
+function FlowNode({ x, y, w, h, step, label, sub, active, onClick }) {
+  const st = gstate(step);
+  const clickable = step && step.evidence;
+  return (
+    <g onClick={clickable ? onClick : undefined} style={{ cursor: clickable ? "pointer" : "default" }}>
+      {step && step.status === "running" && (
+        <rect x={x-3} y={y-3} width={w+6} height={h+6} rx={13} fill="none"
+              stroke={st.glow} strokeWidth="1.2" opacity="0.5" className="pulse-ring"/>
+      )}
+      <rect x={x} y={y} width={w} height={h} rx={11} fill={st.fill}
+            stroke={st.stroke} strokeWidth={active ? 2 : 1.3}
+            opacity={step ? 1 : 0.45}/>
+      {active && <rect x={x} y={y} width={w} height={h} rx={11} fill="none" stroke="#38bdf8" strokeWidth="1.5" opacity="0.7"/>}
+      <text x={x+w/2} y={y+h/2-2} textAnchor="middle" fontSize="11"
+            fontFamily="'Space Grotesk',sans-serif" fontWeight="600"
+            fill={step ? "#e2e8f0" : "#475569"}>{label}</text>
+      {sub && <text x={x+w/2} y={y+h/2+13} textAnchor="middle" fontSize="8"
+            fontFamily="'JetBrains Mono',monospace" fill="#64748b">{sub}</text>}
+    </g>
+  );
+}
+
+function LoopGraph({ run, active, setActive }) {
+  const { cols, rerouted } = useMemo(() => flowFromRun(run), [run]);
+  const W = 1180, H = 360;
+  // column x-anchors across the canvas
+  const X = { input:30, cso:170, brief:330, plan:330, div:560, review:840, synth:990, out:1100 };
+  const flow = (d, key, color="#475569", dash) =>
+    <path key={key} d={d} fill="none" stroke={color} strokeWidth="1.5"
+          strokeDasharray={dash} markerEnd={`url(#${color===GSTATE.reroute.stroke?"flowArrLoop":"flowArr"})`}/>;
+
+  // division pills, vertically distributed
+  const divs = cols.division.concat(cols.reroute);
+  const dN = Math.max(divs.length, 1);
+  const dTop = 60, dGap = Math.min(64, (H-120) / dN), dH = 40, dW = 220;
+  const divY = (i) => dTop + i * dGap;
+
+  const csoY = H/2 - 32, csoH = 64, csoW = 96;
+  const revStep = cols.review[cols.review.length-1];
+  const synthStep = cols.synth[cols.synth.length-1];
+  const briefStep = cols.brief[0], planStep = cols.plan[0];
+
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden"
+         style={{ background:"radial-gradient(120% 90% at 80% -10%, rgba(56,189,248,0.06), transparent 55%), #0c1322" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ display:"block", width:"100%", height:"auto" }}>
+        <defs>
+          <marker id="flowArr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 1 L9 5 L0 9" fill="none" stroke="#64748b" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+          </marker>
+          <marker id="flowArrLoop" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 1 L9 5 L0 9" fill="none" stroke="#fbbf24" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"/>
+          </marker>
+        </defs>
+
+        {/* input → CSO */}
+        <FlowNode x={X.input} y={H/2-26} w={110} h={52} step={run.meta?{status:"done"}:null}
+                  label="QUERY" sub="target question"/>
+        {flow(`M${X.input+110} ${H/2} H${X.cso-4}`, "in-cso")}
+
+        {/* CSO orchestrator */}
+        <FlowNode x={X.cso} y={csoY} w={csoW} h={csoH} step={{status:run.status==="running"&&run.steps.length<2?"running":"done"}}
+                  label="CSO" sub="route"/>
+
+        {/* CSO → brief / plan side roles */}
+        {flow(`M${X.cso+csoW} ${H/2-14} C${X.brief-40} ${H/2-14} ${X.brief-40} ${divY(0)-60} ${X.brief-4} ${divY(0)-60}`,"cso-brief")}
+        <FlowNode x={X.brief} y={divY(0)-78} w={170} h={36} step={briefStep}
+                  label="Chief of Staff" sub="brief · decompose"
+                  active={!!briefStep&&active===briefStep.id}
+                  onClick={()=>briefStep&&setActive(active===briefStep.id?null:briefStep.id)}/>
+
+        {/* CSO → division fan-out */}
+        {divs.map((s,i)=>(
+          <React.Fragment key={"e"+i}>
+            {flow(`M${X.cso+csoW} ${H/2} C${X.div-60} ${H/2} ${X.div-60} ${divY(i)+dH/2} ${X.div-4} ${divY(i)+dH/2}`,
+                  "cso-div"+i, s.reroute?GSTATE.reroute.stroke:"#475569", s.reroute?"5 4":undefined)}
+            <FlowNode x={X.div} y={divY(i)} w={dW} h={dH} step={s}
+                      label={prettyDiv(s.division) + (s.reroute?" ↺":"")}
+                      sub={s.role}
+                      active={active===s.id} onClick={()=>setActive(active===s.id?null:s.id)}/>
+          </React.Fragment>
+        ))}
+        {divs.length===0 && (
+          <FlowNode x={X.div} y={divY(0)} w={dW} h={dH} step={null} label="divisions" sub="awaiting routing…"/>
+        )}
+
+        {/* divisions merge → reviewer */}
+        {flow(`M${X.div+dW} ${divY(Math.floor((dN-1)/2))+dH/2} C${X.review-50} ${H/2} ${X.review-50} ${H/2} ${X.review-4} ${H/2}`,"div-rev")}
+        <FlowNode x={X.review} y={H/2-30} w={120} h={60} step={revStep}
+                  label="Reviewer" sub="gap-gate · panel"
+                  active={active==="review"} onClick={()=>revStep&&setActive(active==="review"?null:"review")}/>
+
+        {/* reviewer → synthesis */}
+        {flow(`M${X.review+120} ${H/2} H${X.synth-4}`,"rev-synth")}
+        <FlowNode x={X.synth} y={H/2-26} w={90} h={52} step={synthStep||(run.synthesis?{status:"done"}:null)}
+                  label="CSO" sub="synthesis"/>
+
+        {/* synthesis → GO/NO-GO */}
+        {flow(`M${X.synth+90} ${H/2} H${X.out-4}`,"synth-out")}
+        <FlowNode x={X.out} y={H/2-26} w={70} h={52}
+                  step={run.decision&&run.decision!=="PENDING"?{status:"done",terminal:run.decision==="GO"}:null}
+                  label={(run.decision||"PENDING").replace("_"," ").split(" ")[0]||"PENDING"}
+                  sub={run.decision==="PENDING"?"awaiting":"verdict"}/>
+
+        {/* the re-route feedback arc — drawn live once any reroute step fires */}
+        {rerouted && (
+          <>
+            <path d={`M${X.review} ${H/2+30} C${X.review} ${H-24} ${X.div} ${H-24} ${X.cso+csoW/2} ${H-24} L${X.cso+csoW/2} ${csoY+csoH+2}`}
+                  fill="none" stroke={GSTATE.reroute.stroke} strokeWidth="1.7" strokeDasharray="6 5"
+                  markerEnd="url(#flowArrLoop)"/>
+            <rect x={X.div-10} y={H-36} width="240" height="22" rx="11" fill="#0c1322" stroke={GSTATE.reroute.stroke} strokeOpacity="0.35"/>
+            <text x={X.div+110} y={H-21} textAnchor="middle" fontSize="10"
+                  fontFamily="'JetBrains Mono',monospace" fill={GSTATE.reroute.stroke}>
+              re-route to fill missing gaps · {cols.reroute.length}
+            </text>
+          </>
+        )}
+      </svg>
+      {/* selected-step detail, reusing the timeline card so clicks stay informative */}
+      {active && run.steps.find(s=>s.id===active) && (
+        <div className="border-t border-slate-800 p-4">
+          <LoopStep step={run.steps.find(s=>s.id===active)}
+                    idx={run.steps.findIndex(s=>s.id===active)} last
+                    active onClick={()=>setActive(null)}
+                    engineGaps={run.engineGaps} engineForced={run.engineForced} panel={run.panel}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LoopTrace({run}) {
   const [active, setActive] = useState(null);
+  const [view, setView] = useState("graph");  // "graph" (process flow) | "timeline"
   return (
     <div>
       <div className="flex items-center gap-3 mb-5 text-xs text-slate-400 flex-wrap">
         {Object.entries(PROV).map(([k,p])=><span key={k}>{p.icon} {p.label}</span>)}
+        <div className="ml-auto inline-flex rounded-lg border border-slate-700 overflow-hidden">
+          {[["graph","⬡ Process flow"],["timeline","☰ Timeline"]].map(([k,l])=>(
+            <button key={k} onClick={()=>setView(k)}
+              className={`px-3 py-1 text-xs ${view===k?"bg-slate-700 text-slate-100":"text-slate-400 hover:text-slate-200"}`}>{l}</button>
+          ))}
+        </div>
       </div>
       {run.decisionEngine && <PrometheuxDecision run={run} className="mb-5"/>}
+      {view==="graph" && <LoopGraph run={run} active={active} setActive={setActive}/>}
+      {view==="timeline" && (
       <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
         {run.steps.map((s,i)=>(
           <LoopStep key={s.id+"_"+i} step={s} idx={i} last={i===run.steps.length-1}
@@ -554,6 +748,7 @@ function LoopTrace({run}) {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
@@ -769,17 +964,28 @@ function Report({run}) {
 // ======================================================================================
 //  Query screen + run shell
 // ======================================================================================
+// Reasoning-budget presets for the review→reroute loop. Higher budget lets the loop
+// chase more of the broader "desired" evidence axes (somatic / malignancy / landscape)
+// before converging; lower keeps it on the core four. Token spend is the bound — the
+// same meter Langfuse traces. Mirrors a "thinking effort" selector.
+const BUDGETS = [
+  {key:"focused",  label:"Focused",  tokens:0,      hint:"core axes only — fastest"},
+  {key:"balanced", label:"Balanced", tokens:30000,  hint:"core + a couple broader axes"},
+  {key:"thorough", label:"Thorough", tokens:60000,  hint:"chase all broader axes (default)"},
+];
+
 function QueryScreen({onRun}) {
   const [q, setQ] = useState(EXAMPLES[0]);
   const [demo, setDemo] = useState(true);
   const [agents, setAgents] = useState(false);
   const [partial, setPartial] = useState(false);
+  const [budget, setBudget] = useState("thorough");
   return (
     <div className="max-w-2xl mx-auto px-4 py-20 fade-up">
       <div className="text-xs text-sky-400 mono mb-2">virtual-biotech-cso · multi-agent harness</div>
       <h1 className="text-3xl sm:text-4xl font-extrabold text-white">Ask the Virtual CSO.</h1>
       <p className="text-slate-400 mt-3">Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time.</p>
-      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents);}}>
+      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents, BUDGETS.find(b=>b.key===budget).tokens);}}>
         <textarea value={q} onChange={(e)=>setQ(e.target.value)} rows={3}
           className="w-full rounded-xl bg-slate-900/70 border border-slate-700 focus:border-sky-500 outline-none p-4 text-slate-100 text-sm resize-none"
           placeholder="e.g. Assess B7-H3 potential as a therapeutic target in lung cancer"/>
