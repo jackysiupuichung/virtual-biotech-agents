@@ -59,14 +59,30 @@ def _kind_of(node_id: str) -> str:
     return node_id.split(":", 1)[0] if ":" in node_id else "entity"
 
 
+def _orient(subject: str, obj: str, relation: str) -> tuple[str, str]:
+    """Orient an edge so a candidate **target** is the evidence subject, never a marker.
+
+    The CSO reasoning treats any node that is the subject of an evidence edge as a
+    target (prometheux_reason.derive_gaps / the ``evidence(T,Ax,_)`` facts). A
+    ``gene:``-prefixed scRNA *marker* (CD3D) is NOT a therapeutic target — it is
+    evidence about a **cell type's** expression profile. So for an ``EXPRESSED_IN``
+    fact written gene→celltype we flip it to celltype→gene: the cell type carries the
+    expression evidence and the marker gene never appears as a target. ``target:``
+    subjects (candidate targets, e.g. CD276 from literature) are left as-is.
+    """
+    if relation == "EXPRESSED_IN" and _kind_of(subject) == "gene":
+        return obj, subject          # celltype --EXPRESSED_IN--> gene
+    return subject, obj
+
+
 def import_facts(csv_paths: list[Path], store: Path) -> int:
     graph = KG.KnowledgeGraph(store=store)
     run = f"dataset-projection-import"
     n = 0
     for path in csv_paths:
         for r in csv.DictReader(path.open()):
-            s, t = r["subject"], r["object"]
             rel = r["relation"]
+            s, t = _orient(r["subject"], r["object"], rel)
             conf = float(r["confidence"])
             axis = _RELATION_AXIS.get(rel, "evidence")
             s_kind, t_kind = _kind_of(s), _kind_of(t)

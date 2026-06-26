@@ -414,6 +414,9 @@ def decide_from_evidence(results: list[dict[str, Any]], target: str) -> dict[str
             axes[axis] = {"grade": grade, "weight": w}
 
     score = round(sum(a["weight"] for a in axes.values()), 3)
+    # axes with genuinely no information — named explicitly so a low score reads as
+    # "no information on X", never as a quietly-discounted number.
+    absent_axes = [ax for ax, a in axes.items() if a["grade"] == "absent"]
     safety = axes["safety"]
     has_safety = safety["grade"] != "absent"
     strong_safety = safety["grade"] == "strong"
@@ -437,13 +440,17 @@ def decide_from_evidence(results: list[dict[str, Any]], target: str) -> dict[str
 
     breakdown = ", ".join(f"{ax}={a['grade']}({a['weight']})"
                           for ax, a in axes.items())
-    explanation = (f"{tgt} → {tier}: {why}. Per-axis: {breakdown} "
+    # State absence plainly: name the axes with no information rather than letting a
+    # low score imply weak-but-present evidence.
+    absence = (f" No information on: {', '.join(absent_axes)}." if absent_axes else "")
+    explanation = (f"{tgt} → {tier}: {why}.{absence} Per-axis: {breakdown} "
                    f"(sum {score}/4.0).")
     facts = [f"axis_score({tgt}, {ax}, {a['weight']})" for ax, a in axes.items()]
+    facts += [f"no_information({tgt}, {ax})" for ax in absent_axes]
     facts.append(f"score({tgt}, {score})")
     facts.append(f"{tier.lower()}({tgt})")
     return {"tier": tier, "score": score, "max_score": 4.0, "axes": axes,
-            "explanation": explanation, "facts": facts}
+            "absent_axes": absent_axes, "explanation": explanation, "facts": facts}
 
 
 def derive_gaps(graph: KG.KnowledgeGraph) -> list[dict[str, Any]]:
@@ -459,11 +466,14 @@ def derive_gaps(graph: KG.KnowledgeGraph) -> list[dict[str, Any]]:
     # Reuse the fact base reason() compiles, then evaluate the gap rules over it.
     facts = _parse_facts(graph_to_vada(graph))
     evidence = facts.get("evidence", [])           # (target, axis, conf)
-    expressed = facts.get("expressed_in", [])      # (target, celltype, conf)
 
+    # A node is a target if it is *declared* one or carries *prioritization-axis*
+    # evidence. Appearing only in an expression edge (expressed_in) does NOT confer
+    # targethood — that is expression context (e.g. a scRNA marker / a cell type),
+    # not a candidate-target claim. Folding expressed_in subjects in here would flag
+    # markers and cell types as targets missing every axis.
     declared = {t for (t,) in facts.get("target", [])}
-    targets = sorted(declared | {t for (t, _, _) in evidence}
-                     | {t for (t, _, _) in expressed})
+    targets = sorted(declared | {t for (t, _, _) in evidence})
     axes_of: dict[str, set[str]] = {}
     for (t, ax, _) in evidence:
         axes_of.setdefault(t, set()).add(ax)
@@ -509,16 +519,20 @@ def _reason_prometheux(vada: str) -> ReasonResult:
       3. ``run_concept`` to evaluate the rules, then
       4. ``fetch_results`` to read each derived predicate's rows.
 
-    Auth is the ``PMTX_TOKEN`` env var + the ``JARVISPY_URL`` config the SDK reads.
-    Any failure raises so :func:`reason` degrades to the local evaluator (never
-    fabricates). The exact row/column shape from ``fetch_results`` is the one piece
-    that needs a live token to pin down; :func:`_normalize_px_rows` is permissive
-    about it and is the single place to adjust once a real response is seen.
+    Auth is the ``PMTX_TOKEN`` env var + the ``JARVISPY_URL`` config the SDK reads
+    (the SDK defaults to ``http://localhost:8000``, so the hosted org/user URL must
+    be applied or every call 404s). Any failure raises so :func:`reason` degrades to
+    the local evaluator (never fabricates). Verified live against the hosted engine
+    (2026-06-26): ``run_concept`` needs ``persist_outputs=True`` or ``fetch_results``
+    404s on a missing results file, and the result rows are nested at
+    ``["results"]["facts"]`` — see :func:`_normalize_px_rows`.
     """
     import prometheux_chain as px  # optional dependency
 
-    # auth: token from the env (the SDK reads PMTX_TOKEN), optional URL override
-    os.environ["PMTX_TOKEN"] = os.environ["PMTX_TOKEN"]
+    # auth: PMTX_TOKEN is read from the env by the SDK; JARVISPY_URL points the SDK
+    # at the hosted backend (it ships defaulting to http://localhost:8000, so the
+    # hosted org/user URL MUST be applied or every call 404s). Both come from the
+    # process env, which the caller/CLI is expected to have loaded from .env.
     url = os.environ.get("JARVISPY_URL")
     if url:
         px.config.set("JARVISPY_URL", url)
@@ -530,9 +544,12 @@ def _reason_prometheux(vada: str) -> ReasonResult:
     explanations: list[dict[str, Any]] = []
     for pred in _PX_OUTPUTS:
         concept_name = f"{_PX_CONCEPT}_{pred}"
-        px.save_concept(project_id, definition=vada,
-                        output_predicate=pred, concept_name=concept_name)
-        px.run_concept(project_id, concept_name)
+        px.save_concept(project_id, definition=vada, output_predicate=pred,
+                        concept_name=concept_name, existing_name=concept_name)
+        # persist_outputs=True is REQUIRED: without it the run computes but writes
+        # no results file and fetch_results 500s with PATH_NOT_FOUND. page_size is
+        # capped at 1000 by the backend.
+        px.run_concept(project_id, concept_name, persist_outputs=True)
         rows = px.fetch_results(project_id, output_predicate=pred, page_size=1000)
         derived[pred] = _normalize_px_rows(rows)
         for r in derived[pred]:
@@ -550,14 +567,22 @@ def _normalize_px_rows(rows: Any) -> list[tuple]:
     """
     if rows is None:
         return []
-    # paginated envelope: {"results"/"rows"/"data": [...]}
+    # The live JarvisPy shape (verified against the hosted engine) is nested:
+    #   {"results": {"facts": [[...], ...], "columnNames": [...]},
+    #    "pagination": {...}}
+    # — rows live at ["results"]["facts"]. We also accept the flatter shapes
+    # ({"results"/"rows"/"data"/"items": [...]}) so the parser stays permissive.
     if isinstance(rows, dict):
-        for key in ("results", "rows", "data", "items"):
-            if isinstance(rows.get(key), list):
-                rows = rows[key]
-                break
+        inner = rows.get("results")
+        if isinstance(inner, dict) and isinstance(inner.get("facts"), list):
+            rows = inner["facts"]
         else:
-            return []
+            for key in ("results", "rows", "data", "items"):
+                if isinstance(rows.get(key), list):
+                    rows = rows[key]
+                    break
+            else:
+                return []
     out: list[tuple] = []
     for r in rows:
         if isinstance(r, dict):

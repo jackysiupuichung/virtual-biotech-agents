@@ -101,11 +101,13 @@ Mapping: `EXPRESSED_IN`→`specificity` axis, `GENETIC_LINK`→`genetics`; confi
 throwaway store): the decision layer scored specificity=strong + genetics=supporting
 and correctly returned `NO_GO` via the safety hard-gate (no safety read).
 
-**Note:** the importer treats every `subject` as a graph node by its id prefix; a
-`gene:`-prefixed scRNA *marker* (CD3D, CD14) is not a therapeutic target, so the
-gap-detector will flag its missing axes. Use the `target:` prefix for candidate
-targets and `gene:` only for marker evidence — or extend the importer to attach
-marker facts to a celltype rather than as a standalone target.
+**Markers vs targets.** A `gene:`-prefixed scRNA *marker* (CD3D, CD14) is not a
+therapeutic target. The importer orients `EXPRESSED_IN` gene→celltype facts as
+celltype→gene so the marker never becomes an evidence subject, and the CSO
+gap-detector only treats nodes with *prioritization-axis* evidence (or declared
+`Target` nodes) as targets — so markers and cell types are no longer flagged.
+Verified: importing pbmc3k + literature leaves only the real `target:` candidates
+(CD276, B7-H3, EGFR, KRAS, MET) as targets.
 
 ## Operational notes (from the verified live integration)
 
