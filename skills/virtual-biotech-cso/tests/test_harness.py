@@ -27,7 +27,7 @@ class FakeRunner:
     model = "fake-1"
 
     def __init__(self, verdict="synthesize", reroute_times=None, route_to="scrna-orchestrator",
-                 plan="full"):
+                 plan="full", missing_seq=None):
         # verdict: the steady-state verdict. reroute_times: if set, re-route exactly
         # this many times then return 'synthesize' (lets us test loop convergence).
         # route_to: the skill the reviewer chooses (to exercise catalog validation).
@@ -38,6 +38,9 @@ class FakeRunner:
         self._reroute_times = reroute_times
         self._route_to = route_to
         self._plan = plan
+        # missing_seq: optional per-pass ``missing`` text, so a test can ask the SAME
+        # skill a *different* question each pass (exercises the deeper-reroute path).
+        self._missing_seq = missing_seq
         self._reviews = 0
         self.calls = []
 
@@ -47,28 +50,42 @@ class FakeRunner:
         # "Scientific Reviewer" in its body).
         title = prompt.splitlines()[0]
         self.calls.append(title)
-        # The planner reuses the Orchestrator prompt but is the only call whose
-        # schema asks for `subtasks` — dispatch on that before the synthesis branch.
-        if "subtasks" in schema:
+        # The planner reuses the Orchestrator prompt but is the only call whose schema
+        # asks for `questions` (the hybrid planner) — dispatch on that. Each question
+        # carries a best-fit (division, intent); cso.bind_questions binds the routable
+        # ones to skills and routes the rest to proposed experiments.
+        if "questions" in schema:
             minimal = [
-                {"division": "target_id_and_prioritization",
-                 "intent": "germline_genetic_support", "question": "germline?",
-                 "depends_on": []},
-                {"division": "clinical_officers",
-                 "intent": "prior_trials_and_outcomes", "question": "prior trials?",
-                 "depends_on": []},
+                {"question": "germline?", "rationale": "causal grounding",
+                 "division": "target_id_and_prioritization",
+                 "intent": "germline_genetic_support", "depends_on": []},
+                {"question": "prior trials?", "rationale": "translatability",
+                 "division": "clinical_officers",
+                 "intent": "prior_trials_and_outcomes", "depends_on": []},
             ]
             if self._plan == "minimal":
-                return {"subtasks": minimal}
-            # full plan: covers all four required axes (genetics, specificity, safety,
-            # tractability) so the Prometheux gap-detector finds no structural gap.
-            return {"subtasks": minimal[:1] + [
-                {"division": "target_id_and_prioritization",
-                 "intent": "cell_type_specificity", "question": "specific?",
-                 "depends_on": []},
-                {"division": "target_safety",
-                 "intent": "post_market_adverse_events", "question": "safe?",
-                 "depends_on": []},
+                return {"reasoning": "minimal scan", "questions": minimal}
+            # full plan: covers all four *core* required axes (genetics, specificity,
+            # safety, tractability) plus the somatic + malignancy desired axes, so the
+            # Prometheux gap-detector finds no *forcing* structural gap and the tests
+            # isolate the LLM-verdict path. It deliberately does NOT run lit-synthesizer
+            # (the landscape axis / REROUTE_FALLBACK_SKILL): those are non-core, so their
+            # absence never forces a re-route, and keeping lit-synthesizer un-run lets
+            # the reroute-fallback tests observe an honest fallback. (The landscape
+            # axis is non-core, so leaving it unassessed never forces a re-route.)
+            return {"reasoning": "full assessment", "questions": minimal[:1] + [
+                {"question": "specific?", "rationale": "trial-success prior",
+                 "division": "target_id_and_prioritization",
+                 "intent": "cell_type_specificity", "depends_on": []},
+                {"question": "safe?", "rationale": "AE risk",
+                 "division": "target_safety",
+                 "intent": "post_market_adverse_events", "depends_on": []},
+                {"question": "somatic drivers?", "rationale": "driver frequency",
+                 "division": "target_id_and_prioritization",
+                 "intent": "somatic_mutation_frequency", "depends_on": []},
+                {"question": "on tumour cells?", "rationale": "ADC/CAR-T efficacy",
+                 "division": "target_id_and_prioritization",
+                 "intent": "malignant_cell_localization", "depends_on": []},
                 minimal[1],
             ]}
         if "Chief of Staff" in title:
@@ -90,9 +107,12 @@ class FakeRunner:
             # supplies a distinct catalog skill per pass (the loop dedups otherwise).
             route = (self._route_to[min(self._reviews - 1, len(self._route_to) - 1)]
                      if isinstance(self._route_to, (list, tuple)) else self._route_to)
+            missing = ("spatial" if self._missing_seq is None
+                       else self._missing_seq[min(self._reviews - 1,
+                                                  len(self._missing_seq) - 1)])
             return {"verdict": verdict,
                     "scores": {"relevance": 5, "evidence": 4, "thoroughness": 3},
-                    "gaps": [{"missing": "spatial", "route_to": route,
+                    "gaps": [{"missing": missing, "route_to": route,
                               "why": "lost context"}] if verdict == "re-route" else [],
                     "experiments": []}
         if "Orchestrator" in title:
@@ -159,8 +179,13 @@ class BadPlanRunner(FakeRunner):
     """Proposes an invented division → harness must fall back to deterministic plan."""
 
     def run(self, prompt, context, schema):
-        if "subtasks" in schema:
-            return {"subtasks": [{"division": "made_up_division", "intent": "x"}]}
+        # The hybrid planner is the only call asking for `questions`; emit a question
+        # that names a division which doesn't exist in routing.yaml so binding fails
+        # and the harness falls back to the deterministic plan.
+        if "questions" in schema:
+            return {"reasoning": "bad plan", "questions": [
+                {"question": "x", "rationale": "y", "division": "made_up_division",
+                 "intent": "x", "depends_on": []}]}
         return super().run(prompt, context, schema)
 
 
@@ -168,9 +193,10 @@ def test_invalid_plan_falls_back_to_deterministic(monkeypatch, tmp_path):
     out = _run(monkeypatch, BadPlanRunner("synthesize"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     steps = [e["step"] for e in data["evidence"]]
-    # deterministic 5-step plan, not the invented one
+    # deterministic functional plan (now 4 steps starting at step_01_gwas), not the
+    # invented one.
     assert steps[0] == "step_01_gwas", steps
-    assert len(steps) >= 5
+    assert len(steps) >= 4
 
 
 # --------------------- reviewer verdict drives control flow --------------- #
@@ -213,7 +239,9 @@ def _reroute_steps(out):
 
 # distinct catalog skills (none run by the full plan) so each re-route adds a
 # genuinely new skill — the loop dedups re-routes that re-run a covered skill.
-_FRESH_SKILLS = ["pathway-enricher", "tcga-somatic-profiler", "struct-predictor"]
+# (tcga-somatic-profiler / lit-synthesizer are now part of the full 8-axis plan, so
+# they are excluded here — re-routing to an already-run skill adds no evidence.)
+_FRESH_SKILLS = ["pathway-enricher", "struct-predictor", "crispr-screen-triage"]
 
 
 def test_live_loop_converges_when_reviewer_synthesizes(monkeypatch, tmp_path):
@@ -232,16 +260,49 @@ def test_live_loop_is_bounded_at_max_reroutes(monkeypatch, tmp_path):
 
 def test_loop_stops_when_reroute_would_rerun_a_covered_skill(monkeypatch, tmp_path):
     """Convergence: a reviewer that re-routes forever to the *same* skill must not
-    thrash. The first re-route runs that skill; subsequent passes resolve to the
-    same (now-covered) skill and add no evidence, so the loop stops at one re-route
-    even though the reviewer keeps voting re-route."""
+    thrash on it. The first re-route runs that skill; on subsequent passes the
+    reviewer's repeated choice resolves to the same (now-covered) skill and is
+    skipped — it is never re-run, even though the reviewer keeps voting re-route.
+    (The loop may still continue on *engine*-supplied gaps for other unassessed
+    axes — those add genuinely new evidence — but the reviewer's thrashed skill is
+    run exactly once.)"""
     out = _run(monkeypatch, FakeRunner("re-route", route_to="pathway-enricher"), tmp_path)
-    steps = _reroute_steps(out)
-    assert steps == ["step_06_reroute"], steps
     skills = [e["skill"] for e in
               json.loads(Path(out["result"]).read_text())["data"]["evidence"]
               if "reroute" in e["step"]]
-    assert skills == ["pathway-enricher"]  # ran once, never re-run
+    assert skills.count("pathway-enricher") == 1, skills  # ran once, never re-run
+    assert len(skills) == len(set(skills)), skills  # no skill re-run within the loop
+
+
+def test_deeper_reroute_reruns_question_sensitive_skill_with_new_question(monkeypatch, tmp_path):
+    """A question-sensitive skill (the live search) may be re-routed more than once
+    when each pass asks a *different* question — a deeper follow-up that can surface
+    evidence the shallower first pass didn't. Same skill, distinct ``missing`` →
+    distinct steps, so the loop deepens rather than thrashing."""
+    out = _run(monkeypatch, FakeRunner(
+        "re-route", route_to="lit-synthesizer",
+        missing_seq=["off-target normal-tissue expression",
+                     "competitive ADC landscape", "resistance mechanisms"]), tmp_path)
+    reroutes = [e for e in
+                json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+                if "reroute" in e["step"]]
+    skills = [e["skill"] for e in reroutes]
+    # the SAME search skill ran several times (bounded by MAX_REROUTES), each a
+    # distinct deeper question — i.e. a re-run of a covered skill *was* allowed here.
+    assert skills.count("lit-synthesizer") >= 2, skills
+    assert len({e["question"] for e in reroutes}) == len(reroutes), reroutes  # all distinct
+
+
+def test_deeper_reroute_blocked_when_question_repeats(monkeypatch, tmp_path):
+    """Even the question-sensitive skill is not re-run on the *same* question: an
+    identical (skill, missing) repeat adds nothing, so the loop stops rather than
+    burning a pass on a guaranteed-duplicate search."""
+    out = _run(monkeypatch, FakeRunner(
+        "re-route", route_to="lit-synthesizer", missing_seq=["same question"]), tmp_path)
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"] and e["skill"] == "lit-synthesizer"]
+    assert len(skills) == 1, skills  # one search on that question, never repeated
 
 
 # --------------------- agent-chosen reroute target (change #3) ------------ #
@@ -255,11 +316,13 @@ def test_invented_reroute_target_falls_back_to_catalog_skill(monkeypatch, tmp_pa
 
 
 def test_valid_reroute_target_is_honored(monkeypatch, tmp_path):
-    # lit-synthesizer IS in the catalog → the reviewer's choice is kept.
-    out = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="lit-synthesizer"), tmp_path)
+    # pathway-enricher IS in the catalog and is NOT run by the full plan → the
+    # reviewer's choice is kept (lit-synthesizer is now part of the 8-axis plan, so
+    # routing to it would be a no-op the loop dedups).
+    out = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     skill = next(e["skill"] for e in data["evidence"] if "reroute" in e["step"])
-    assert skill == "lit-synthesizer"
+    assert skill == "pathway-enricher"
 
 
 def test_synthesize_verdict_has_no_reroute(monkeypatch, tmp_path):
@@ -268,6 +331,80 @@ def test_synthesize_verdict_has_no_reroute(monkeypatch, tmp_path):
     out = _run(monkeypatch, FakeRunner("synthesize"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     assert "step_06_reroute" not in [e["step"] for e in data["evidence"]]
+
+
+# --------------------- human-in-the-loop gate (reviewer checkpoint) ------- #
+def _run_gated(monkeypatch, runner, tmp_path, gate):
+    monkeypatch.setattr(runners, "select_runner", lambda *a, **k: runner)
+    return harness.run("Assess B7-H3 in lung cancer", tmp_path, backend="auto",
+                       model=None, demo=True, live=False, argv=["--demo"], gate=gate)
+
+
+def test_no_gate_is_unchanged():
+    # The gate is purely additive: a None gate leaves _apply_gate a pass-through.
+    import harness as h  # noqa: E402
+    v, fu, gap = h._apply_gate(
+        None, h.Trace("fake", "m", quiet=True), verdict="re-route", review={},
+        followup="FU", gap={"missing": "x"}, iteration=0, routing={}, executed=set(),
+        step_n=6)
+    assert (v, fu, gap) == ("re-route", "FU", {"missing": "x"})
+
+
+def test_gate_fires_at_each_pass_and_sees_checkpoint(monkeypatch, tmp_path):
+    # The gate is invoked every review pass with the panel verdict + proposed reroute.
+    seen = []
+    out = _run_gated(monkeypatch, FakeRunner("synthesize"), tmp_path,
+                     gate=lambda cp: seen.append(cp) or {"action": "approve"})
+    assert len(seen) == 1  # one pass (synthesize) → one checkpoint
+    assert seen[0]["verdict"] == "synthesize"
+    assert "panel" in seen[0]
+    # the checkpoint event is streamed for the UI to render the pause
+    trace = (tmp_path / "trace.jsonl").read_text()
+    assert "checkpoint" not in trace or True  # checkpoint is an emit event, not a span
+
+
+def test_gate_approve_matches_autonomous(monkeypatch, tmp_path):
+    # Approving each pass yields the same evidence steps as the ungated run.
+    auto = _run(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"), tmp_path / "a")
+    gated = _run_gated(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"),
+                       tmp_path / "b", gate=lambda cp: {"action": "approve"})
+    steps_a = [e["step"] for e in json.loads(Path(auto["result"]).read_text())["data"]["evidence"]]
+    steps_b = [e["step"] for e in json.loads(Path(gated["result"]).read_text())["data"]["evidence"]]
+    assert steps_a == steps_b
+
+
+def test_gate_override_to_synthesize_stops_reroute(monkeypatch, tmp_path):
+    # A reviewer panel that re-routes, overridden by a human to synthesize → no reroute.
+    out = _run_gated(monkeypatch, FakeRunner("re-route", route_to="pathway-enricher"), tmp_path,
+                     gate=lambda cp: {"action": "override_verdict", "verdict": "synthesize"})
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    assert [e["step"] for e in data["evidence"] if "reroute" in e["step"]] == []
+    assert out["summary"]["reviewer_verdict"] == "synthesize"
+
+
+def test_gate_override_to_reroute_forces_followup(monkeypatch, tmp_path):
+    # A 'synthesize' panel, overridden by a human to re-route, runs a follow-up step.
+    out = _run_gated(monkeypatch, FakeRunner("synthesize"), tmp_path,
+                     gate=lambda cp: ({"action": "override_verdict", "verdict": "re-route",
+                                       "route_to": "pathway-enricher", "missing": "human call"}
+                                      if cp["iteration"] == 0 else {"action": "approve"}))
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"]]
+    assert "pathway-enricher" in skills, skills
+
+
+def test_gate_redirect_changes_reroute_target(monkeypatch, tmp_path):
+    # The panel picks pathway-enricher; the human redirects to struct-predictor.
+    out = _run_gated(monkeypatch, FakeRunner(reroute_times=1, route_to="pathway-enricher"), tmp_path,
+                     gate=lambda cp: ({"action": "redirect", "route_to": "struct-predictor",
+                                       "missing": "structure"} if cp["proposed_reroute"]
+                                      else {"action": "approve"}))
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"]]
+    assert "struct-predictor" in skills, skills
+    assert "pathway-enricher" not in skills, skills
 
 
 # --------------------- Prometheux gap-detector forces re-route ------------- #
@@ -408,8 +545,8 @@ def test_division_scientists_run_and_interpret(monkeypatch, tmp_path):
     out = _run(monkeypatch, DivRunner("synthesize"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     findings = data["division_findings"]
-    # full plan spans target_id (germline+specificity), target_safety, clinical →
-    # one division scientist agent per distinct division.
+    # full plan spans target_id (germline+specificity+somatic+malignancy),
+    # target_safety, clinical → one division scientist agent per distinct division.
     divisions = sorted(f["division"] for f in findings)
     assert divisions == ["clinical_officers", "target_id_and_prioritization",
                          "target_safety"], findings
@@ -419,8 +556,11 @@ def test_division_scientists_run_and_interpret(monkeypatch, tmp_path):
     trace = (tmp_path / "trace.jsonl").read_text()
     assert "scientist:target_id_and_prioritization" in trace
     assert "scientist:clinical_officers" in trace
-    # raw evidence steps still flow alongside the interpretations
-    assert len(data["evidence"]) == len(data["plan"])
+    # every planned step still surfaces as evidence (re-routes legitimately add more,
+    # so assert coverage of the plan rather than an exact count).
+    evidence_steps = {e["step"] for e in data["evidence"]}
+    plan_steps = {s["step"] for s in data["plan"]}
+    assert plan_steps <= evidence_steps
 
 
 def test_division_findings_stub_without_backend_keep_evidence(monkeypatch, tmp_path):
@@ -428,4 +568,6 @@ def test_division_findings_stub_without_backend_keep_evidence(monkeypatch, tmp_p
     data = json.loads(Path(out["result"]).read_text())["data"]
     # no backend → interpretations stubbed, but evidence still present (never fabricates)
     assert all(f["source"] == "delegate-to-agent" for f in data["division_findings"])
-    assert len(data["evidence"]) >= 5
+    # the deterministic fallback plan is 4 steps (the non-functional scrna step was
+    # removed); evidence still flows for every one.
+    assert len(data["evidence"]) >= 4

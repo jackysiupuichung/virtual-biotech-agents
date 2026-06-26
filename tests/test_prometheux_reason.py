@@ -65,12 +65,22 @@ def test_empty_graph_derives_nothing() -> None:
 
 # --- the reviewer gap-detector (load-bearing role) ------------------------- #
 def test_gaps_from_evidence_flags_missing_axes() -> None:
-    # only a specificity step is present → safety/genetics/tractability are gaps
+    # only a specificity step is present → every OTHER decision axis is a missing-axis
+    # gap (forcing); within the covered specificity axis, the unfilled malignant
+    # datatype is a soft enrichment gap (non-forcing).
     results = [{"step": "step_03_celltype_specificity", "grade": "strong"}]
     gaps = pr.gaps_from_evidence(results, "B7-H3")
-    axes = {g["why"].split("'")[1] for g in gaps}
-    assert axes == {"safety", "genetics", "tractability"}
-    assert all(g["forces_reroute"] for g in gaps)
+    # missing AXES carry a missing_axis fact; their `why` names the axis.
+    missing_axes = {g["why"].split("'")[1] for g in gaps
+                    if g["fact"].startswith("missing_axis")}
+    assert missing_axes == {"target_validity", "safety", "tractability"}
+    # all four decision axes are core → every missing one forces a re-route.
+    forcing = {g["why"].split("'")[1] for g in gaps
+               if g["forces_reroute"] and g["fact"].startswith("missing_axis")}
+    assert forcing == {"target_validity", "safety", "tractability"}
+    # the "more within an axis" signal: a datatype-enrichment gap on the covered axis.
+    enrich = [g for g in gaps if g["fact"].startswith("missing_datatype")]
+    assert enrich and all(not g["forces_reroute"] for g in enrich)
     assert all(g["lenses"] == ["prometheux"] for g in gaps)
 
 
@@ -85,9 +95,10 @@ def test_absent_grade_is_weak_not_forcing() -> None:
     # a step that targeted safety but returned no data → reported, but NOT forcing
     # (re-routing to the same empty skill would loop). The other axes are structural.
     results = [{"skill": "openfda-safety", "step": "step_04_offtarget_safety", "grade": "absent"}]
-    gaps = {g["why"].split("'")[1]: g for g in gaps_by_axis(results)}
-    assert gaps["safety"]["forces_reroute"] is False
-    assert gaps["genetics"]["forces_reroute"] is True  # never assessed → structural
+    gaps = {g["why"].split("'")[1]: g for g in gaps_by_axis(results)
+            if g["fact"].startswith(("missing_axis", "weak_axis"))}
+    assert gaps["safety"]["forces_reroute"] is False           # attempted but empty
+    assert gaps["target_validity"]["forces_reroute"] is True   # never assessed → structural
 
 
 def gaps_by_axis(results):
@@ -95,11 +106,23 @@ def gaps_by_axis(results):
 
 
 def test_full_coverage_yields_no_gaps() -> None:
+    # No gaps requires every decision axis covered AND every *functional* datatype
+    # within it assessed — one step per functional datatype (skill names drive the
+    # datatype mapping). Missing any would surface a soft enrichment gap.
     results = [
-        {"step": "step_01_gwas", "grade": "supporting"},
-        {"step": "step_03_celltype_specificity", "grade": "strong"},
-        {"step": "step_04_offtarget_safety", "grade": "supporting"},
-        {"step": "step_05_clinical_trials", "grade": "supporting"},
+        {"skill": "gwas-lookup", "step": "step_01_gwas", "grade": "supporting"},
+        {"skill": "tcga-somatic-profiler", "step": "step_02_somatic", "grade": "supporting"},
+        {"skill": "crispr-screen-triage", "step": "step_03_crispr", "grade": "supporting"},
+        {"skill": "celltype-specificity-profiler", "step": "step_04_spec", "grade": "strong"},
+        {"skill": "malignant-expression-profiler", "step": "step_05_malig", "grade": "supporting"},
+        {"skill": "openfda-safety", "step": "step_06_safety", "grade": "supporting"},
+        {"skill": "clinical-trial-finder", "step": "step_07_trials", "grade": "supporting"},
+        # the OT step carries a real payload so expand_evidence fills all 3 OT datatypes
+        {"skill": "opentargets-target-factors", "step": "step_08_factors", "grade": "supporting",
+         "result": {"prioritisation_factors": [{"key": "k", "value": 0.5}] * 6,
+                    "tractability_positive": [{"label": "x", "value": True}] * 2,
+                    "safety_liabilities": [{"event": "e"}]}},
+        {"skill": "lit-synthesizer", "step": "step_09_landscape", "grade": "supporting"},
     ]
     assert pr.gaps_from_evidence(results, "B7-H3") == []
 
@@ -174,7 +197,7 @@ def test_decision_names_absent_axes_explicitly() -> None:
         # no genetics, safety, or tractability evidence
     ]
     dec = pr.decide_from_evidence(results, "B7-H3")
-    assert set(dec["absent_axes"]) == {"safety", "genetics", "tractability"}
+    assert set(dec["absent_axes"]) == {"target_validity", "safety", "tractability"}
     assert "No information on:" in dec["explanation"]
     assert "no_information(B7-H3, safety)" in dec["facts"]
 

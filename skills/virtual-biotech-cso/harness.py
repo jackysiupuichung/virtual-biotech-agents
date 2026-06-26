@@ -37,6 +37,16 @@ from typing import Any, Callable
 # one to stream the live loop as SSE; the CLI leaves it unset (console only).
 Emit = Callable[[str, dict[str, Any]], None]
 
+# Human-in-the-loop gate. Called once per review-loop pass *after* the reviewer
+# panel votes and a candidate follow-up is resolved, but *before* the loop acts on
+# it. Receives a checkpoint payload (verdict, panel, gaps, the proposed re-route)
+# and returns a decision dict the loop applies — letting a human approve, override
+# the verdict, redirect the re-route, or inject a gap. Returning ``None`` (or a
+# falsy/`{"action": "approve"}` value) keeps the autonomous behaviour unchanged.
+# When no gate is supplied the loop runs fully autonomously exactly as before, so
+# HITL is purely additive — the CLI and every existing test are unaffected.
+Gate = Callable[[dict[str, Any]], "dict[str, Any] | None"]
+
 import cso  # sibling module — reused, never modified
 import runners
 from tracing import TraceRecorder
@@ -60,6 +70,19 @@ PLAN_SCHEMA = {
                   "intent": "string (an intent under that division)",
                   "question": "string", "depends_on": ["step_NN_intent"]}],
 }
+# Hybrid planner: first reason freely about the ideal investigation, THEN bind each
+# question to a functional (division, intent) — or leave it unbound (→ a proposed
+# experiment). The reasoning is streamed so the UI shows the agent deciding what to ask.
+HYBRID_PLAN_SCHEMA = {
+    "reasoning": "string (1-3 sentences: how you're approaching this target assessment)",
+    "questions": [{
+        "question": "string (a scientific sub-question worth answering for this target)",
+        "rationale": "string (why this question matters to the go/no-go decision)",
+        "division": "string (the best-fit routing division, or null if none fits)",
+        "intent": "string (the best-fit intent under that division, or null if none fits)",
+        "depends_on": ["step_NN_intent (earlier bound questions only)"],
+    }],
+}
 DIVISION_FINDING_SCHEMA = {
     "division": "string",
     "interpretation": "string (cite [step_NN])",
@@ -80,6 +103,15 @@ SYNTHESIS_SCHEMA = {
 
 AGENT_SOURCE = "agent (live)"  # provenance tag for agent-produced slots
 MAX_REROUTES = 3  # change #2: bound the review→reroute loop (avoid unbounded recursion)
+
+# Token budget for the review→reroute loop. The loop always runs its core passes
+# (up to MAX_REROUTES, forced by the load-bearing core axes); beyond that it keeps
+# chasing the broader *desired* axes (prometheux_reason.REQUIRED_AXES minus
+# CORE_AXES) only while the run's accumulated token spend (rec.totals) is under this
+# ceiling. So a thin run converges on the core four, a budget-rich run fills the
+# broader axes, and the bound is tokens — not a magic pass count. Overridable per
+# run via the ``token_budget`` arg to ``_review_and_reroute`` (0/None → core only).
+DEFAULT_TOKEN_BUDGET = 60_000
 
 
 def _read_prompt(path: Path) -> str:
@@ -162,44 +194,67 @@ def _agent_or_stub(trace: Trace, role: str, runner: runners.Runner, prompt: Path
 
 def _plan(trace: Trace, runner: runners.Runner, query: str, briefing: dict[str, Any],
           case: str, routing: dict[str, Any], rec: TraceRecorder
-          ) -> tuple[list[cso.Subtask], str]:
-    """Ask the planning agent for a plan; validate + bind it, else fall back.
+          ) -> tuple[list[cso.Subtask], list[dict[str, Any]], str]:
+    """Hybrid planner: reason up the ideal investigation, then ground it.
 
-    This is change #1 from docs/ai-scientist-landscape-review.md: the plan becomes an
-    *agent output* validated against routing.yaml, not a deterministic lookup. The
-    agent may only reference real (division, intent) pairs — anything invented, or any
-    backend failure, degrades to cso.decompose_and_route (the honest deterministic plan).
+    The planning agent first reasons *freely* — it lists the scientific questions it
+    would ask to make the go/no-go call, each with a rationale — then binds each to the
+    best functional (division, intent). ``cso.bind_questions`` splits the result:
+    questions that route to a runnable skill become executed subtasks; the rest become
+    **proposed experiments** (the agent knew what it wanted, but no tool answers it yet).
+    The planner's reasoning + the bound/unbound split stream to the UI, so the agent is
+    seen *deciding what to investigate*, not silently emitting a list.
+
+    Returns ``(subtasks, experiments, source)``. Any backend failure (or an empty/
+    invalid result) degrades to the deterministic plan with no extra experiments.
     """
     catalog = cso._routable_intents(routing)
     menu = "\n".join(f"- {div}: {', '.join(sorted(ix))}" for div, ix in catalog.items())
     context = (
         f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
-        f"Propose a plan. Each subtask must use one (division, intent) pair from this "
-        f"routing menu — do not invent divisions, intents, or skills:\n{menu}\n\n"
-        f"depends_on entries must reference earlier steps as step_NN_<intent>."
+        "You are the CSO planning this target assessment. First, in `reasoning`, say "
+        "briefly how you'll approach it. Then in `questions`, list the scientific "
+        "sub-questions you'd answer to reach a go/no-go decision — reason about what "
+        "actually matters for THIS target, don't just fill slots. For each question, "
+        "pick the best-fit (division, intent) from the menu below; if none fits, set "
+        "them to null (it becomes a proposed experiment). Prefer questions you can "
+        f"ground in the menu, but include the key open questions even if unbindable:\n{menu}\n\n"
+        "depends_on may reference earlier bound questions as step_NN_<intent>."
     )
     with rec.span("planner", kind="agent", backend=runner.name, model=runner.model) as sp:
         try:
             payload = runners.run_with_retry(
-                runner, _read_prompt(cso.ORCHESTRATOR_PROMPT), context, PLAN_SCHEMA)
-            subtasks = cso.validate_and_bind_plan(payload.get("subtasks", []), routing)
+                runner, _read_prompt(cso.ORCHESTRATOR_PROMPT), context, HYBRID_PLAN_SCHEMA)
+            subtasks, experiments = cso.bind_questions(payload.get("questions", []), routing)
+            if not subtasks:  # nothing bound → fall back so the run still produces evidence
+                raise cso.PlanValidationError("no question bound to a functional skill")
+            reasoning = str(payload.get("reasoning", "")).strip()
             sp.record_usage(**_usage_of(runner)).set(
-                source=AGENT_SOURCE, n_steps=len(subtasks), validated=True)
-            trace.step("🗺️", f"planner: agent-proposed plan ({len(subtasks)} steps, validated)")
-            return subtasks, AGENT_SOURCE
+                source=AGENT_SOURCE, n_steps=len(subtasks), n_experiments=len(experiments))
+            trace.step("🧠", f"planner reasoning: {reasoning[:120]}" if reasoning else
+                       "planner: (no reasoning text)")
+            trace.step("🗺️", f"planner: {len(subtasks)} grounded step(s), "
+                       f"{len(experiments)} open question(s) → proposed experiments")
+            trace.event("planner_reasoning", {
+                "reasoning": reasoning,
+                "grounded": [{"step": t.step, "skill": t.skill, "question": t.question}
+                             for t in subtasks],
+                "open_questions": experiments,
+            })
+            return subtasks, experiments, AGENT_SOURCE
         except runners.NoBackendError:
             subtasks = cso.decompose_and_route(query, case, routing)
             sp.status = "stub"
             sp.set(source=cso.DELEGATE, degraded="no-backend", n_steps=len(subtasks))
             trace.step("⚪", f"planner: no backend → deterministic plan ({len(subtasks)} steps)")
-            return subtasks, cso.DELEGATE
-        except Exception as exc:  # noqa: BLE001 — incl. PlanValidationError; degrade, never fabricate
+            return subtasks, [], cso.DELEGATE
+        except Exception as exc:  # noqa: BLE001 — degrade, never fabricate
             subtasks = cso.decompose_and_route(query, case, routing)
             sp.status = "stub"
             sp.set(source=cso.DELEGATE, degraded=type(exc).__name__,
                    reason=str(exc), n_steps=len(subtasks))
             trace.step("⚠️", f"planner: {type(exc).__name__} → deterministic plan ({exc})")
-            return subtasks, cso.DELEGATE
+            return subtasks, [], cso.DELEGATE
 
 
 def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, Any]],
@@ -245,7 +300,8 @@ def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, 
         review = cso.aggregate_panel_review(lens_reviews, routing, extra_gaps=engine_gaps)
         panel = review["panel"]
         panel_sp.set(verdict=review["verdict"], reroute_votes=panel["reroute_votes"],
-                     forced_by_engine=panel.get("forced_by_engine", False))
+                     forced_by_engine=panel.get("forced_by_engine", False),
+                     scores=review.get("scores", {}))
     review["source"] = AGENT_SOURCE
     forced = " (engine-forced)" if panel.get("forced_by_engine") else ""
     trace.step("👥", f"reviewer panel: {panel['reroute_votes']}/{panel['n_lenses']} lenses "
@@ -328,22 +384,155 @@ def _engine_decision(trace: Trace, results: list[dict[str, Any]],
             return None
 
 
+def _project_decision_facts(trace: Trace, decision: dict[str, Any] | None,
+                            target: str, out_dir: Path, run_id: str) -> Path | None:
+    """Project the run's verdict into decision facts on every run (local-only).
+
+    Writes ``<out_dir>/run_decision.facts.csv`` — the final-overall tier + per-axis
+    subreport conclusions in the dataset-projection Fact contract — so the verdict is
+    durable as facts, ready to reason over next to PrimeKG via run_decision_live.py.
+    This is the *projection* (cheap, dependency-light, no engine call); the live join
+    stays an explicit step. Guarded: a missing extractor never breaks a finished run.
+    """
+    if decision is None or out_dir is None:
+        return None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                               / "dataset-projection" / "extractors"))
+        from run_decision import _decision_facts  # noqa: E402
+        from facts import write_facts  # noqa: E402
+        out = out_dir / "run_decision.facts.csv"
+        n = write_facts(_decision_facts(decision, target, run_id), out)
+        trace.step("🗄️", f"projected {n} decision facts → {out.name} "
+                          f"(bind via run_decision_live.py)")
+        return out
+    except Exception as exc:  # noqa: BLE001 — projection is best-effort, never fatal
+        trace.event("decision_facts", {"degraded": str(exc)})
+        return None
+
+
+def _apply_gate(gate: "Gate | None", trace: Trace, *, verdict: str,
+                review: dict[str, Any], followup: "cso.Subtask | None",
+                gap: dict[str, Any] | None, iteration: int,
+                routing: dict[str, Any], executed: set[str], step_n: int
+                ) -> tuple[str, "cso.Subtask | None", dict[str, Any] | None]:
+    """Pause for a human at one review-loop checkpoint; apply their decision.
+
+    Called after the panel has voted and the loop has resolved its *proposed*
+    follow-up, but before anything executes. The gate (supplied by the UI) blocks
+    until the human responds, then returns a decision dict the loop honours:
+
+    - ``approve`` / falsy / no gate → keep the autonomous (verdict, followup).
+    - ``override_verdict`` + ``verdict`` → force ``synthesize`` or ``re-route``.
+    - ``redirect`` + ``route_to`` (and optional ``missing``/``why``) → re-route to
+      a human-chosen skill instead of the panel's pick.
+    - ``add_gap`` + ``missing``/``route_to`` → inject a new gap to chase; implies
+      ``re-route``.
+
+    Returns the (possibly amended) ``(verdict, followup, gap)``. With no gate this
+    is a pure pass-through, so the autonomous loop is unchanged.
+    """
+    if gate is None:
+        return verdict, followup, gap
+    checkpoint = {
+        "iteration": iteration,
+        "verdict": verdict,
+        "panel": review.get("panel", {}),
+        "scores": review.get("scores", {}),
+        "gaps": review.get("gaps", []),
+        "proposed_reroute": (
+            {"skill": followup.skill, "question": followup.question,
+             "missing": (gap or {}).get("missing", "")} if followup else None),
+    }
+    trace.event("checkpoint", checkpoint)
+    trace.step("⏸️", f"human checkpoint (pass {iteration + 1}): "
+               f"awaiting reviewer decision on verdict '{verdict}'")
+    decision = gate(checkpoint) or {}
+    action = decision.get("action", "approve")
+    if action == "approve" or not action:
+        return verdict, followup, gap
+    if action == "override_verdict":
+        new_verdict = decision.get("verdict", verdict)
+        trace.step("🧑‍⚖️", f"human override: verdict '{verdict}' → '{new_verdict}'")
+        if new_verdict != "re-route":
+            return new_verdict, None, None  # synthesize: drop any follow-up
+        # Forcing a re-route: if the panel proposed no follow-up (it had voted
+        # synthesize), build one from the human's route_to so the loop has a target.
+        if followup is None and decision.get("route_to"):
+            new_gap = {"missing": decision.get("missing") or "human-directed re-route",
+                       "route_to": decision["route_to"],
+                       "why": decision.get("why", "human-directed")}
+            followup = cso._reroute_task(new_gap, routing, step_n=step_n, executed=executed)
+            gap = new_gap
+        return new_verdict, followup, gap
+    if action in ("redirect", "add_gap"):
+        new_gap = {
+            "missing": decision.get("missing") or (gap or {}).get("missing", "human gap"),
+            "route_to": decision.get("route_to") or (gap or {}).get("route_to"),
+            "why": decision.get("why") or (gap or {}).get("why", "human-directed"),
+        }
+        new_followup = cso._reroute_task(new_gap, routing, step_n=step_n, executed=executed)
+        trace.step("🧑‍🔬", f"human {action} → {new_followup.skill} "
+                   f"({new_gap['missing']})")
+        return "re-route", new_followup, new_gap
+    trace.step("⚠️", f"human checkpoint: unknown action {action!r} → proceeding")
+    return verdict, followup, gap
+
+
 def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                  routing: dict[str, Any], results: list[dict[str, Any]],
-                 demo: bool, live: bool, rec: TraceRecorder) -> dict[str, Any]:
-    """Run reviewer→reroute until `synthesize` or MAX_REROUTES (changes #2 + #3).
+                 demo: bool, live: bool, rec: TraceRecorder,
+                 token_budget: int | None = DEFAULT_TOKEN_BUDGET,
+                 gate: "Gate | None" = None) -> dict[str, Any]:
+    """Run reviewer→reroute until `synthesize`, the budget, or MAX_REROUTES.
 
     Each iteration re-runs the reviewer over the *current* evidence (so a re-route's
     new step is itself reviewable), and on a `re-route` verdict executes one follow-up
     bound to the reviewer's chosen skill — validated against the catalog, with a
     numbered step id so successive re-routes don't collide. Returns the *last*
     reviewer payload (the one the synthesis sees), with its source tag set.
+
+    A follow-up is actionable if it runs an un-run skill, OR asks a question-sensitive
+    skill (the live search) a *new* question — a deeper probe for the specific gap,
+    steered via ``focus``. A deterministic gene-DB skill, or an identical (skill,
+    question) repeat, is skipped: re-running it can't add evidence, so the loop
+    synthesizes with the residual gap instead of thrashing.
+
+    The loop runs its core passes (``MAX_REROUTES``, forced by the load-bearing core
+    axes) and then keeps chasing the broader *desired* axes while accumulated token
+    spend (``rec.totals``) stays under ``token_budget`` — so a budget-rich run fills
+    the broader evidence axes while a thin run still converges on the core four.
     """
     panel_capable = runner.name != "stub"  # a live backend → fan out the reviewer panel
     review: dict[str, Any] = {}
     with rec.span("review_loop", kind="loop", mode="panel" if panel_capable else "single"
                   ) as loop_sp:
-        for i in range(MAX_REROUTES + 1):  # initial review + up to MAX_REROUTES follow-ups
+        # Core passes: initial review + up to MAX_REROUTES forced follow-ups. Past
+        # that, the loop continues only while the token budget has room (to chase the
+        # broader *desired* axes). ``i`` keeps numbering re-route steps uniquely.
+        def _budget_room() -> bool:
+            # Chase the broader desired axes only when there is a *measured* token
+            # spend below the budget. A run with no token telemetry (stub/test, or a
+            # runner that doesn't report usage) reads as spent==0 — treat that as "no
+            # budget signal" and fall back to the core cap rather than "infinite
+            # room". On live runs rec.totals is the same meter Langfuse mirrors.
+            spent = rec.totals.get("total_tokens", 0)
+            return bool(token_budget) and 0 < spent < token_budget
+
+        i = 0
+        # Signatures of re-routes already executed this loop, as (skill, missing).
+        # A re-route is actionable if it either runs an un-run skill OR asks the
+        # same skill a *different* question (a new ``missing``) — a deeper follow-up
+        # that can surface evidence the first, shallower pass did not. Only an
+        # identical (skill, missing) repeat is blocked, since re-running a
+        # deterministic skill on the same question cannot add anything.
+        rerouted_sigs: set[tuple[str, str]] = set()
+        while True:
+            within_core = i <= MAX_REROUTES
+            if not within_core and not _budget_room():
+                trace.step("🧾", f"token budget {token_budget} reached after core passes "
+                           "→ synthesize with residual desired-axis gaps")
+                break
             if panel_capable:
                 review = _review_panel(trace, runner, results, routing, rec, query)
                 review_src = AGENT_SOURCE
@@ -369,36 +558,68 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                     "forced": any(g.get("forces_reroute") for g in engine_gaps)})
                 trace.event("review", {"review": review})
             review.setdefault("source", review_src)
+            autonomous_verdict = review.get("verdict", "synthesize")
 
-            if review.get("verdict") != "re-route":
-                trace.step("✅", f"reviewer verdict: {review.get('verdict', 'synthesize')}")
+            # Convergence: a reroute adds evidence if it runs an un-run skill, OR
+            # asks an already-run skill a *new* question (a deeper follow-up the
+            # first pass didn't pose). Resolve each gap to its *actual* skill (via
+            # _reroute_task, which validates the reviewer's route_to and falls back
+            # to the catalog reroute target for an invalid/missing one). Forcing
+            # engine gaps sort first, so a required uncovered axis is always
+            # preferred. Only an *identical* (skill, missing) repeat is skipped —
+            # re-running a deterministic skill on the same question cannot improve,
+            # and looping on it was the loop's old failure. If every gap is such a
+            # repeat, stop and synthesize with the residual gaps.
+            executed = {e.get("skill") for e in results if e.get("skill")}
+            followup = gap = None
+            for g in review.get("gaps") or []:
+                cand = cso._reroute_task(g, routing, step_n=6 + i, executed=executed)
+                missing = (g.get("missing") or "").strip()
+                sig = (cand.skill, missing)
+                # New skill → always actionable. Already-run skill → actionable only
+                # as a *deeper follow-up*: a question-sensitive skill (live search)
+                # asked a new, non-empty question it hasn't been asked yet. A
+                # deterministic gene-DB skill can't yield new evidence from a reworded
+                # question, and a question-less repeat adds nothing — both are skipped,
+                # so the loop never thrashes re-running a covered lookup.
+                deeper = (cand.skill in cso.QUESTION_SENSITIVE_SKILLS
+                          and bool(missing) and sig not in rerouted_sigs)
+                if cand.skill not in executed or deeper:
+                    gap, followup = g, cand
+                    break
+
+            # HUMAN-IN-THE-LOOP checkpoint. Fires every pass — after the panel votes
+            # and the autonomous follow-up is resolved, before anything executes — so
+            # a human can approve, override the verdict (even force a re-route off a
+            # `synthesize`), redirect the skill, or inject a gap. No gate → pure
+            # pass-through (autonomous loop unchanged).
+            verdict, followup, gap = _apply_gate(
+                gate, trace, verdict=autonomous_verdict, review=review,
+                followup=followup, gap=gap, iteration=i, routing=routing,
+                executed=executed, step_n=6 + i)
+            # A human decision is the verdict of record: reflect it in ``review`` so
+            # the report / result.json carry the human-amended verdict, not the
+            # panel's superseded autonomous one.
+            if verdict != autonomous_verdict:
+                review["verdict"] = verdict
+                review["human_override"] = {"from": autonomous_verdict, "to": verdict}
+
+            if verdict != "re-route":
+                trace.step("✅", f"reviewer verdict: {verdict}")
                 break
-            if i == MAX_REROUTES:
+            # At the core cap, stop unless the budget still has room to chase the
+            # broader desired axes — the top-of-loop check then bounds those passes.
+            if i >= MAX_REROUTES and not _budget_room():
                 trace.step("🛑", f"reviewer still re-routing after {MAX_REROUTES} passes; "
                            "synthesizing with residual gaps")
                 break
-
-            # Convergence: a reroute only adds evidence if it runs a skill we have
-            # not already run. Resolve each gap to its *actual* skill (via
-            # _reroute_task, which validates the reviewer's route_to and falls back
-            # to the catalog reroute target for an invalid/missing one), then pick
-            # the first gap whose resolved skill is not yet executed. Forcing engine
-            # gaps sort first, so a required uncovered axis is always preferred. If
-            # every gap resolves to an already-run skill — a weak/absent axis that
-            # re-running cannot improve — stop and synthesize with the residual gaps
-            # rather than thrash on the same skill (the loop's old failure).
-            executed = {e.get("skill") for e in results if e.get("skill")}
-            followup = None
-            for g in review.get("gaps") or []:
-                cand = cso._reroute_task(g, routing, step_n=6 + i, executed=executed)
-                if cand.skill not in executed:
-                    gap, followup = g, cand
-                    break
             if followup is None:
-                trace.step("✅", "no actionable gap left (every gap re-runs a covered "
-                           "skill) → synthesize with residual gaps")
+                trace.step("✅", "no actionable gap left (every gap repeats a covered "
+                           "skill+question) → synthesize with residual gaps")
                 break
-            trace.step("🔁", f"reroute {i + 1}/{MAX_REROUTES} → {followup.skill} "
+            rerouted_sigs.add((followup.skill, (gap.get("missing") or "").strip()))
+            cap = MAX_REROUTES if within_core else "budget"
+            trace.step("🔁", f"reroute {i + 1}/{cap} → {followup.skill} "
                        f"({gap.get('missing', 'gap')})")
             trace.event("phase", {"id": followup.step, "role": followup.skill,
                                   "kind": "skill", "division": followup.division + " (re-route)",
@@ -408,7 +629,10 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                           missing=gap.get("missing")):
                 # pass the query as the live target so a reroute to lit-synthesizer
                 # runs a real-time Tavily search for this target, not the cached demo.
-                env = cso.execute_skill(followup, case, demo, live, target=query)
+                # On a *deeper* repeat (same skill, new question) pass the gap's
+                # ``missing`` as ``focus`` so the search chases the specific gap.
+                focus = gap.get("missing") if followup.skill in executed else None
+                env = cso.execute_skill(followup, case, demo, live, target=query, focus=focus)
                 results.append(env)
             trace.event("evidence", {**_evidence_event(env), "reroute": True})
 
@@ -418,13 +642,15 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
             if review_src != AGENT_SOURCE:
                 trace.step("✅", "reviewer (cached/stub) → one re-route, then synthesize")
                 break
+            i += 1
         loop_sp.set(verdict=review.get("verdict", "synthesize"))
     return review
 
 
 def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
         demo: bool, live: bool, argv: list[str], emit: "Emit | None" = None,
-        quiet: bool = False) -> dict[str, Any]:
+        quiet: bool = False, token_budget: int | None = DEFAULT_TOKEN_BUDGET,
+        gate: "Gate | None" = None) -> dict[str, Any]:
     """Run the live multi-agent loop.
 
     ``emit`` is an optional structured-event sink: when set (the frontend supplies
@@ -432,6 +658,11 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
     the SAME loop the CLI prints, not a re-implementation. ``quiet`` suppresses the
     console trace (the server doesn't want it). ``out_dir=None`` skips writing the
     report/result files (the streaming caller renders from the events + final dict).
+
+    ``gate`` is an optional human-in-the-loop callback: when set, the review loop
+    pauses at each pass (after the panel votes, before it acts) and applies the
+    human's decision — approve, override the verdict, redirect the re-route, or
+    inject a gap. Unset → the loop runs fully autonomously, unchanged.
     """
     case = cso.case_key(query)
     routing = cso.load_routing()
@@ -460,7 +691,8 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
     trace.event("briefing", {"briefing": briefing, "source": brief_src})
 
     # 2 — PLAN (live agent role; validated against routing.yaml, else deterministic) #
-    subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing, rec)
+    subtasks, plan_experiments, plan_src = _plan(
+        trace, runner, query, briefing, case, routing, rec)
     trace.step("🧭", f"plan → {len(subtasks)} routed sub-tasks ({plan_src})")
     trace.event("plan", {"subtasks": [t.as_plan_entry() for t in subtasks],
                          "source": plan_src})
@@ -476,7 +708,8 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
     #     The reviewer re-runs after each re-route until it returns `synthesize` or
     #     MAX_REROUTES is hit. Each re-route target is the reviewer's *chosen* skill,
     #     validated against the catalog (change #3) before execution.
-    review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec)
+    review = _review_loop(trace, runner, query, case, routing, results, demo, live, rec,
+                          token_budget=token_budget, gate=gate)
 
     # 4b — DECISION (Prometheux): derive the GO/NO-GO tier deductively from the final
     #      evidence. Authoritative for the report's Decision field; the agent narrates.
@@ -488,11 +721,14 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
                     "Write your recommendation consistent with this tier; it is the "
                     "Decision of record. If you disagree, argue it in the rationale."
                     if decision else "")
+    open_q_ctx = (f"\n\nOpen questions the planner wanted answered but no tool could "
+                  f"(fold these into proposed experiments):\n"
+                  f"{json.dumps(plan_experiments, default=str)}" if plan_experiments else "")
     syn_context = (
         f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
         f"Division scientist findings:\n{json.dumps(division_findings, default=str)}\n\n"
         f"Evidence:\n{_evidence_context(results)}\n\n"
-        f"Reviewer:\n{json.dumps(review, default=str)}{decision_ctx}"
+        f"Reviewer:\n{json.dumps(review, default=str)}{decision_ctx}{open_q_ctx}"
     )
     trace.event("phase", {"id": "synth", "role": "CSO Orchestrator", "kind": "agent",
                           "division": "Synthesis", "title": "Synthesize recommendation",
@@ -530,15 +766,23 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
         summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
                                         synthesis, runner, backend, demo, live,
                                         division_findings=division_findings,
-                                        decision_engine=decision)
+                                        decision_engine=decision,
+                                        plan_experiments=plan_experiments)
         result_path = cso._write_result_json(out_dir, summary, data)
         cso._write_reproducibility(out_dir / "reproducibility", argv,
                                    [report_path, result_path])
+        # Project the verdict into decision facts every run (same target derivation
+        # as _engine_decision), so the run's conclusion is durable as facts.
+        import re as _re
+        _m = _re.search(r"\b([A-Z][A-Z0-9]{1,6}(?:-[A-Z0-9]+)?)\b", query or "")
+        _target = _m.group(1) if _m else (query or "target")
+        _project_decision_facts(trace, decision, _target, out_dir, out_dir.name)
     else:
         summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
                                         synthesis, runner, backend, demo, live,
                                         division_findings=division_findings,
-                                        decision_engine=decision)
+                                        decision_engine=decision,
+                                        plan_experiments=plan_experiments)
 
     # Finalise the execution trace (span tree + timing + token totals).
     trace_path = rec.close(query=query, decision=summary.get("decision"),
@@ -677,7 +921,7 @@ def _evidence_event(env: dict[str, Any]) -> dict[str, Any]:
 
 def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
                     runner, backend, demo, live, division_findings=None,
-                    decision_engine=None
+                    decision_engine=None, plan_experiments=None
                     ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Mirror cso.run()'s result.json envelope, marking the live-agent loop."""
     syn = synthesis or {}
@@ -692,7 +936,11 @@ def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
         + [g.get("missing") for g in review.get("gaps", [])]
         + list(syn.get("evidence_gaps", []))
     )
-    proposed = list(syn.get("proposed_experiments", [])) + list(review.get("experiments", []))
+    # Proposed experiments = synthesis + reviewer + the planner's unbindable open
+    # questions (the agent knew what it wanted but no functional tool answered it).
+    proposed = (list(syn.get("proposed_experiments", []))
+                + list(review.get("experiments", []))
+                + list(plan_experiments or []))
     calls_llm = runner.name != "stub"
     summary = {
         "query": query, "case": case,

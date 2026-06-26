@@ -155,6 +155,27 @@ def _skill_for(routing: dict[str, Any], division: str, intent: str) -> str:
     return "unrouted-skill"
 
 
+# Skills that actually execute live today — in-repo leaf scripts (LOCAL_SKILLS) plus
+# the installed ClawBio catalog skills we've verified run (CLAWBIO_SKILL_MAP, minus
+# the ones still needing inputs/atlases we can't supply). Only these are exposed to
+# the planner and the deterministic plan, so a live run never routes to a dead skill.
+# The rest are tracked in DEFERRED_SKILLS — wire upstream/inputs, then promote here.
+FUNCTIONAL_SKILLS: set[str] = {
+    "celltype-specificity-profiler", "clinical-trial-finder", "clinpgx",
+    "crispr-screen-triage", "equity-scorer", "gwas-lookup", "lit-synthesizer",
+    "malignant-expression-profiler", "openfda-safety", "opentargets-target-factors",
+    "tcga-somatic-profiler",
+}
+# Routed-but-not-yet-runnable (no ClawBio counterpart, or needs an input we don't have
+# live: an h5ad atlas, an Ensembl id, a region window). TODO: wire these and promote
+# into FUNCTIONAL_SKILLS. Tracked in docs/deferred-skills.md.
+DEFERRED_SKILLS: set[str] = {
+    "cellxgene-fetch", "claw-ancestry-pca", "fine-mapping", "gwas-catalog-region-fetch",
+    "omics-target-evidence-mapper", "opentargets-association-evidence",
+    "pathway-enricher", "scrna-embedding", "struct-predictor", "turingdb-graph",
+}
+
+
 def decompose_and_route(query: str, case: str, routing: dict[str, Any]) -> list[Subtask]:
     """Decompose the query into subtasks and route each via routing.yaml.
 
@@ -163,14 +184,14 @@ def decompose_and_route(query: str, case: str, routing: dict[str, Any]) -> list[
     are resolved from routing.yaml so the plan stays in sync with the map.
     """
     target = "B7-H3 (CD276)" if case == "b7h3" else "the target"
+    # The cell-type-expression step (scrna-embedding) is deferred — it needs an h5ad
+    # atlas input we don't fetch live — so the deterministic plan goes straight to the
+    # cell-type-specificity profiler (functional; reads the same cell-type signal).
     spec = [
         ("step_01_gwas", "target_id_and_prioritization", "germline_genetic_support",
          f"Is there germline genetic support for {target}?", []),
-        ("step_02_celltype_expression", "target_id_and_prioritization", "cell_type_expression",
-         f"Which cell types express {target}?", []),
         ("step_03_celltype_specificity", "target_id_and_prioritization", "cell_type_specificity",
-         f"How cell-type-specific is {target} expression (tau + bimodality)?",
-         ["step_02_celltype_expression"]),
+         f"How cell-type-specific is {target} expression (tau + bimodality)?", []),
         ("step_04_offtarget_safety", "target_safety", "off_target_expression",
          f"What is the off-target / broad-tissue expression risk for {target}?",
          ["step_03_celltype_specificity"]),
@@ -189,12 +210,21 @@ class PlanValidationError(ValueError):
 
 
 def _routable_intents(routing: dict[str, Any]) -> dict[str, set[str]]:
-    """Map each division → the set of intents it can route (from routing.yaml)."""
-    return {
-        division: {intent for intent, entry in intents.items() if isinstance(entry, dict)}
-        for division, intents in routing.items()
-        if isinstance(intents, dict)
-    }
+    """Map each division → the set of intents it can route (from routing.yaml).
+
+    Only intents whose primary skill is in FUNCTIONAL_SKILLS are exposed — so the
+    planner agent's menu, and any plan validated against it, can only route to skills
+    that actually execute live. Deferred skills are simply absent from the menu.
+    """
+    out: dict[str, set[str]] = {}
+    for division, intents in routing.items():
+        if not isinstance(intents, dict):
+            continue
+        usable = {intent for intent, entry in intents.items()
+                  if isinstance(entry, dict) and entry.get("skill") in FUNCTIONAL_SKILLS}
+        if usable:
+            out[division] = usable
+    return out
 
 
 def validate_and_bind_plan(
@@ -257,6 +287,59 @@ def validate_and_bind_plan(
     return subtasks
 
 
+def bind_questions(
+    questions: list[dict[str, Any]], routing: dict[str, Any]
+) -> tuple[list[Subtask], list[dict[str, Any]]]:
+    """Bind a hybrid planner's free-form questions to functional skills.
+
+    The hybrid planner reasons up an *ideal* investigation as natural-language
+    questions, each with a best-guess (division, intent). This splits them:
+
+      * a question whose (division, intent) routes to a functional skill becomes a
+        bound :class:`Subtask` (executed this run),
+      * a question with no fitting / no functional skill becomes a **proposed
+        experiment** — the agent knew what it wanted but no tool can answer it yet.
+
+    Returns ``(subtasks, experiments)``. Unlike ``validate_and_bind_plan`` this never
+    raises on an unroutable question — it just routes it to the experiments bucket, so
+    the agent's full reasoning survives even when only part of it is executable. A
+    question that fits a real (division, intent) but a *deferred* skill still routes to
+    experiments (we only execute FUNCTIONAL_SKILLS), with a note naming the skill.
+    """
+    routable = _routable_intents(routing)            # functional intents only
+    all_intents = {                                  # every intent, for "deferred" detection
+        div: {i for i, e in ix.items() if isinstance(e, dict)}
+        for div, ix in routing.items() if isinstance(ix, dict)
+    }
+    subtasks: list[Subtask] = []
+    experiments: list[dict[str, Any]] = []
+    seen_steps: set[str] = set()
+    n = 0
+    for entry in questions or []:
+        if not isinstance(entry, dict):
+            continue
+        q = str(entry.get("question") or "investigate the target").strip()
+        division, intent = entry.get("division"), entry.get("intent")
+        bound = (division in routable and intent in routable.get(division, set()))
+        if bound:
+            n += 1
+            step = f"step_{n:02d}_{intent}"
+            deps = [d for d in (entry.get("depends_on") or []) if d in seen_steps]
+            subtasks.append(Subtask(step=step, division=division, question=q,
+                                    skill=_skill_for(routing, division, intent),
+                                    depends_on=deps))
+            seen_steps.add(step)
+        else:
+            # name the tool gap when the question fit a real intent but a deferred skill
+            note = entry.get("rationale") or ""
+            if division in all_intents and intent in all_intents.get(division, set()):
+                note = (note + " ").strip() + f"(needs {_skill_for(routing, division, intent)}, " \
+                       "not yet runnable — see docs/deferred-skills.md)"
+            experiments.append({"experiment": q, "rationale": note,
+                                "expected_readout": "would answer this open question"})
+    return subtasks, experiments
+
+
 def catalog_skills(routing: dict[str, Any]) -> set[str]:
     """Every skill name reachable in routing.yaml (primary ``skill`` + ``also`` lists).
 
@@ -276,6 +359,14 @@ def catalog_skills(routing: dict[str, Any]) -> set[str]:
 
 
 REROUTE_FALLBACK_SKILL = "lit-synthesizer"  # the routing.yaml-designated reroute target
+
+# Skills whose output is *question-sensitive*: a re-route can ask them a deeper,
+# different question (a gap's ``missing``) and genuinely get new evidence. Only the
+# free-text live search qualifies — its query is steered by ``focus`` in
+# _local_skill_args. Gene-DB skills are deterministic in the gene alone, so a
+# "different question" cannot change their result; the review loop blocks repeats of
+# those so it never thrashes re-running a lookup that can't improve.
+QUESTION_SENSITIVE_SKILLS = frozenset({"lit-synthesizer"})
 
 
 def group_by_division(subtasks: list[Subtask]) -> list[tuple[str, list[Subtask]]]:
@@ -483,29 +574,79 @@ LOCAL_SKILLS: dict[str, str] = {
     "openfda-safety": "openfda-safety/openfda_safety.py",
     "celltype-specificity-profiler": "celltype-specificity-profiler/profiler.py",
     "clinical-trial-finder": "clinical-trial-finder/clinical_trial_finder.py",
+    # These ship as runnable scripts in this repo too — route them to their own CLI
+    # (each accepts --demo, and --gene/--disease parsed from the target) rather than
+    # falling through to the external ClawBio runtime. Without these entries a live
+    # run reported them "unavailable" even though the script sits right here.
+    "opentargets-association-evidence":
+        "opentargets-association-evidence/opentargets_association_evidence.py",
+    "opentargets-target-factors":
+        "opentargets-target-factors/opentargets_target_factors.py",
+    "malignant-expression-profiler":
+        "malignant-expression-profiler/malignant_expression_profiler.py",
+    "tcga-somatic-profiler": "tcga-somatic-profiler/tcga_somatic_profiler.py",
+    "cellxgene-fetch": "cellxgene-fetch/cellxgene_fetch.py",
 }
 
 
-def _local_skill_args(skill: str, live: bool, target: str | None) -> list[str]:
+# Skills whose CLI takes a --gene symbol (and some also --disease) for a live run.
+# Given a real target we pass the parsed symbol; otherwise they fall back to --demo.
+_GENE_ARG_SKILLS = {
+    "opentargets-association-evidence": ("--gene", "--disease"),
+    "opentargets-target-factors": ("--gene",),
+    "tcga-somatic-profiler": ("--gene",),
+    "cellxgene-fetch": ("--gene", "--disease"),
+    # malignant-expression-profiler needs a single-cell --atlas it can't fetch live,
+    # so it stays on --demo (its bundled illustrative data) rather than erroring.
+}
+
+
+def _target_gene(target: str | None) -> str | None:
+    """Best-effort gene/target symbol from a free-text target ("B7-H3 in lung …")."""
+    if not target:
+        return None
+    m = re.search(r"\b([A-Z][A-Z0-9]{1,6}(?:-[A-Z0-9]+)?)\b", target)
+    return m.group(1) if m else None
+
+
+def _local_skill_args(skill: str, live: bool, target: str | None,
+                      focus: str | None = None) -> list[str]:
     """CLI args for an in-repo leaf skill.
 
     In ``--live`` we run the skill for real where it can: ``lit-synthesizer`` does a
     **live Tavily search** for ``target`` (real-time current-evidence acquisition —
-    the sponsor-tool + autonomy path) when ``TAVILY_API_KEY`` is set. Everything else,
-    and any live skill lacking its key/input, falls back to the offline ``--demo`` so
-    the run still produces honest, labelled evidence rather than failing.
+    the sponsor-tool + autonomy path) when ``TAVILY_API_KEY`` is set; the gene-based
+    skills get the parsed ``--gene`` (and ``--disease`` where they accept it). Anything
+    lacking its key/input falls back to the offline ``--demo`` so the run still produces
+    honest, labelled evidence rather than failing.
+
+    ``focus`` is an optional reviewer follow-up (a gap's ``missing``) used to steer a
+    *deeper* re-route: for the free-text search skill it is appended to the target so
+    the live search chases the specific missing evidence instead of repeating the bare
+    target query. Deterministic gene-DB skills ignore it — their output is fixed by the
+    gene, so a "different question" cannot change it (the loop blocks those repeats).
     """
     if live and skill == "lit-synthesizer" and target and os.environ.get("TAVILY_API_KEY"):
-        return ["--target", target]
+        q = f"{target} — {focus}" if focus else target
+        return ["--target", q]
     # clinical-trial-finder hits the public ClinicalTrials.gov API v2 — no key needed,
     # so a live run queries real trials (and real NCT deep links) whenever a target is set.
     if live and skill == "clinical-trial-finder" and target:
         return ["--target", target]
+    if live and skill in _GENE_ARG_SKILLS:
+        gene = _target_gene(target)
+        if gene:
+            flags = _GENE_ARG_SKILLS[skill]
+            args = ["--gene", gene]
+            if "--disease" in flags and target:
+                args += ["--disease", target]  # the skill resolves the disease phrase
+            return args
     return ["--demo"]
 
 
 def _run_local_skill(skill: str, live: bool = False,
-                     target: str | None = None) -> dict[str, Any] | None:
+                     target: str | None = None,
+                     focus: str | None = None) -> dict[str, Any] | None:
     """Run an in-repo leaf skill via its own CLI. None if unknown.
 
     Returns the skill's JSON envelope (its landscape.json/safety.json/etc.) so the
@@ -518,7 +659,7 @@ def _run_local_skill(skill: str, live: bool = False,
     import tempfile
 
     rel = LOCAL_SKILLS[skill]
-    args = _local_skill_args(skill, live, target)
+    args = _local_skill_args(skill, live, target, focus)
     script = REPO_ROOT / "skills" / rel
     if not script.exists():
         return {"status": "not executed", "reason": f"{skill}: script not found at {script}."}
@@ -533,49 +674,99 @@ def _run_local_skill(skill: str, live: bool = False,
                         "reason": f"{skill} exited {proc.returncode}: {proc.stderr.strip()[:200]}"}
             via = f"{skill} {' '.join(args)}"  # e.g. 'lit-synthesizer --target B7-H3 ...'
             # Fold the richest JSON artifact the skill wrote into the evidence row.
-            for name in ("landscape.json", "safety.json", "result.json", "profile.json"):
-                p = Path(td) / name
-                if p.exists():
+            # Prefer the known canonical names; else fall back to ANY *.json the skill
+            # emitted (skills vary: factors.json, profile.json, somatic.json, …) so a
+            # skill's data is never silently dropped to a bare stdout string.
+            known = ("landscape.json", "safety.json", "result.json", "profile.json",
+                     "factors.json", "somatic.json", "malignant_profile.json")
+            candidates = [Path(td) / n for n in known if (Path(td) / n).exists()]
+            candidates += [p for p in Path(td).glob("*.json") if p not in candidates]
+            for p in candidates:
+                try:
                     payload = json.loads(p.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
                     return {"status": "ok", "via": via, **payload}
             return {"status": "ok", "via": via, "stdout": proc.stdout.strip()[:400]}
     except Exception as exc:  # pragma: no cover - defensive
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def _run_skill_live(skill: str, target: str | None = None) -> dict[str, Any]:
+def _run_skill_live(skill: str, target: str | None = None,
+                    focus: str | None = None) -> dict[str, Any]:
     """Execute a routed skill (best-effort, no LLM).
 
     Resolution: an in-repo leaf skill via its own CLI first (LOCAL_SKILLS) — run live
-    where it can (e.g. lit-synthesizer → live Tavily for ``target``), else its offline
-    --demo — then fall back to an external clawbio.py run_skill runtime. Any failure
-    returns an honest envelope rather than a fabricated result.
+    where it can (e.g. lit-synthesizer → live Tavily for ``target``, steered by an
+    optional ``focus`` follow-up), else its offline --demo — then fall back to an
+    external clawbio.py run_skill runtime. Any failure returns an honest envelope
+    rather than a fabricated result.
     """
-    local = _run_local_skill(skill, live=True, target=target)
+    local = _run_local_skill(skill, live=True, target=target, focus=focus)
     if local is not None:
         return local
-    try:
-        import importlib.util
+    # Not an in-repo leaf skill → try the installed ClawBio catalog runtime
+    # (``pip install clawbio``). Routing uses our own skill names; map them to the
+    # ClawBio catalog's names where a counterpart exists. A skill with no ClawBio
+    # counterpart, or no installed runtime, returns a clean "unavailable" envelope —
+    # never a raw FileNotFoundError.
+    clawbio_name = CLAWBIO_SKILL_MAP.get(skill, skill)
+    return _run_clawbio_skill(skill, clawbio_name)
 
-        spec = importlib.util.spec_from_file_location("clawbio_runner", REPO_ROOT / "clawbio.py")
-        runner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(runner)  # type: ignore[union-attr]
-        result = runner.run_skill(skill_name=skill, demo=True)
-        if isinstance(result, dict) and result.get("success"):
-            return {"status": "ok", "via": "clawbio run", "files": result.get("files", [])}
+
+# Our routing skill names → the installed ClawBio catalog's names. Only entries with a
+# real counterpart in `clawbio list`; anything absent stays honestly "unavailable".
+CLAWBIO_SKILL_MAP: dict[str, str] = {
+    "gwas-lookup": "gwas",
+    "scrna-embedding": "scrna-embedding",
+    "crispr-screen-triage": "crispr-triage",
+    "equity-scorer": "equity",
+    "gwas-catalog-region-fetch": "gwas-region",
+    "pathway-enricher": "pathway-enricher",
+    "clinpgx": "clinpgx",
+}
+
+
+def _run_clawbio_skill(routing_name: str, clawbio_name: str) -> dict[str, Any]:
+    """Run a skill via the installed ``clawbio`` package (best-effort, no LLM).
+
+    Imports the package lazily (it's an optional dep — ``pip install clawbio``). A
+    skill not present in the local routing→ClawBio map, an uninstalled runtime, or a
+    skill that needs input we don't have all return an honest "unavailable" envelope.
+    """
+    if routing_name not in CLAWBIO_SKILL_MAP:
         return {"status": "not executed",
-                "reason": f"clawbio could not run {skill!r} (not registered or needs input)."}
-    except Exception as exc:  # pragma: no cover - exercised only with a live runtime
+                "reason": f"{routing_name!r} has no counterpart in the installed ClawBio "
+                          "catalog; run with cached --demo data or add it upstream."}
+    try:
+        import clawbio  # optional dependency
+    except ImportError:
+        return {"status": "not executed",
+                "reason": f"{routing_name!r} is a ClawBio catalog skill; install the "
+                          "runtime with `pip install clawbio` to execute it live."}
+    try:
+        result = clawbio.run_skill(skill_name=clawbio_name, demo=True)
+        if isinstance(result, dict) and result.get("success"):
+            return {"status": "ok", "via": f"clawbio run {clawbio_name}",
+                    "files": result.get("files", [])}
+        reason = (result or {}).get("error") if isinstance(result, dict) else None
+        return {"status": "not executed",
+                "reason": f"clawbio could not run {clawbio_name!r}"
+                          + (f": {reason}" if reason else " (needs input or not registered).")}
+    except Exception as exc:  # pragma: no cover - depends on the live runtime
         return {"status": "not executed", "reason": f"{type(exc).__name__}: {exc}"}
 
 
 def execute_skill(task: Subtask, case: str, demo: bool, live: bool,
-                  target: str | None = None) -> dict[str, Any]:
+                  target: str | None = None, focus: str | None = None) -> dict[str, Any]:
     """STEP C: produce a result envelope for a routed skill.
 
     Resolution order: cached demo fixture → live ClawBio run → honest stub.
     ``target`` (the query's "<gene> in <disease>") is passed to skills that take it
-    live — notably lit-synthesizer's real-time Tavily search. No LLM is involved.
+    live — notably lit-synthesizer's real-time Tavily search. ``focus`` is an optional
+    reviewer follow-up that steers a *deeper* re-route's live search toward the specific
+    missing evidence. No LLM is involved.
     """
     envelope = {
         "step": task.step,
@@ -594,7 +785,7 @@ def execute_skill(task: Subtask, case: str, demo: bool, live: bool,
         envelope["source"] = "unavailable"
         return envelope
     if live:
-        envelope["result"] = _run_skill_live(task.skill, target=target)
+        envelope["result"] = _run_skill_live(task.skill, target=target, focus=focus)
         envelope["source"] = "clawbio" if envelope["result"].get("status") == "ok" else "unavailable"
         return envelope
     envelope["result"] = {

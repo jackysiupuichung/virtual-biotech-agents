@@ -60,6 +60,7 @@ const emptyRun = () => ({
   panel: null,                // latest 4-lens reviewer-panel vote {lenses, reroute_votes, n_lenses}
   divisionFindings: {},       // division name -> division_finding event
   confidence: "n/a",
+  checkpoint: null,           // HITL: {run_id, iteration, verdict, panel, gaps, proposed_reroute} while awaiting a human
   error: null,
 });
 
@@ -102,6 +103,14 @@ function reduceEvent(run, ev, data) {
     case "review":
       r.review = data.review;
       r.steps = r.steps.map(s => s.id === "review" ? { ...s, status: "done", review: data.review } : s);
+      return r;
+    case "checkpoint_wait":
+      // HITL: the review loop is paused awaiting a human decision on this pass.
+      r.checkpoint = data;
+      return r;
+    case "checkpoint_resolved":
+      // the decision was delivered (by this human or by timeout) — clear the pause.
+      r.checkpoint = null;
       return r;
     case "synthesis":
       r.synthesis = data.synthesis;
@@ -979,13 +988,14 @@ function QueryScreen({onRun}) {
   const [demo, setDemo] = useState(true);
   const [agents, setAgents] = useState(false);
   const [partial, setPartial] = useState(false);
+  const [hitl, setHitl] = useState(false);
   const [budget, setBudget] = useState("thorough");
   return (
     <div className="max-w-2xl mx-auto px-4 py-20 fade-up">
       <div className="text-xs text-sky-400 mono mb-2">virtual-biotech-cso · multi-agent harness</div>
       <h1 className="text-3xl sm:text-4xl font-extrabold text-white">Ask the Virtual CSO.</h1>
       <p className="text-slate-400 mt-3">Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time.</p>
-      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents, BUDGETS.find(b=>b.key===budget).tokens);}}>
+      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents, BUDGETS.find(b=>b.key===budget).tokens, hitl);}}>
         <textarea value={q} onChange={(e)=>setQ(e.target.value)} rows={3}
           className="w-full rounded-xl bg-slate-900/70 border border-slate-700 focus:border-sky-500 outline-none p-4 text-slate-100 text-sm resize-none"
           placeholder="e.g. Assess B7-H3 potential as a therapeutic target in lung cancer"/>
@@ -1004,6 +1014,10 @@ function QueryScreen({onRun}) {
           <input type="checkbox" checked={partial} onChange={(e)=>setPartial(e.target.checked)} className="accent-fuchsia-500"/>
           ◆ skip the safety step <span className="text-slate-600">(demonstrate the Prometheux gap-detector forcing a re-route to fill the missing axis)</span>
         </label>
+        <label className="flex items-center gap-2 text-sm text-amber-300/90 cursor-pointer mt-3">
+          <input type="checkbox" checked={hitl} onChange={(e)=>setHitl(e.target.checked)} className="accent-amber-500"/>
+          🧑‍⚖️ human in the loop <span className="text-slate-600">(pause at each reviewer pass to approve, override, redirect, or add a gap — the human joins the panel)</span>
+        </label>
       </form>
       <div className="mt-8">
         <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-2">try an example</div>
@@ -1015,16 +1029,68 @@ function QueryScreen({onRun}) {
   );
 }
 
+// HITL: the reviewer-panel checkpoint. The loop is paused; the human joins the panel
+// — approve the autonomous verdict, override it, redirect the re-route, or add a gap.
+function CheckpointModal({ cp, onDecide }) {
+  const [skill, setSkill] = useState(cp.proposed_reroute?.skill || "");
+  const [missing, setMissing] = useState("");
+  const pr = cp.proposed_reroute;
+  const verdict = cp.verdict;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm fade-up">
+      <div className="max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900 p-6 shadow-2xl">
+        <div className="text-xs text-amber-300 mono mb-1">🧑‍⚖️ human in the loop · reviewer pass {(cp.iteration ?? 0) + 1}</div>
+        <h3 className="text-lg font-bold text-white">The panel voted <span className={verdict==="re-route"?"text-amber-300":"text-emerald-300"}>{verdict}</span>.</h3>
+        <p className="text-sm text-slate-400 mt-1">
+          {cp.panel ? `${cp.panel.reroute_votes}/${cp.panel.n_lenses} lenses flagged a re-route. ` : ""}
+          {pr ? <>Proposed next step: <span className="text-slate-200 mono">{pr.skill}</span>{pr.missing?` — to fill "${pr.missing}"`:""}.</> : "No follow-up proposed."}
+        </p>
+        {(cp.gaps && cp.gaps.length>0) && (
+          <ul className="mt-3 text-xs text-slate-400 list-disc pl-5 space-y-0.5">
+            {cp.gaps.slice(0,4).map((g,i)=><li key={i}><span className="text-slate-300">{g.missing}</span>{g.route_to?` → ${g.route_to}`:""}</li>)}
+          </ul>
+        )}
+        <div className="mt-5 grid grid-cols-2 gap-2">
+          <button onClick={()=>onDecide({action:"approve"})}
+            className="px-3 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-white text-sm font-semibold">✓ Approve verdict</button>
+          {verdict==="re-route"
+            ? <button onClick={()=>onDecide({action:"override_verdict",verdict:"synthesize"})}
+                className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-sm font-semibold">■ Stop &amp; synthesize</button>
+            : <button onClick={()=>onDecide({action:"override_verdict",verdict:"re-route",route_to:skill||undefined,missing:missing||"human-directed re-route"})}
+                className="px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-white text-sm font-semibold">↻ Force a re-route</button>}
+        </div>
+        <div className="mt-4 border-t border-slate-800 pt-4">
+          <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-2">…or steer the next step</div>
+          <div className="flex gap-2">
+            <input value={skill} onChange={e=>setSkill(e.target.value)} placeholder="skill (e.g. struct-predictor)"
+              className="flex-1 rounded-lg bg-slate-800 border border-slate-700 focus:border-amber-500 outline-none px-2 py-1.5 text-xs text-slate-100 mono"/>
+            <input value={missing} onChange={e=>setMissing(e.target.value)} placeholder="gap / question"
+              className="flex-1 rounded-lg bg-slate-800 border border-slate-700 focus:border-amber-500 outline-none px-2 py-1.5 text-xs text-slate-100"/>
+          </div>
+          <div className="flex gap-2 mt-2">
+            <button disabled={!skill} onClick={()=>onDecide({action:"redirect",route_to:skill,missing:missing||undefined})}
+              className="flex-1 px-3 py-1.5 rounded-lg border border-amber-500/40 text-amber-200 hover:bg-amber-500/10 disabled:opacity-40 text-xs font-semibold">→ Redirect re-route</button>
+            <button disabled={!skill&&!missing} onClick={()=>onDecide({action:"add_gap",route_to:skill||undefined,missing:missing||undefined})}
+              className="flex-1 px-3 py-1.5 rounded-lg border border-sky-500/40 text-sky-200 hover:bg-sky-500/10 disabled:opacity-40 text-xs font-semibold">+ Add gap to chase</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [run, setRun] = useState(emptyRun);
   const [tab, setTab] = useState("loop");
   const esRef = useRef(null);
+  const runRef = useRef(run);
+  runRef.current = run;
 
-  const start = useCallback((query, demo, partial, agents) => {
+  const start = useCallback((query, demo, partial, agents, budget, hitl) => {
     if (esRef.current) esRef.current.close();
-    setRun({ ...emptyRun(), status:"running", meta:{ query, partial: !!partial } });
+    setRun({ ...emptyRun(), status:"running", meta:{ query, partial: !!partial, hitl: !!hitl } });
     setTab("loop");
-    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo?1:0}&agents=${agents?1:0}${partial?"&partial=1":""}`;
+    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo?1:0}&agents=${agents?1:0}${partial?"&partial=1":""}${hitl?"&hitl=1":""}`;
     const es = new EventSource(url);
     esRef.current = es;
     const on = (name) => es.addEventListener(name, (e)=>{
@@ -1032,8 +1098,20 @@ function App() {
       setRun(prev => reduceEvent(prev, name, data));
       if (name === "done" || name === "error") es.close();
     });
-    ["start","phase","briefing","plan","evidence","node","edge","engine_gaps","panel","division_finding","review","synthesis","decision","done","error"].forEach(on);
+    ["start","phase","briefing","plan","evidence","node","edge","engine_gaps","panel","division_finding","review","checkpoint_wait","checkpoint_resolved","synthesis","decision","done","error"].forEach(on);
     es.onerror = () => { setRun(prev => prev.status==="done"?prev:reduceEvent(prev,"error",{message:"connection lost — is server.py running?"})); es.close(); };
+  }, []);
+
+  // HITL: deliver the human's decision to the paused review loop, then clear the modal
+  // optimistically (the server also emits checkpoint_resolved to confirm).
+  const decide = useCallback((decision) => {
+    const cp = runRef.current?.checkpoint;
+    if (!cp) return;
+    setRun(prev => ({ ...prev, checkpoint: null }));
+    fetch(`/api/decision?run_id=${encodeURIComponent(cp.run_id)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(decision),
+    }).catch(()=>{});
   }, []);
 
   useEffect(()=>()=>{ if(esRef.current) esRef.current.close(); }, []);
@@ -1042,7 +1120,7 @@ function App() {
   useEffect(()=>{
     const p = new URLSearchParams(window.location.search);
     const q = p.get("q");
-    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1");
+    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1", undefined, p.get("hitl") === "1");
     if (p.get("tab")) setTab(p.get("tab"));
   }, [start]);
 
@@ -1051,6 +1129,7 @@ function App() {
   const stepsDone = run.steps.filter(s=>s.status==="done").length;
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
+      {run.checkpoint && <CheckpointModal cp={run.checkpoint} onDecide={decide}/>}
       <div className="flex items-start justify-between gap-4 flex-wrap mb-6">
         <div>
           <button onClick={()=>{ if(esRef.current) esRef.current.close(); setRun(emptyRun()); }} className="text-xs text-sky-400 mono mb-1 hover:text-sky-300">← new question</button>

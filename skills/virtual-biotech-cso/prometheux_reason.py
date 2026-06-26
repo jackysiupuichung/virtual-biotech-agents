@@ -97,8 +97,13 @@ def graph_to_vada(graph: KG.KnowledgeGraph) -> str:
         conf = float(e.get("conf") or 0.0)
         if e["type"] == "EXPRESSED_IN":
             facts.append(f'expressed_in("{s}", "{t}", {conf}).')
-        elif e["type"] in ("SPECIFIC_TO", "GENETIC_LINK", "OFF_TARGET_IN", "EVALUATED_IN"):
-            axis = e.get("axis") or "evidence"
+            continue
+        # Any other edge carrying a real prioritization axis is an evidence fact on
+        # its source target — keyed on the axis, not a fixed list of edge types, so
+        # evidence on the broader axes (association/somatic/malignancy/landscape)
+        # reaches the gap-detector instead of being silently dropped.
+        axis = e.get("axis")
+        if axis and axis != "evidence":
             facts.append(f'evidence("{s}", "{axis}", {conf}).')
 
     rules = [
@@ -227,12 +232,71 @@ def _short(node_id: str) -> str:
 # bound skill. The skill names are validated against the catalog downstream by
 # cso._reroute_task, so a rename degrades to the routing.yaml fallback, never to an
 # invented route.
-REQUIRED_AXES = {
-    "safety": "openfda-safety",
-    "specificity": "celltype-specificity-profiler",
-    "genetics": "gwas-lookup",
-    "tractability": "clinical-trial-finder",
+# ----------------------------------------------------------------------------- #
+# Evidence model — hierarchical, following the Open Targets + AstraZeneca format.
+#
+# A target is evaluated on a small set of DECISION AXES (the AstraZeneca "5R"-style
+# dimensions a CSO actually decides on). Each axis is *covered* by one or more
+# DATATYPES — the granular evidence kinds Open Targets breaks an association into
+# (genetic_association, somatic_mutation, known_drug, rna_expression, …). So it's not
+# "more axes", it's more evidence *within* each axis: an axis is satisfied when any of
+# its datatypes carries graded evidence, and its score is the strongest datatype in it.
+#
+# AXIS_EVIDENCE: axis -> {datatype -> skill that produces it}. Only skills that exist
+# in routing.yaml; a datatype whose skill is deferred simply can't be filled yet (the
+# axis can still be covered by a sibling datatype that is functional).
+# ----------------------------------------------------------------------------- #
+AXIS_EVIDENCE: dict[str, dict[str, str]] = {
+    # Right target — is perturbing this target disease-relevant and causal?
+    "target_validity": {
+        "genetic_association": "gwas-lookup",
+        "somatic_mutation": "tcga-somatic-profiler",
+        "functional_genomics": "crispr-screen-triage",
+        "ot_prioritisation": "opentargets-target-factors",   # OT prioritisation factors
+    },
+    # Right tissue — is expression localised to the diseased cells, not normal tissue?
+    "specificity": {
+        "cell_type_specificity": "celltype-specificity-profiler",
+        "malignant_localization": "malignant-expression-profiler",
+    },
+    # Right safety — off-target / broad-tissue liability and real-world adverse events.
+    "safety": {
+        "adverse_events": "openfda-safety",
+        "ot_safety_liabilities": "opentargets-target-factors",  # OT safety liabilities
+    },
+    # Right modality / commercial — precedent, tractability, competitive landscape.
+    "tractability": {
+        "clinical_precedent": "clinical-trial-finder",
+        "ot_tractability": "opentargets-target-factors",     # OT tractability (modality)
+        "competitive_landscape": "lit-synthesizer",
+    },
 }
+
+# opentargets-target-factors is a MULTI-AXIS skill: one GraphQL call returns
+# prioritisation, tractability, and safety liabilities (the Open Targets structure).
+# Its evidence is expanded into one sub-row per axis at ingestion (expand_ot_evidence),
+# each carrying an explicit ``axis`` so the engine credits all three — not just one.
+OT_FACTORS_SKILL = "opentargets-target-factors"
+OT_DATATYPE_BY_AXIS = {
+    "target_validity": "ot_prioritisation",
+    "tractability": "ot_tractability",
+    "safety": "ot_safety_liabilities",
+}
+
+# Flat axis -> *primary* (first) skill, kept for the report / reroute target and for
+# backward compat with callers that index a single skill per axis.
+REQUIRED_AXES = {ax: next(iter(dts.values())) for ax, dts in AXIS_EVIDENCE.items()}
+
+# datatype -> its axis, and datatype -> skill (flattened lookups).
+DATATYPE_AXIS = {dt: ax for ax, dts in AXIS_EVIDENCE.items() for dt in dts}
+DATATYPE_SKILL = {dt: sk for dts in AXIS_EVIDENCE.values() for dt, sk in dts.items()}
+
+# Core axes are load-bearing: a missing one is a proven structural gap that *forces* a
+# re-route regardless of the LLM panel. All four decision axes are core now — each is a
+# distinct go/no-go dimension (you can't advance a target with no safety read, no
+# specificity read, no validity, or no tractability). "More within an axis" lives in
+# the datatypes, not in extra forcing axes.
+CORE_AXES = {"target_validity", "specificity", "safety", "tractability"}
 
 
 def gap_rules() -> str:
@@ -261,25 +325,98 @@ def gap_rules() -> str:
     ])
 
 
-# Keywords that mark a routed step as covering a prioritization axis. Matched
-# against the step's *skill* and *step id* together, so coverage detection is
-# robust to plan-specific step naming (``step_01_gwas`` vs ``step_01_germline...``)
-# rather than keyed on exact step ids. Each axis is filled by REQUIRED_AXES[ax].
-_AXIS_KEYWORDS = {
-    "safety": ("safety", "offtarget", "off-target", "openfda", "adverse"),
-    "specificity": ("specificity", "celltype", "cell-type", "expression", "malignant"),
-    "genetics": ("gwas", "genetic", "germline", "fine-mapping", "association"),
-    "tractability": ("trial", "clinical", "tractab"),
+# Keywords that mark a routed step as covering a *datatype* (the granular evidence
+# kind within an axis). Matched against the step's skill + step id together, so
+# coverage is robust to plan-specific naming. The skill name is the strong signal
+# (each datatype has a canonical skill); keywords catch alternative step labels.
+_DATATYPE_KEYWORDS = {
+    # target_validity
+    "genetic_association": ("gwas", "germline", "genetic", "fine-mapping", "association"),
+    "somatic_mutation": ("somatic", "tcga", "mutation", "driver", "gdc"),
+    "functional_genomics": ("crispr", "screen", "functional", "dependency", "depmap"),
+    # specificity
+    "cell_type_specificity": ("specificity", "celltype", "cell-type", "tau", "bimodal"),
+    "malignant_localization": ("malignant", "malignancy", "tumour", "tumor"),
+    # safety
+    "adverse_events": ("safety", "offtarget", "off-target", "openfda", "adverse", "faers"),
+    # tractability
+    "clinical_precedent": ("trial", "clinical", "nct"),
+    "target_factors": ("tractab", "target-factor", "target_factor", "opentargets-target"),
+    "competitive_landscape": ("literature", "lit-synth", "competitive", "landscape", "recent"),
 }
 
 
-def _covered_axis(skill: str, step: str) -> str | None:
-    """Which required axis (if any) a routed step covers, by skill/step keywords."""
+def _covered_datatype(skill: str, step: str) -> str | None:
+    """Which datatype (if any) a routed step covers — skill name first, then keywords."""
+    # Strong signal: the step's skill is the canonical producer of a datatype.
+    for dt, sk in DATATYPE_SKILL.items():
+        if sk and sk in (skill or ""):
+            return dt
     hay = f"{skill} {step}".lower()
-    for axis, words in _AXIS_KEYWORDS.items():
+    for dt, words in _DATATYPE_KEYWORDS.items():
         if any(w in hay for w in words):
-            return axis
+            return dt
     return None
+
+
+def _covered_axis(skill: str, step: str) -> str | None:
+    """Which decision axis (if any) a routed step covers, via its datatype."""
+    dt = _covered_datatype(skill, step)
+    return DATATYPE_AXIS.get(dt) if dt else None
+
+
+def _ot_axis_grade(result: dict[str, Any]) -> dict[str, str]:
+    """Grade each axis the opentargets-target-factors result informs.
+
+    One efficient Open Targets GraphQL call returns prioritisation + tractability +
+    safetyLiabilities for the target; this credits all three axes from that single
+    payload (no extra API calls):
+
+      * target_validity ← prioritisation factors (more factors → stronger)
+      * tractability    ← positive tractability modality flags
+      * safety          ← safety liabilities. NOTE the inversion: liabilities are a
+        *risk* signal, so MANY liabilities = a weak/absent safety read, while a clean
+        OT profile (zero liabilities) is only ``suggestive`` evidence of safety on its
+        own (openfda-safety / off-target expression carry the real safety read).
+
+    Grades use the standard vocabulary so GRADE_WEIGHT applies unchanged. Absent
+    sub-data on an axis yields ``absent`` (that axis simply isn't credited by OT)."""
+    prio = result.get("prioritisation_factors") or []
+    tract = [t for t in (result.get("tractability_positive") or []) if t.get("value", True)]
+    liab = result.get("safety_liabilities") or []
+    return {
+        "target_validity": "supporting" if len(prio) >= 5 else (
+            "suggestive" if prio else "absent"),
+        "tractability": "supporting" if len(tract) >= 2 else (
+            "suggestive" if tract else "absent"),
+        # Safety from OT is informative either way: flagged liabilities ARE a (cautionary)
+        # read, and a clean profile alongside prioritisation data is a mild positive one.
+        # Both count as 'suggestive' — real safety weight still comes from openfda-safety.
+        # Only a target OT knows nothing about (no prioritisation, no liabilities) is absent.
+        "safety": "suggestive" if (liab or prio) else "absent",
+    }
+
+
+def expand_evidence(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand multi-axis skill results into one axis-tagged row per axis.
+
+    Today only opentargets-target-factors is multi-axis: its single row is replaced
+    by up to three rows, each carrying an explicit ``axis`` + ``grade`` so the gap
+    detector and decision credit all three axes Open Targets actually covers. Every
+    other row passes through unchanged. Pure/in-memory — no extra API calls."""
+    out: list[dict[str, Any]] = []
+    for e in results:
+        if OT_FACTORS_SKILL in (e.get("skill") or "") and isinstance(e.get("result"), dict):
+            grades = _ot_axis_grade(e["result"])
+            for axis, dt in OT_DATATYPE_BY_AXIS.items():
+                g = grades.get(axis, "absent")
+                if g == "absent":
+                    continue  # OT didn't inform this axis → don't fabricate coverage
+                out.append({**e, "axis": axis, "datatype": dt, "grade": g,
+                            "step": f"{e.get('step', 'ot')}::{dt}"})
+        else:
+            out.append(e)
+    return out
 
 
 def gaps_from_evidence(results: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
@@ -301,41 +438,80 @@ def gaps_from_evidence(results: list[dict[str, Any]], target: str) -> list[dict[
       returned nothing would loop without adding evidence. The bounded reviewer
       loop and ``absent``-handling already cover this case.
     """
-    attempted: set[str] = set()   # an axis some step targeted (any grade)
-    with_data: set[str] = set()   # an axis with a non-absent result
+    # Coverage is tracked at the DATATYPE grain, then rolled up to the AXIS — an axis
+    # is "attempted/with_data" if ANY of its datatypes is. This is the Open Targets
+    # rollup: many datatypes feed one axis score. Multi-axis skills (OT target-factors)
+    # are first expanded into one axis-tagged row each.
+    results = expand_evidence(results)
+    dt_attempted: set[str] = set()     # a datatype some step targeted (any grade)
+    dt_with_data: set[str] = set()     # a datatype with a non-absent result
     for e in results:
-        axis = _covered_axis(e.get("skill", ""), e.get("step", ""))
-        if not axis:
+        # expanded rows carry an explicit datatype; everything else is keyword-detected
+        dt = e.get("datatype") or _covered_datatype(e.get("skill", ""), e.get("step", ""))
+        if not dt or dt not in DATATYPE_AXIS:
             continue
-        attempted.add(axis)
+        dt_attempted.add(dt)
         if e.get("grade") and e.get("grade") != "absent":
-            with_data.add(axis)
+            dt_with_data.add(dt)
+
+    ax_attempted = {DATATYPE_AXIS[dt] for dt in dt_attempted}
+    ax_with_data = {DATATYPE_AXIS[dt] for dt in dt_with_data}
 
     tgt = _short(target)
     gaps: list[dict[str, Any]] = []
     for ax, skill in REQUIRED_AXES.items():
-        if ax not in attempted:
+        if ax not in ax_attempted:
             gaps.append({
                 "missing": f"no {ax} evidence for {tgt}",
                 "route_to": skill,
                 "why": f"required axis '{ax}' was never assessed by any routed step",
                 "lenses": ["prometheux"],
-                "forces_reroute": True,
+                "forces_reroute": ax in CORE_AXES,
                 "fact": f"missing_axis({tgt}, {ax})",
                 "explanation": f"{tgt} carries no evidence on the required {ax} axis "
                                f"(no step targeted it)",
             })
-        elif ax not in with_data:
+        elif ax not in ax_with_data:
             gaps.append({
                 "missing": f"{ax} evidence for {tgt} returned empty",
                 "route_to": skill,
-                "why": f"the step on axis '{ax}' returned no data (grade: absent)",
+                "why": f"every datatype on axis '{ax}' returned no data (grade: absent)",
                 "lenses": ["prometheux"],
                 "forces_reroute": False,
                 "fact": f"weak_axis({tgt}, {ax})",
                 "explanation": f"{tgt}'s {ax} axis was assessed but returned no data",
             })
+    # Datatype-enrichment gaps (the "more within an axis" signal): an axis IS covered,
+    # but a sibling datatype with a functional skill was never run. Soft — never forces
+    # a re-route (the axis is already satisfied) — but reported so a thorough run fills
+    # the fuller Open-Targets-style breakdown. Skipped for deferred skills (no runtime).
+    functional = _functional_skills()
+    for dt, sk in DATATYPE_SKILL.items():
+        ax = DATATYPE_AXIS[dt]
+        if ax in ax_with_data and dt not in dt_attempted and sk in functional:
+            gaps.append({
+                "missing": f"{dt} evidence for {tgt} (enriches the {ax} axis)",
+                "route_to": sk,
+                "why": f"axis '{ax}' is covered but the '{dt}' datatype was not assessed",
+                "lenses": ["prometheux"],
+                "forces_reroute": False,
+                "fact": f"missing_datatype({tgt}, {ax}, {dt})",
+                "explanation": f"{tgt}'s {ax} axis has evidence, but the {dt} datatype "
+                               "(an Open-Targets-style sub-evidence) was not assessed",
+            })
     return gaps
+
+
+def _functional_skills() -> set[str]:
+    """The skills that actually execute (from cso.FUNCTIONAL_SKILLS), guarded.
+
+    Imported lazily so prometheux_reason stays importable standalone (tests, --vada).
+    Falls back to every skill named in AXIS_EVIDENCE if cso isn't importable."""
+    try:
+        import cso
+        return set(cso.FUNCTIONAL_SKILLS)
+    except Exception:  # noqa: BLE001
+        return set(DATATYPE_SKILL.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +573,9 @@ def decide_from_evidence(results: list[dict[str, Any]], target: str) -> dict[str
     set, so the decision always renders.
     """
     tgt = _short(target)
+    # Expand multi-axis skills (OT target-factors) into axis-tagged rows first, so OT's
+    # single GraphQL payload credits validity + tractability + safety, not just one.
+    results = expand_evidence(results)
     # best graded evidence per required axis (max weight wins)
     axes: dict[str, dict[str, Any]] = {
         ax: {"grade": "absent", "weight": 0.0} for ax in REQUIRED_AXES}
@@ -488,7 +667,7 @@ def derive_gaps(graph: KG.KnowledgeGraph) -> list[dict[str, Any]]:
                     "route_to": skill,
                     "why": f"required axis '{ax}' has no evidence on the graph",
                     "lenses": ["prometheux"],
-                    "forces_reroute": True,
+                    "forces_reroute": ax in CORE_AXES,
                     "fact": f"missing_axis({t}, {ax})",
                     "explanation": f"{_short(t)} carries no evidence on the required {ax} axis",
                 })
