@@ -162,8 +162,60 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
     return deltas
 
 
+# --- human-in-the-loop registry -------------------------------------------- #
+# When a run enables HITL, its review-loop gate blocks on a per-run decision queue
+# while the browser shows the checkpoint. The browser POSTs the human's choice to
+# /api/decision?run_id=…, which drops it on the queue and unblocks the loop.
+import queue as _queue
+import threading as _threading
+
+_HITL_LOCK = _threading.Lock()
+_HITL_QUEUES: "dict[str, _queue.Queue[dict]]" = {}
+# How long the gate waits for a human before proceeding with the panel's autonomous
+# verdict — so a closed tab or a distracted operator never wedges the loop forever.
+HITL_TIMEOUT_S = 180.0
+
+
+def _hitl_gate(run_id: str, emit):
+    """Build a gate callback for ``harness.run`` that pauses for a human.
+
+    Returns ``None`` when HITL is off (the loop stays fully autonomous). Otherwise
+    returns a callback that, at each review checkpoint, registers a fresh decision
+    queue, emits a ``checkpoint_wait`` event the UI renders as a pause, and blocks
+    until the browser POSTs a decision (or the timeout elapses → auto-approve)."""
+    def gate(checkpoint: dict) -> dict:
+        q: "_queue.Queue[dict]" = _queue.Queue(maxsize=1)
+        with _HITL_LOCK:
+            _HITL_QUEUES[run_id] = q
+        emit("checkpoint_wait", {"run_id": run_id, **checkpoint})
+        try:
+            decision = q.get(timeout=HITL_TIMEOUT_S)
+        except _queue.Empty:
+            decision = {"action": "approve", "timed_out": True}
+        finally:
+            with _HITL_LOCK:
+                _HITL_QUEUES.pop(run_id, None)
+        emit("checkpoint_resolved", {"run_id": run_id, "decision": decision})
+        return decision
+    return gate
+
+
+def submit_decision(run_id: str, decision: dict) -> bool:
+    """Deliver a human decision to a waiting gate. True if a gate was waiting."""
+    with _HITL_LOCK:
+        q = _HITL_QUEUES.get(run_id)
+    if q is None:
+        return False
+    try:
+        q.put_nowait(decision)
+        return True
+    except _queue.Full:
+        return False
+
+
 def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
-             backend: str | None = None, token_budget: int | None = None):
+             backend: str | None = None, token_budget: int | None = None,
+             hitl: bool = False):
     """Generator yielding (event_name, payload) for each phase of the loop.
 
     This drives the REAL multi-agent loop — ``harness.run()`` — and bridges its
@@ -196,11 +248,13 @@ def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
     def emit(event: str, payload: dict) -> None:
         q.put((event, payload))
 
+    gate = _hitl_gate(run_id, emit) if hitl else None
+
     def worker() -> None:
         try:
             box["result"] = harness.run(
                 query, None, backend=backend, model=CONFIG["model"],
-                demo=demo, live=live, argv=[], emit=emit, quiet=True,
+                demo=demo, live=live, argv=[], emit=emit, quiet=True, gate=gate,
                 **({"token_budget": token_budget} if token_budget is not None
                    else {}))
         except Exception as exc:  # surface to the stream, then end it
@@ -338,13 +392,70 @@ class Handler(BaseHTTPRequestHandler):
             return self._ledger()
         if parsed.path == "/api/ranking":
             return self._json(_prometheux_ranking())
+        if parsed.path == "/api/report":
+            return self._paid_report()
         return self._static(parsed.path)
 
-    def _json(self, payload: dict):
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/decision":
+            return self._decision(parse_qs(parsed.query))
+        self.send_response(404)
+        self.end_headers()
+
+    # --- human-in-the-loop decision delivery ----------------------------- #
+    def _decision(self, qs):
+        run_id = qs.get("run_id", [""])[0]
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            decision = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            decision = {}
+        delivered = submit_decision(run_id, decision)
+        self._json({"delivered": delivered, "run_id": run_id})
+
+    def _json(self, payload: dict, status: int = 200, headers: dict | None = None):
         body = json.dumps(payload, default=str).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # --- paid artifact: x402-gated cited report -------------------------- #
+    def _paid_report(self):
+        """Serve cited.md only after x402 payment; otherwise reply HTTP 402.
+
+        First request (no X-PAYMENT header) -> 402 with the x402 ``accepts`` block
+        plus MPP / CDP / agentic.market listing pointers (read from
+        ``cited.payment.json``). A retry carrying a valid X-PAYMENT header gets the
+        full markdown and an ``X-PAYMENT-RESPONSE`` settlement receipt. Pricing and
+        pay-to are single-sourced with ``publish_cited.py`` via the manifest.
+        """
+        try:
+            import x402  # noqa: E402  (sibling module)
+        except Exception as exc:  # noqa: BLE001 — gate unavailable
+            return self._json({"error": f"payment gate unavailable: {exc}"}, status=503)
+
+        cited = HERE.parent / "cited.md"
+        if not cited.is_file():
+            return self._json(
+                {"error": "cited.md not published; run python3 publish_cited.py"},
+                status=404)
+
+        ok, receipt = x402.verify_payment(self.headers.get("X-PAYMENT"))
+        if not ok:
+            return self._json(x402.payment_required_body({"detail": receipt}),
+                              status=402, headers={"Accept-Payment": "x402"})
+
+        body = cited.read_text(encoding="utf-8").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-PAYMENT-RESPONSE", json.dumps(receipt, default=str))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -395,6 +506,10 @@ class Handler(BaseHTTPRequestHandler):
                 token_budget = max(0, int(raw_budget))
             except (TypeError, ValueError):
                 token_budget = None
+        # Human-in-the-loop: when set, the reviewer panel pauses at each pass for a
+        # human decision (approve / override / redirect / add-gap) posted to
+        # /api/decision. Default off → the loop runs fully autonomously.
+        hitl = qs.get("hitl", ["0"])[0] in ("1", "true")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -403,7 +518,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             for event, data in run_loop(query, demo=demo, live=live, partial=partial,
-                                        backend=backend, token_budget=token_budget):
+                                        backend=backend, token_budget=token_budget,
+                                        hitl=hitl):
                 self.wfile.write(_sse(event, data))
                 self.wfile.flush()
         except BrokenPipeError:

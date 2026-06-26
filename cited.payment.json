@@ -1,0 +1,73 @@
+{
+  "asset": "cited.md",
+  "title": "Target Assessment \u2014 B7H3 \u00b7 B7-H3 (CD276) ADC in lung cancer",
+  "decision": "CONDITIONAL_GO",
+  "description": "Full Virtual-Biotech CSO target-assessment report with cited evidence.",
+  "price": {
+    "amount": "0.50",
+    "currency": "USDC",
+    "network": "base"
+  },
+  "rails": {
+    "x402": {
+      "version": 1,
+      "scheme": "exact",
+      "network": "base",
+      "maxAmountRequired": "0.50",
+      "asset": "USDC",
+      "payTo": "0x000000000000000000000000000000000000dEaD",
+      "resource": "/api/report",
+      "description": "Pay-per-fetch for the full cited report."
+    },
+    "mpp": {
+      "listing": "vbcso/cited-report",
+      "payTo": "0x000000000000000000000000000000000000dEaD",
+      "price": "0.50",
+      "currency": "USDC"
+    },
+    "cdp": {
+      "network": "base",
+      "receiver": "0x000000000000000000000000000000000000dEaD",
+      "token": "USDC"
+    },
+    "agentic_market": {
+      "listing_url": "https://agentic.market/listings/vbcso-cited-report",
+      "seller": "virtual-biotech-cso",
+      "price": "0.50",
+      "currency": "USDC"
+    }
+  },
+  "citations": [
+    {
+      "n": 1,
+      "skill": "gwas-lookup",
+      "url": "https://www.ebi.ac.uk/gwas/"
+    },
+    {
+      "n": 2,
+      "skill": "scrna-embedding",
+      "url": "https://cellxgene.cziscience.com/"
+    },
+    {
+      "n": 3,
+      "skill": "celltype-specificity-profiler",
+      "url": "https://cellxgene.cziscience.com/"
+    },
+    {
+      "n": 4,
+      "skill": "celltype-specificity-profiler",
+      "url": "https://cellxgene.cziscience.com/"
+    },
+    {
+      "n": 5,
+      "skill": "clinical-trial-finder",
+      "url": "https://clinicaltrials.gov/study/NCT04145622"
+    },
+    {
+      "n": 6,
+      "skill": "scrna-orchestrator",
+      "url": "https://cellxgene.cziscience.com/"
+    }
+  ],
+  "source_report": "skills/virtual-biotech-cso/output/report.md"
+}

@@ -105,6 +105,8 @@ const emptyRun = () => ({
   divisionFindings: {},
   // division name -> division_finding event
   confidence: "n/a",
+  checkpoint: null,
+  // HITL: {run_id, iteration, verdict, panel, gaps, proposed_reroute} while awaiting a human
   error: null
 });
 function reduceEvent(run, ev, data) {
@@ -179,6 +181,14 @@ function reduceEvent(run, ev, data) {
         status: "done",
         review: data.review
       } : s);
+      return r;
+    case "checkpoint_wait":
+      // HITL: the review loop is paused awaiting a human decision on this pass.
+      r.checkpoint = data;
+      return r;
+    case "checkpoint_resolved":
+      // the decision was delivered (by this human or by timeout) — clear the pause.
+      r.checkpoint = null;
       return r;
     case "synthesis":
       r.synthesis = data.synthesis;
@@ -1041,7 +1051,7 @@ function LoopGraph({
     rerouted
   } = useMemo(() => flowFromRun(run), [run]);
   const W = 1180,
-    H = 400;
+    H = 360;
   // column x-anchors across the canvas
   const X = {
     input: 30,
@@ -1074,8 +1084,6 @@ function LoopGraph({
   const csoY = H / 2 - 32,
     csoH = 64,
     csoW = 96;
-  const briefY = 14,
-    briefH = 36; // Chief-of-Staff node, anchored at the top with a return loop to CSO
   const revStep = cols.review[cols.review.length - 1];
   const synthStep = cols.synth[cols.synth.length - 1];
   const briefStep = cols.brief[0],
@@ -1142,11 +1150,11 @@ function LoopGraph({
     },
     label: "CSO",
     sub: "route"
-  }), flow(`M${X.cso + csoW} ${H / 2 - 14} C${X.brief - 40} ${H / 2 - 14} ${X.brief - 40} ${briefY + briefH / 2} ${X.brief - 4} ${briefY + briefH / 2}`, "cso-brief"), flow(`M${X.brief - 8} ${briefY + briefH / 2 + 10} C${X.cso + csoW + 30} ${briefY + briefH / 2 + 10} ${X.cso + csoW + 30} ${H / 2 - 24} ${X.cso + csoW + 4} ${H / 2 - 24}`, "brief-cso", GSTATE.reroute.stroke, "5 4"), /*#__PURE__*/React.createElement(FlowNode, {
+  }), flow(`M${X.cso + csoW} ${H / 2 - 14} C${X.brief - 40} ${H / 2 - 14} ${X.brief - 40} ${divY(0) - 60} ${X.brief - 4} ${divY(0) - 60}`, "cso-brief"), /*#__PURE__*/React.createElement(FlowNode, {
     x: X.brief,
-    y: briefY,
+    y: divY(0) - 78,
     w: 170,
-    h: briefH,
+    h: 36,
     step: briefStep,
     label: "Chief of Staff",
     sub: "brief · decompose",
@@ -1204,15 +1212,15 @@ function LoopGraph({
     label: (run.decision || "PENDING").replace("_", " ").split(" ")[0] || "PENDING",
     sub: run.decision === "PENDING" ? "awaiting" : "verdict"
   }), rerouted && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("path", {
-    d: `M${X.review + 60} ${H / 2 + 30} C${X.review + 60} ${H - 12} ${X.review + 40} ${H - 12} ${X.review} ${H - 12} H${X.cso + csoW / 2 + 22} C${X.cso + csoW / 2} ${H - 12} ${X.cso + csoW / 2} ${H - 12} ${X.cso + csoW / 2} ${csoY + csoH + 2}`,
+    d: `M${X.review} ${H / 2 + 30} C${X.review} ${H - 24} ${X.div} ${H - 24} ${X.cso + csoW / 2} ${H - 24} L${X.cso + csoW / 2} ${csoY + csoH + 2}`,
     fill: "none",
     stroke: GSTATE.reroute.stroke,
     strokeWidth: "1.7",
     strokeDasharray: "6 5",
     markerEnd: "url(#flowArrLoop)"
   }), /*#__PURE__*/React.createElement("rect", {
-    x: (X.cso + X.review) / 2 - 110,
-    y: H - 41,
+    x: X.div - 10,
+    y: H - 36,
     width: "240",
     height: "22",
     rx: "11",
@@ -1220,8 +1228,8 @@ function LoopGraph({
     stroke: GSTATE.reroute.stroke,
     strokeOpacity: "0.35"
   }), /*#__PURE__*/React.createElement("text", {
-    x: (X.cso + X.review) / 2 + 10,
-    y: H - 26,
+    x: X.div + 110,
+    y: H - 21,
     textAnchor: "middle",
     fontSize: "10",
     fontFamily: "'JetBrains Mono',monospace",
@@ -1576,6 +1584,26 @@ function Report({
 // ======================================================================================
 //  Query screen + run shell
 // ======================================================================================
+// Reasoning-budget presets for the review→reroute loop. Higher budget lets the loop
+// chase more of the broader "desired" evidence axes (somatic / malignancy / landscape)
+// before converging; lower keeps it on the core four. Token spend is the bound — the
+// same meter Langfuse traces. Mirrors a "thinking effort" selector.
+const BUDGETS = [{
+  key: "focused",
+  label: "Focused",
+  tokens: 0,
+  hint: "core axes only — fastest"
+}, {
+  key: "balanced",
+  label: "Balanced",
+  tokens: 30000,
+  hint: "core + a couple broader axes"
+}, {
+  key: "thorough",
+  label: "Thorough",
+  tokens: 60000,
+  hint: "chase all broader axes (default)"
+}];
 function QueryScreen({
   onRun
 }) {
@@ -1583,6 +1611,8 @@ function QueryScreen({
   const [demo, setDemo] = useState(true);
   const [agents, setAgents] = useState(false);
   const [partial, setPartial] = useState(false);
+  const [hitl, setHitl] = useState(false);
+  const [budget, setBudget] = useState("thorough");
   return /*#__PURE__*/React.createElement("div", {
     className: "max-w-2xl mx-auto px-4 py-20 fade-up"
   }, /*#__PURE__*/React.createElement("div", {
@@ -1595,7 +1625,7 @@ function QueryScreen({
     className: "mt-8",
     onSubmit: e => {
       e.preventDefault();
-      if (q.trim()) onRun(q.trim(), demo, partial, agents);
+      if (q.trim()) onRun(q.trim(), demo, partial, agents, BUDGETS.find(b => b.key === budget).tokens, hitl);
     }
   }, /*#__PURE__*/React.createElement("textarea", {
     value: q,
@@ -1635,7 +1665,16 @@ function QueryScreen({
     className: "accent-fuchsia-500"
   }), "◆ skip the safety step ", /*#__PURE__*/React.createElement("span", {
     className: "text-slate-600"
-  }, "(demonstrate the Prometheux gap-detector forcing a re-route to fill the missing axis)"))), /*#__PURE__*/React.createElement("div", {
+  }, "(demonstrate the Prometheux gap-detector forcing a re-route to fill the missing axis)")), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-2 text-sm text-amber-300/90 cursor-pointer mt-3"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: hitl,
+    onChange: e => setHitl(e.target.checked),
+    className: "accent-amber-500"
+  }), "🧑‍⚖️ human in the loop ", /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-600"
+  }, "(pause at each reviewer pass to approve, override, redirect, or add a gap — the human joins the panel)"))), /*#__PURE__*/React.createElement("div", {
     className: "mt-8"
   }, /*#__PURE__*/React.createElement("div", {
     className: "text-[11px] uppercase tracking-wide text-slate-500 mb-2"
@@ -1647,22 +1686,113 @@ function QueryScreen({
     className: "text-left text-sm text-slate-300 rounded-lg border border-slate-800 hover:border-slate-600 bg-slate-900/40 px-3 py-2"
   }, ex)))));
 }
+
+// HITL: the reviewer-panel checkpoint. The loop is paused; the human joins the panel
+// — approve the autonomous verdict, override it, redirect the re-route, or add a gap.
+function CheckpointModal({
+  cp,
+  onDecide
+}) {
+  const [skill, setSkill] = useState(cp.proposed_reroute?.skill || "");
+  const [missing, setMissing] = useState("");
+  const pr = cp.proposed_reroute;
+  const verdict = cp.verdict;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm fade-up"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "max-w-lg w-full mx-4 rounded-2xl border border-amber-500/40 bg-slate-900 p-6 shadow-2xl"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-xs text-amber-300 mono mb-1"
+  }, "🧑‍⚖️ human in the loop · reviewer pass ", (cp.iteration ?? 0) + 1), /*#__PURE__*/React.createElement("h3", {
+    className: "text-lg font-bold text-white"
+  }, "The panel voted ", /*#__PURE__*/React.createElement("span", {
+    className: verdict === "re-route" ? "text-amber-300" : "text-emerald-300"
+  }, verdict), "."), /*#__PURE__*/React.createElement("p", {
+    className: "text-sm text-slate-400 mt-1"
+  }, cp.panel ? `${cp.panel.reroute_votes}/${cp.panel.n_lenses} lenses flagged a re-route. ` : "", pr ? /*#__PURE__*/React.createElement(React.Fragment, null, "Proposed next step: ", /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-200 mono"
+  }, pr.skill), pr.missing ? ` — to fill "${pr.missing}"` : "", ".") : "No follow-up proposed."), cp.gaps && cp.gaps.length > 0 && /*#__PURE__*/React.createElement("ul", {
+    className: "mt-3 text-xs text-slate-400 list-disc pl-5 space-y-0.5"
+  }, cp.gaps.slice(0, 4).map((g, i) => /*#__PURE__*/React.createElement("li", {
+    key: i
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-300"
+  }, g.missing), g.route_to ? ` → ${g.route_to}` : ""))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-5 grid grid-cols-2 gap-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => onDecide({
+      action: "approve"
+    }),
+    className: "px-3 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-white text-sm font-semibold"
+  }, "✓ Approve verdict"), verdict === "re-route" ? /*#__PURE__*/React.createElement("button", {
+    onClick: () => onDecide({
+      action: "override_verdict",
+      verdict: "synthesize"
+    }),
+    className: "px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-sm font-semibold"
+  }, "■ Stop & synthesize") : /*#__PURE__*/React.createElement("button", {
+    onClick: () => onDecide({
+      action: "override_verdict",
+      verdict: "re-route",
+      route_to: skill || undefined,
+      missing: missing || "human-directed re-route"
+    }),
+    className: "px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-white text-sm font-semibold"
+  }, "↻ Force a re-route")), /*#__PURE__*/React.createElement("div", {
+    className: "mt-4 border-t border-slate-800 pt-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-[11px] uppercase tracking-wide text-slate-500 mb-2"
+  }, "…or steer the next step"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2"
+  }, /*#__PURE__*/React.createElement("input", {
+    value: skill,
+    onChange: e => setSkill(e.target.value),
+    placeholder: "skill (e.g. struct-predictor)",
+    className: "flex-1 rounded-lg bg-slate-800 border border-slate-700 focus:border-amber-500 outline-none px-2 py-1.5 text-xs text-slate-100 mono"
+  }), /*#__PURE__*/React.createElement("input", {
+    value: missing,
+    onChange: e => setMissing(e.target.value),
+    placeholder: "gap / question",
+    className: "flex-1 rounded-lg bg-slate-800 border border-slate-700 focus:border-amber-500 outline-none px-2 py-1.5 text-xs text-slate-100"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 mt-2"
+  }, /*#__PURE__*/React.createElement("button", {
+    disabled: !skill,
+    onClick: () => onDecide({
+      action: "redirect",
+      route_to: skill,
+      missing: missing || undefined
+    }),
+    className: "flex-1 px-3 py-1.5 rounded-lg border border-amber-500/40 text-amber-200 hover:bg-amber-500/10 disabled:opacity-40 text-xs font-semibold"
+  }, "→ Redirect re-route"), /*#__PURE__*/React.createElement("button", {
+    disabled: !skill && !missing,
+    onClick: () => onDecide({
+      action: "add_gap",
+      route_to: skill || undefined,
+      missing: missing || undefined
+    }),
+    className: "flex-1 px-3 py-1.5 rounded-lg border border-sky-500/40 text-sky-200 hover:bg-sky-500/10 disabled:opacity-40 text-xs font-semibold"
+  }, "+ Add gap to chase")))));
+}
 function App() {
   const [run, setRun] = useState(emptyRun);
   const [tab, setTab] = useState("loop");
   const esRef = useRef(null);
-  const start = useCallback((query, demo, partial, agents) => {
+  const runRef = useRef(run);
+  runRef.current = run;
+  const start = useCallback((query, demo, partial, agents, budget, hitl) => {
     if (esRef.current) esRef.current.close();
     setRun({
       ...emptyRun(),
       status: "running",
       meta: {
         query,
-        partial: !!partial
+        partial: !!partial,
+        hitl: !!hitl
       }
     });
     setTab("loop");
-    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}&agents=${agents ? 1 : 0}${partial ? "&partial=1" : ""}`;
+    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}&agents=${agents ? 1 : 0}${partial ? "&partial=1" : ""}${hitl ? "&hitl=1" : ""}`;
     const es = new EventSource(url);
     esRef.current = es;
     const on = name => es.addEventListener(name, e => {
@@ -1670,13 +1800,31 @@ function App() {
       setRun(prev => reduceEvent(prev, name, data));
       if (name === "done" || name === "error") es.close();
     });
-    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "engine_gaps", "panel", "division_finding", "review", "synthesis", "decision", "done", "error"].forEach(on);
+    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "engine_gaps", "panel", "division_finding", "review", "checkpoint_wait", "checkpoint_resolved", "synthesis", "decision", "done", "error"].forEach(on);
     es.onerror = () => {
       setRun(prev => prev.status === "done" ? prev : reduceEvent(prev, "error", {
         message: "connection lost — is server.py running?"
       }));
       es.close();
     };
+  }, []);
+
+  // HITL: deliver the human's decision to the paused review loop, then clear the modal
+  // optimistically (the server also emits checkpoint_resolved to confirm).
+  const decide = useCallback(decision => {
+    const cp = runRef.current?.checkpoint;
+    if (!cp) return;
+    setRun(prev => ({
+      ...prev,
+      checkpoint: null
+    }));
+    fetch(`/api/decision?run_id=${encodeURIComponent(cp.run_id)}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(decision)
+    }).catch(() => {});
   }, []);
   useEffect(() => () => {
     if (esRef.current) esRef.current.close();
@@ -1686,7 +1834,7 @@ function App() {
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
     const q = p.get("q");
-    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1");
+    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1", undefined, p.get("hitl") === "1");
     if (p.get("tab")) setTab(p.get("tab"));
   }, [start]);
   if (run.status === "idle") return /*#__PURE__*/React.createElement(QueryScreen, {
@@ -1695,7 +1843,10 @@ function App() {
   const stepsDone = run.steps.filter(s => s.status === "done").length;
   return /*#__PURE__*/React.createElement("div", {
     className: "max-w-5xl mx-auto px-4 sm:px-6 py-8"
-  }, /*#__PURE__*/React.createElement("div", {
+  }, run.checkpoint && /*#__PURE__*/React.createElement(CheckpointModal, {
+    cp: run.checkpoint,
+    onDecide: decide
+  }), /*#__PURE__*/React.createElement("div", {
     className: "flex items-start justify-between gap-4 flex-wrap mb-6"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("button", {
     onClick: () => {
