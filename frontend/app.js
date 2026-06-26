@@ -88,6 +88,18 @@ const emptyRun = () => ({
   synthesis: null,
   report_md: null,
   decision: "PENDING",
+  decisionSource: null,
+  // "prometheux" | "agent"
+  decisionEngine: null,
+  // {tier, score, max_score, axes, explanation, facts}
+  agentDecision: null,
+  // the synthesis agent's proposed tier (for divergence)
+  diverges: false,
+  // engine tier != agent tier
+  engineGaps: [],
+  // Prometheux structural gaps (the non-silenceable voice)
+  engineForced: false,
+  // a structural gap forced the re-route
   confidence: "n/a",
   error: null
 });
@@ -143,6 +155,10 @@ function reduceEvent(run, ev, data) {
         } : s);
         return r;
       }
+    case "engine_gaps":
+      r.engineGaps = data.gaps || [];
+      r.engineForced = !!data.forced;
+      return r;
     case "review":
       r.review = data.review;
       r.steps = r.steps.map(s => s.id === "review" ? {
@@ -154,13 +170,22 @@ function reduceEvent(run, ev, data) {
     case "synthesis":
       r.synthesis = data.synthesis;
       return r;
+    case "decision":
+      r.decision = data.decision || "REVIEW";
+      r.decisionSource = data.decision_source || null;
+      r.decisionEngine = data.engine || null;
+      r.agentDecision = data.agent_decision || null;
+      r.diverges = !!data.diverges;
+      r.confidence = data.confidence || r.confidence;
+      return r;
     case "done":
       r.steps = r.steps.map(s => s.status === "running" ? {
         ...s,
         status: "done"
       } : s);
       r.report_md = data.report_md;
-      r.decision = data.decision || "REVIEW";
+      r.decision = data.decision || r.decision || "REVIEW";
+      r.decisionSource = data.decision_source || r.decisionSource;
       r.confidence = data.confidence || "n/a";
       r.status = "done";
       return r;
@@ -726,7 +751,9 @@ function LoopStep({
   idx,
   last,
   active,
-  onClick
+  onClick,
+  engineGaps,
+  engineForced
 }) {
   const ev = step.evidence;
   const running = step.status === "running";
@@ -789,7 +816,22 @@ function LoopStep({
   }, /*#__PURE__*/React.createElement("div", null, "relevance ", step.review.scores?.relevance, "/5 · evidence ", step.review.scores?.evidence, "/5 · thoroughness ", step.review.scores?.thoroughness, "/5"), (step.review.gaps || []).map((gp, i) => /*#__PURE__*/React.createElement("div", {
     key: i,
     className: "text-xs text-amber-300/80 mt-1"
-  }, "↳ gap: ", gp.missing, " → re-route to ", gp.route_to))), active && ev && res.top_cell_types && /*#__PURE__*/React.createElement("table", {
+  }, "↳ gap: ", gp.missing, " → re-route to ", gp.route_to))), step.id === "review" && engineGaps && engineGaps.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded-lg border border-fuchsia-500/40 bg-fuchsia-500/5 p-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 text-xs"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "px-2 py-0.5 rounded-md font-bold bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40"
+  }, "◆ PROMETHEUX"), /*#__PURE__*/React.createElement("span", {
+    className: "text-fuchsia-200/90"
+  }, "deductive gap-detector · ", engineForced ? "forced re-route" : "advisory")), engineGaps.map((g, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    className: "mt-2 text-xs text-fuchsia-100/80"
+  }, g.forces_reroute ? "⛔" : "○", " ", g.explanation, " ", /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-500"
+  }, "→ ", g.route_to))), /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 text-[10px] text-slate-500"
+  }, "A proven missing axis is a fact, not a judgement — so the engine re-routes even if the LLM panel said synthesize.")), active && ev && res.top_cell_types && /*#__PURE__*/React.createElement("table", {
     className: "mt-3 w-full text-xs"
   }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
     className: "text-slate-500 text-left"
@@ -818,7 +860,10 @@ function LoopTrace({
     className: "flex items-center gap-3 mb-5 text-xs text-slate-400 flex-wrap"
   }, Object.entries(PROV).map(([k, p]) => /*#__PURE__*/React.createElement("span", {
     key: k
-  }, p.icon, " ", p.label))), /*#__PURE__*/React.createElement("div", {
+  }, p.icon, " ", p.label))), run.decisionEngine && /*#__PURE__*/React.createElement(PrometheuxDecision, {
+    run: run,
+    className: "mb-5"
+  }), /*#__PURE__*/React.createElement("div", {
     className: "rounded-2xl border border-slate-800 bg-slate-900/30 p-5"
   }, run.steps.map((s, i) => /*#__PURE__*/React.createElement(LoopStep, {
     key: s.id + "_" + i,
@@ -826,10 +871,62 @@ function LoopTrace({
     idx: i,
     last: i === run.steps.length - 1,
     active: active === s.id,
-    onClick: () => setActive(active === s.id ? null : s.id)
+    onClick: () => setActive(active === s.id ? null : s.id),
+    engineGaps: run.engineGaps,
+    engineForced: run.engineForced
   })), run.status === "running" && run.steps.length === 0 && /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-slate-500"
   }, "starting the loop…")));
+}
+
+// Prometheux deductive decision: the GO/NO-GO tier derived from per-axis coverage,
+// with the safety hard-gate and a replayable per-axis basis. Authoritative over the
+// agent's free-text; a divergence is surfaced, never silently overridden.
+function PrometheuxDecision({
+  run,
+  className
+}) {
+  const e = run.decisionEngine;
+  if (!e) return null;
+  const dec = DECISION[e.tier] || DECISION.REVIEW;
+  const axes = e.axes || {};
+  return /*#__PURE__*/React.createElement("div", {
+    className: `rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/5 p-5 ${className || ""}`
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 mb-3 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "px-2 py-0.5 rounded-md font-bold text-xs bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40"
+  }, "◆ PROMETHEUX"), /*#__PURE__*/React.createElement("span", {
+    className: "text-xs uppercase tracking-widest text-fuchsia-200/80"
+  }, "deductive decision"), /*#__PURE__*/React.createElement("span", {
+    className: `ml-auto px-3 py-1 rounded-lg font-extrabold text-sm ${dec.c}`
+  }, (e.tier || "REVIEW").replace("_", " "))), /*#__PURE__*/React.createElement("div", {
+    className: "text-sm text-slate-200"
+  }, "coverage score ", /*#__PURE__*/React.createElement("span", {
+    className: "mono font-bold text-fuchsia-200"
+  }, e.score), /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-500"
+  }, " / ", e.max_score)), /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2"
+  }, Object.entries(axes).map(([ax, a]) => {
+    const absent = a.grade === "absent";
+    return /*#__PURE__*/React.createElement("div", {
+      key: ax,
+      className: `rounded-lg border px-3 py-2 ${absent ? "border-rose-500/30 bg-rose-500/5 border-dashed" : "border-slate-700 bg-slate-950/50"}`
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "text-[10px] uppercase tracking-wide text-slate-500"
+    }, ax), /*#__PURE__*/React.createElement("div", {
+      className: `text-sm font-semibold ${a.weight >= 1 ? "text-emerald-300" : a.weight >= 0.5 ? "text-sky-300" : a.weight > 0 ? "text-amber-300" : "text-rose-300/90"}`
+    }, absent ? "no information" : a.grade), /*#__PURE__*/React.createElement("div", {
+      className: "mono text-[10px] text-slate-500"
+    }, "w ", a.weight));
+  })), (e.absent_axes || []).length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-xs text-rose-200/90"
+  }, "⚪ ", /*#__PURE__*/React.createElement("b", null, "No information"), " on: ", e.absent_axes.join(", "), " — these axes were never assessed (or returned empty). The score reflects absence, not weak evidence."), e.explanation && /*#__PURE__*/React.createElement("p", {
+    className: "mt-3 text-xs text-fuchsia-100/70 leading-relaxed border-t border-fuchsia-500/20 pt-3"
+  }, e.explanation), run.diverges && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200"
+  }, "⚠️ ", /*#__PURE__*/React.createElement("b", null, "Divergence:"), " the synthesis agent proposed ", /*#__PURE__*/React.createElement("b", null, (run.agentDecision || "").replace("_", " ")), ", but the deductive layer derives ", /*#__PURE__*/React.createElement("b", null, (e.tier || "").replace("_", " ")), " from the evidence coverage. The derived tier is the decision of record."));
 }
 
 // ======================================================================================
@@ -864,7 +961,10 @@ function Report({
       className: "text-xs text-slate-600 mt-1"
     }, run.status === "running" ? "synthesis pending — evidence still being gathered…" : "submit a query to begin."));
   }
-  const dec = DECISION[s.decision] || DECISION.REVIEW;
+  // The decision of record is the Prometheux-derived tier when the engine ran,
+  // else the agent's. The agent's free-text is always the rationale below.
+  const decTier = run.decisionEngine?.tier || s.decision || "REVIEW";
+  const dec = DECISION[decTier] || DECISION.REVIEW;
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, /*#__PURE__*/React.createElement("div", {
@@ -875,13 +975,17 @@ function Report({
     className: "flex items-center gap-3 flex-wrap"
   }, /*#__PURE__*/React.createElement("span", {
     className: `px-4 py-1.5 rounded-lg font-extrabold text-sm ${dec.c}`
-  }, (s.decision || "REVIEW").replace("_", " ")), /*#__PURE__*/React.createElement(Chip, {
+  }, decTier.replace("_", " ")), run.decisionSource === "prometheux" && /*#__PURE__*/React.createElement(Chip, {
+    cls: "border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10"
+  }, "◆ derived"), /*#__PURE__*/React.createElement(Chip, {
     cls: "border-slate-600 text-slate-300 bg-slate-800"
   }, "confidence: ", s.confidence || run.confidence)), /*#__PURE__*/React.createElement("p", {
     className: "mt-4 text-sm text-slate-200 leading-relaxed"
   }, s.recommendation), s.target_overview && /*#__PURE__*/React.createElement("p", {
     className: "mt-3 text-xs text-slate-400 leading-relaxed border-t border-slate-800 pt-3"
-  }, s.target_overview)), /*#__PURE__*/React.createElement("div", {
+  }, s.target_overview)), run.decisionEngine && /*#__PURE__*/React.createElement(PrometheuxDecision, {
+    run: run
+  }), /*#__PURE__*/React.createElement("div", {
     className: "grid md:grid-cols-2 gap-5"
   }, /*#__PURE__*/React.createElement(Panel, {
     title: "Liabilities & risks",
@@ -926,6 +1030,7 @@ function QueryScreen({
 }) {
   const [q, setQ] = useState(EXAMPLES[0]);
   const [demo, setDemo] = useState(true);
+  const [partial, setPartial] = useState(false);
   return /*#__PURE__*/React.createElement("div", {
     className: "max-w-2xl mx-auto px-4 py-20 fade-up"
   }, /*#__PURE__*/React.createElement("div", {
@@ -938,7 +1043,7 @@ function QueryScreen({
     className: "mt-8",
     onSubmit: e => {
       e.preventDefault();
-      if (q.trim()) onRun(q.trim(), demo);
+      if (q.trim()) onRun(q.trim(), demo, partial);
     }
   }, /*#__PURE__*/React.createElement("textarea", {
     value: q,
@@ -960,7 +1065,16 @@ function QueryScreen({
   }, "(cached data, no LLM/network — reliable for a stage)")), /*#__PURE__*/React.createElement("button", {
     type: "submit",
     className: "px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm"
-  }, "Run assessment →"))), /*#__PURE__*/React.createElement("div", {
+  }, "Run assessment →")), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-2 text-sm text-fuchsia-300/90 cursor-pointer mt-3"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: partial,
+    onChange: e => setPartial(e.target.checked),
+    className: "accent-fuchsia-500"
+  }), "◆ skip the safety step ", /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-600"
+  }, "(demonstrate the Prometheux gap-detector forcing a re-route to fill the missing axis)"))), /*#__PURE__*/React.createElement("div", {
     className: "mt-8"
   }, /*#__PURE__*/React.createElement("div", {
     className: "text-[11px] uppercase tracking-wide text-slate-500 mb-2"
@@ -976,17 +1090,20 @@ function App() {
   const [run, setRun] = useState(emptyRun);
   const [tab, setTab] = useState("loop");
   const esRef = useRef(null);
-  const start = useCallback((query, demo) => {
+  const start = useCallback((query, demo, partial) => {
     if (esRef.current) esRef.current.close();
     setRun({
       ...emptyRun(),
       status: "running",
       meta: {
-        query
+        query,
+        partial: !!partial
       }
     });
     setTab("loop");
-    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}`;
+    // demo off → run the routed skills live (real ClawBio/Tavily data) so the
+    // evidence layer is populated; otherwise the decision sees no information.
+    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}${demo ? "" : "&live=1"}${partial ? "&partial=1" : ""}`;
     const es = new EventSource(url);
     esRef.current = es;
     const on = name => es.addEventListener(name, e => {
@@ -994,7 +1111,7 @@ function App() {
       setRun(prev => reduceEvent(prev, name, data));
       if (name === "done" || name === "error") es.close();
     });
-    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "review", "synthesis", "done", "error"].forEach(on);
+    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "engine_gaps", "review", "synthesis", "decision", "done", "error"].forEach(on);
     es.onerror = () => {
       setRun(prev => prev.status === "done" ? prev : reduceEvent(prev, "error", {
         message: "connection lost — is server.py running?"
@@ -1010,7 +1127,7 @@ function App() {
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
     const q = p.get("q");
-    if (q) start(q, p.get("demo") !== "0");
+    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1");
     if (p.get("tab")) setTab(p.get("tab"));
   }, [start]);
   if (run.status === "idle") return /*#__PURE__*/React.createElement(QueryScreen, {
@@ -1037,7 +1154,9 @@ function App() {
     className: "text-slate-500 mono"
   }, run.meta.backend, " · ", run.meta.model) : /*#__PURE__*/React.createElement("span", {
     className: "text-slate-500"
-  }, "demo / stub — no LLM"))), /*#__PURE__*/React.createElement("div", {
+  }, "demo / stub — no LLM"), run.meta?.partial && /*#__PURE__*/React.createElement(Chip, {
+    cls: "border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10"
+  }, "◆ safety step skipped"))), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 text-center"
   }, /*#__PURE__*/React.createElement(Stat, {
     n: stepsDone,
