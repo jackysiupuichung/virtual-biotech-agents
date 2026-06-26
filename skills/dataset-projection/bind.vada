@@ -15,6 +15,16 @@
 % Our projected facts bind: the 7-column contract written by facts.write_facts.
 @bind("projected_facts","csv useHeaders='true'","disk/","projected_facts.csv").
 
+% Prior CSO run verdicts: the SAME 7-column contract, written by the run_decision
+% extractor (the final-overall tier + per-axis subreport conclusions). Binding past
+% verdicts next to PrimeKG lets a new run reason over what we already decided.
+%
+% NOTE: decision facts are TINY (5 rows/run), so the live runner (run_decision_live.py)
+% INLINES them as `run_decision(...)` ground atoms rather than using this bind — the
+% SDK has no file upload, so a `disk/` CSV must be placed via the web app first. This
+% bind is the large-scale / many-runs form, kept for when verdicts are uploaded that way.
+@bind("run_decision","csv useHeaders='true'","disk/","run_decision.facts.csv").
+
 % --- normalize each source into a common `cell_marker` / `kg_edge` predicate ----
 % A projected single-cell conclusion: gene G is a marker of cell type C (conf S).
 cell_marker(G, C, S) :- projected_facts(G, "EXPRESSED_IN", C, _, S, _, _).
@@ -36,4 +46,27 @@ marker_disease_link(G, C, Disease) :-
        "PrimeKG links [G] to disease [Disease] — a cross-dataset conclusion").
 
 @output("marker_disease_link").
+
+% --- prior verdicts as reasoning material -------------------------------------
+% A finished run's final-overall tier for a target (subject is `target:<sym>`,
+% object is `verdict:<tier>`). T is the human-readable tier carried in `value`.
+prior_verdict(Target, T, Conf) :-
+    run_decision(Target, "DECIDED", _, T, Conf, _, _).
+
+% Cross-dataset: a target we previously decided that PrimeKG also ties to a disease
+% — so a new run can surface "we already verdicted this target, and here's the
+% disease context PrimeKG knows", a conclusion neither the run nor PrimeKG has alone.
+% Targets are projected as `target:<symbol>`; PrimeKG names genes by canonical symbol,
+% so the join is on the upper-cased symbol stripped of the `target:` prefix.
+verdict_disease_context(Target, T, Disease) :-
+    prior_verdict(Target, T, _),
+    Sym = upper(substr(Target, 8, 64)),
+    kg_csv(_, _, _, _, "gene/protein", Sym, _, _, _, "disease", Disease, _).
+
+@model("verdict_disease_context", "['Target:string','T:string','Disease:string']",
+       "[Target] has a prior CSO verdict [T]; PrimeKG ties it to disease [Disease] "
+       "— a past decision joined to knowledge-graph disease context").
+
+@output("prior_verdict").
+@output("verdict_disease_context").
 @explain("console").

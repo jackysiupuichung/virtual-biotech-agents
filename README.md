@@ -102,6 +102,49 @@ python skills/virtual-biotech-cso/harness.py --live --backend auto \
 
 ---
 
+## 🎰 Information maximization under a token budget
+
+Every re-route costs tokens (LLM agent calls + skill execution), so the loop can't chase
+every possible gap. The design principle is simple: **spend the next agent call on the
+evidence that most changes the verdict, and stop when the budget says the marginal gap
+isn't worth it.** Three mechanisms in the code enforce this:
+
+1. **A hard token budget gates exploration.** The loop always runs its *core passes* — the
+   four load-bearing prioritization axes (validity · specificity · safety · tractability),
+   which are forced regardless of cost. Past that, it only keeps chasing the broader
+   *desired* axes while measured spend stays under the budget
+   ([`harness.py`](skills/virtual-biotech-cso/harness.py): `DEFAULT_TOKEN_BUDGET = 60_000`,
+   `_budget_room()`). A thin run converges on the core four; a budget-rich run fills the
+   rest. The meter is `rec.totals` — the same token count [Langfuse](https://langfuse.com) mirrors.
+2. **Gaps are ranked by expected information, then spent greedily.** Candidate gaps sort by
+   `(forces_reroute, corroborating-lens-count)` descending
+   ([`cso.py`](skills/virtual-biotech-cso/cso.py): `aggregate_panel_review`), so a *provably
+   missing required axis* is always filled before a merely-corroborated soft gap. The next
+   re-route always goes to the highest-value arm available.
+3. **No thrash — never pull a depleted arm.** A re-route that resolves to an
+   already-answered skill+question adds zero information, so the loop skips it and converges
+   ([`harness.py`](skills/virtual-biotech-cso/harness.py), `executed` set). The rule is sharp,
+   not blunt: a *question-sensitive* arm like live literature search **may** re-run on a
+   genuinely *deeper* question, but the **same** question is refused outright — the loop
+   deepens, it doesn't spin. This convergence is **regression-tested, not hoped for** —
+   `test_loop_stops_when_reroute_would_rerun_a_covered_skill`,
+   `test_live_loop_is_bounded_at_max_reroutes`, and the two `deeper_reroute` cases pin every
+   edge of the policy (all 28 harness tests green).
+
+> **Multi-arm bandit, by analogy.** Each candidate skill is an *arm*; its expected
+> *information gain* about the verdict is the reward; the token budget is the total pulls
+> you can afford. We deliberately run the **greedy / pure-exploitation** policy — pull the
+> highest expected-information arm each round, structurally-forced axes first — because in a
+> single short investigation, exploration regret isn't worth paying: the four core axes are
+> known *a priori* to be decision-relevant, so there's nothing to learn about which arms
+> matter. **This is a conceptual framing, not a learned bandit** — there are no reward
+> estimates, no UCB/Thompson exploration term, and no cross-run regret tracking. The honest
+> upgrade path (a real bandit) is to *learn* per-skill information-gain priors across many
+> target assessments and let the selector explore under uncertainty — promising future work,
+> not what ships today.
+
+---
+
 ## 🧱 The framework (architecture from the paper)
 
 **4 scientific divisions · 11 agents · 100+ data tools**, spanning 78,726 targets, 39,530 diseases, 14.5M protein–protein interactions, 100M+ single-cell profiles, and 4B+ drug-perturbation measurements (Tahoe-100M).

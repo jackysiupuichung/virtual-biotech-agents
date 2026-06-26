@@ -11,6 +11,7 @@ sys.path.insert(0, str(SKILL_DIR))
 import pytest  # noqa: E402
 
 from cso import (  # noqa: E402
+    FUNCTIONAL_SKILLS,
     PlanValidationError,
     case_key,
     decompose_and_route,
@@ -36,18 +37,19 @@ def test_case_key_generic_slug():
 def test_decompose_routes_from_yaml():
     routing = load_routing()
     tasks = decompose_and_route("Assess B7-H3 in lung cancer", "b7h3", routing)
+    # The cell-type-expression step (scrna-embedding) is deferred (no live h5ad atlas),
+    # so the deterministic plan goes straight to the functional specificity profiler.
     assert [t.step for t in tasks] == [
         "step_01_gwas",
-        "step_02_celltype_expression",
         "step_03_celltype_specificity",
         "step_04_offtarget_safety",
         "step_05_clinical_trials",
     ]
+    # every routed skill in the deterministic plan is functional (executes live)
+    assert all(t.skill in FUNCTIONAL_SKILLS for t in tasks), [t.skill for t in tasks]
     # routing.yaml binds the specificity sub-question to our PR #1 skill
     spec = next(t for t in tasks if t.step == "step_03_celltype_specificity")
     assert spec.skill == "celltype-specificity-profiler"
-    # dependency wiring is preserved
-    assert spec.depends_on == ["step_02_celltype_expression"]
 
 
 def test_reroute_task_uses_gap_route():
@@ -83,7 +85,7 @@ def test_demo_writes_full_contract(tmp_path):
     assert summary["case"] == "b7h3"
     assert summary["mode"] == "demo"
     assert summary["reviewer_verdict"] == "re-route"
-    assert summary["n_steps"] == 6  # 5 + one re-route
+    assert summary["n_steps"] == 5  # 4 functional steps + one re-route
 
     assert (out / "report.md").exists()
     assert (out / "result.json").exists()
@@ -105,11 +107,11 @@ def test_demo_writes_full_contract(tmp_path):
     envelope = json.loads((out / "result.json").read_text())
     assert envelope["skill"] == "virtual-biotech-cso"
     assert envelope["data"]["review"]["verdict"] == "re-route"
-    assert len(envelope["data"]["evidence"]) == 6
+    assert len(envelope["data"]["evidence"]) == 5  # 4 functional steps + one re-route
     # new schema fields
     for key in ("references", "evidence_gaps", "proposed_experiments"):
         assert key in envelope["data"], f"missing data key: {key}"
-    assert len(envelope["data"]["references"]) == 6
+    assert len(envelope["data"]["references"]) == 5
     assert envelope["summary"]["decision"] == "CONDITIONAL_GO"
     assert envelope["data"]["proposed_experiments"]  # non-empty (synthesis + reviewer)
 

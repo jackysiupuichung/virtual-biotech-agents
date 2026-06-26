@@ -373,6 +373,33 @@ def _engine_decision(trace: Trace, results: list[dict[str, Any]],
             return None
 
 
+def _project_decision_facts(trace: Trace, decision: dict[str, Any] | None,
+                            target: str, out_dir: Path, run_id: str) -> Path | None:
+    """Project the run's verdict into decision facts on every run (local-only).
+
+    Writes ``<out_dir>/run_decision.facts.csv`` — the final-overall tier + per-axis
+    subreport conclusions in the dataset-projection Fact contract — so the verdict is
+    durable as facts, ready to reason over next to PrimeKG via run_decision_live.py.
+    This is the *projection* (cheap, dependency-light, no engine call); the live join
+    stays an explicit step. Guarded: a missing extractor never breaks a finished run.
+    """
+    if decision is None or out_dir is None:
+        return None
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                               / "dataset-projection" / "extractors"))
+        from run_decision import _decision_facts  # noqa: E402
+        from facts import write_facts  # noqa: E402
+        out = out_dir / "run_decision.facts.csv"
+        n = write_facts(_decision_facts(decision, target, run_id), out)
+        trace.step("🗄️", f"projected {n} decision facts → {out.name} "
+                          f"(bind via run_decision_live.py)")
+        return out
+    except Exception as exc:  # noqa: BLE001 — projection is best-effort, never fatal
+        trace.event("decision_facts", {"degraded": str(exc)})
+        return None
+
+
 def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                  routing: dict[str, Any], results: list[dict[str, Any]],
                  demo: bool, live: bool, rec: TraceRecorder,
@@ -642,6 +669,12 @@ def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
         result_path = cso._write_result_json(out_dir, summary, data)
         cso._write_reproducibility(out_dir / "reproducibility", argv,
                                    [report_path, result_path])
+        # Project the verdict into decision facts every run (same target derivation
+        # as _engine_decision), so the run's conclusion is durable as facts.
+        import re as _re
+        _m = _re.search(r"\b([A-Z][A-Z0-9]{1,6}(?:-[A-Z0-9]+)?)\b", query or "")
+        _target = _m.group(1) if _m else (query or "target")
+        _project_decision_facts(trace, decision, _target, out_dir, out_dir.name)
     else:
         summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
                                         synthesis, runner, backend, demo, live,

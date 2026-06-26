@@ -88,9 +88,17 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
     prov_icon = ev.get("provenance", "")
     prov_kind = {"🧪": "computed", "🔧": "computed", "🗄️": "retrieved", "🌐": "web", "⚪": "gap"}.get(prov_icon, "computed")
     _src_id, src_label, src_url = KG.canonical_source(ev.get("reference", ""), ev["skill"], prov_icon)
-    axis = {"step_03_celltype_specificity": "specificity", "step_04_offtarget_safety": "safety",
-            "step_01_gwas": "genetics", "step_05_clinical_trials": "tractability",
-            "step_06_reroute": "efficacy"}.get(ev["step"], ev.get("division", "evidence"))
+    # Axis = which prioritization axis this evidence fills. Inferred from the
+    # step's skill + step id via the *same* keyword buckets the gap-detector uses
+    # (prometheux_reason._AXIS_KEYWORDS), so agent-proposed plans with non-default
+    # step names still land on the right axis and aren't dropped to a generic
+    # "evidence" bucket the gap logic can't see. Falls back to the legacy
+    # hardcoded map, then the division.
+    import prometheux_reason as _pr  # noqa: E402  (sibling skill module)
+    axis = (_pr._covered_axis(ev.get("skill", ""), ev["step"])
+            or {"step_03_celltype_specificity": "specificity", "step_04_offtarget_safety": "safety",
+                "step_01_gwas": "genetics", "step_05_clinical_trials": "tractability",
+                "step_06_reroute": "efficacy"}.get(ev["step"], ev.get("division", "evidence")))
 
     def emit_node(node):
         deltas.append(("node", {**node, "shared_runs": GRAPH.shared_with(node["id"], run_id)}))
@@ -155,7 +163,7 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
 
 
 def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
-             backend: str | None = None):
+             backend: str | None = None, token_budget: int | None = None):
     """Generator yielding (event_name, payload) for each phase of the loop.
 
     This drives the REAL multi-agent loop — ``harness.run()`` — and bridges its
@@ -192,7 +200,9 @@ def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
         try:
             box["result"] = harness.run(
                 query, None, backend=backend, model=CONFIG["model"],
-                demo=demo, live=live, argv=[], emit=emit, quiet=True)
+                demo=demo, live=live, argv=[], emit=emit, quiet=True,
+                **({"token_budget": token_budget} if token_budget is not None
+                   else {}))
         except Exception as exc:  # surface to the stream, then end it
             box["error"] = exc
         finally:
@@ -374,6 +384,17 @@ class Handler(BaseHTTPRequestHandler):
         elif agents in ("0", "false"):
             backend = "stub"
             demo, live = True, False
+        # Token budget for the review→reroute loop (the harness gates how many of the
+        # broader "desired" axes it chases on accumulated token spend). Sent by the
+        # UI's budget selector; omitted/blank/invalid → harness default. 0 → core
+        # axes only (no desired-axis chasing).
+        token_budget = None
+        raw_budget = qs.get("token_budget", [None])[0]
+        if raw_budget not in (None, ""):
+            try:
+                token_budget = max(0, int(raw_budget))
+            except (TypeError, ValueError):
+                token_budget = None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -382,7 +403,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             for event, data in run_loop(query, demo=demo, live=live, partial=partial,
-                                        backend=backend):
+                                        backend=backend, token_budget=token_budget):
                 self.wfile.write(_sse(event, data))
                 self.wfile.flush()
         except BrokenPipeError:
