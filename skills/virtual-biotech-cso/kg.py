@@ -38,6 +38,52 @@ def nid(kind: str, key: str) -> str:
     return f"{kind}:{_slug(key)}"
 
 
+# Cache of alias → canonical metadata so repeat runs / repeat targets don't re-hit
+# the Open Targets API. Keyed by (kind, lowercased raw symbol).
+_CANON_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def canonical_entity(kind: str, raw: str) -> dict[str, Any]:
+    """Resolve a raw target/disease symbol to canonical-identity metadata.
+
+    Uses :mod:`resolver` (Open Targets ``mapIds``, live-first) to turn an alias
+    (``B7-H3``) into its canonical symbol/id (``CD276`` / ``ENSG…``; diseases →
+    EFO/MONDO). Returns a dict of node properties to attach::
+
+        {"canonical_symbol": str, "canonical_id": str, "ontology": str,
+         "alias_of": str | None}
+
+    The node *id* itself stays slug-based (``nid``) so existing ``kg.json`` nodes
+    keep deduping — this only enriches the node with its canonical identity, and
+    records ``alias_of`` when the input differed from the canonical symbol. Resolver
+    failure (offline, no hit) yields empty metadata; we never block node creation on
+    a network call, and never fabricate an id. ``kind`` is ``"target"`` or
+    ``"disease"`` (anything else returns empty — only those two normalize).
+    """
+    entity = {"target": "target", "disease": "disease"}.get(kind)
+    if not entity or not raw:
+        return {}
+    ck = (entity, raw.strip().lower())
+    if ck in _CANON_CACHE:
+        return _CANON_CACHE[ck]
+
+    meta: dict[str, Any] = {}
+    try:
+        import resolver  # local module; optional at import time
+        r = resolver.resolve_one(raw, entity)
+        if r.resolved:
+            ontology = ("Ensembl" if entity == "target"
+                        else r.canonical_id.split("_", 1)[0] or "EFO")
+            meta = {"canonical_symbol": r.canonical_name,
+                    "canonical_id": r.canonical_id, "ontology": ontology}
+            if r.canonical_name.lower() != raw.strip().lower():
+                meta["alias_of"] = r.canonical_name
+    except Exception:  # noqa: BLE001 — resolution is best-effort enrichment
+        meta = {}
+    _CANON_CACHE[ck] = meta
+    return meta
+
+
 # map a routed-step provenance icon / source string to a canonical Source node.
 # Each entry: keyword -> (label, url). The keyword is matched against the
 # "<reference> <skill>" text, so both the human ref string and the skill name can
@@ -77,6 +123,30 @@ _PROV_LABEL = {
 }
 
 
+# A clinical-trial registry id (ClinicalTrials.gov NCT… or EUCTR yyyy-nnnnnn-nn)
+# anywhere in a ref/result should deep-link to the *actual* study record, not the
+# registry homepage. These map an id → its canonical study URL.
+_NCT_RE = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+_EUCTR_RE = re.compile(r"\b\d{4}-\d{6}-\d{2}\b")
+
+
+def trial_deep_link(text: str) -> str:
+    """Return a deep link to the actual trial record if `text` names a registry id.
+
+    A bare ``NCT01234567`` or an EUCTR ``2020-001234-10`` resolves to the study
+    page; without an id we have no specific trial to point at, so return "" and
+    let the caller fall back to the registry homepage.
+    """
+    m = _NCT_RE.search(text or "")
+    if m:
+        return f"https://clinicaltrials.gov/study/{m.group(0).upper()}"
+    m = _EUCTR_RE.search(text or "")
+    if m:
+        return (f"https://www.clinicaltrialsregister.eu/ctr-search/search"
+                f"?query={m.group(0)}")
+    return ""
+
+
 def canonical_source(reference: str, skill: str, provenance_icon: str) -> tuple[str, str, str]:
     """Return (canonical_source_id, label, url) for an evidence item.
 
@@ -88,9 +158,13 @@ def canonical_source(reference: str, skill: str, provenance_icon: str) -> tuple[
     """
     text = f"{reference} {skill}".lower()
     url_in_ref = re.search(r"https?://[^\s)]+", reference or "")
+    # A specific trial id deep-links to the study record, beating both a generic
+    # homepage and a registry-base url already in the ref.
+    trial_url = trial_deep_link(reference)
     for key, (label, url) in _SOURCE_CANON.items():
         if key in text:
-            return nid("source", label), label, (url_in_ref.group(0) if url_in_ref else url)
+            chosen = trial_url or (url_in_ref.group(0) if url_in_ref else url)
+            return nid("source", label), label, chosen
     # No catalog match: still give it a meaningful, deduped identity from the
     # provenance kind — labelled by what it IS, keyed so each kind is one node.
     label, slug = _PROV_LABEL.get(provenance_icon, ("Other source", "other"))

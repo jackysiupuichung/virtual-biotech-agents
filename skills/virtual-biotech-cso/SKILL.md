@@ -134,7 +134,8 @@ marks the distinction.
 2. **Decompose & route**: split the query into division sub-questions (Target ID, Target Safety, Modality, Clinical) and bind each to a skill via `routing.yaml`.
 3. **Execute (delegate)**: obtain each step's result from a routed ClawBio skill — cached in `--demo`, real `clawbio run` in `--live`.
 4. **Scientific-Reviewer audit**: structures the audit; the agent scores relevance / evidence / thoroughness and, on a gap, sets `re-route` — the skill then runs **one** follow-up step.
-5. **Synthesis scaffold**: assembles the recommendation/liabilities scaffold for the agent to complete, and writes the `report.md` + `result.json` + `reproducibility/` bundle.
+5. **Prometheux gap-detector** *(load-bearing)*: alongside the LLM reviewer lenses, a Vadalog reasoning pass over the evidence (`prometheux_reason.py`) derives *structural* gaps as facts — a required prioritization axis (safety / specificity / genetics / tractability) that **no routed step assessed**. Such a gap carries `forces_reroute`: it re-routes on its own, regardless of the LLM panel vote, to the `routing.yaml` skill bound to that axis. A proven missing axis is a deductive fact, not a judgement — so the engine is a non-silenceable panel member that drives the control loop. Runs live on the hosted Prometheux engine when `PMTX_TOKEN` is set, else an in-process Datalog fallback runs the same rules (never fabricates).
+6. **Synthesis scaffold**: assembles the recommendation/liabilities scaffold for the agent to complete, and writes the `report.md` + `result.json` + `reproducibility/` bundle.
 
 ## Scope
 

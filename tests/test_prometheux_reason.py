@@ -167,6 +167,18 @@ def test_decision_weak_coverage_yields_review() -> None:
     assert dec["score"] < pr.CONDITIONAL_THRESHOLD
 
 
+def test_decision_names_absent_axes_explicitly() -> None:
+    """Genuinely-missing axes are reported as absent, not buried in a low score."""
+    results = [
+        {"step": "step_03_celltype_specificity", "grade": "strong"},
+        # no genetics, safety, or tractability evidence
+    ]
+    dec = pr.decide_from_evidence(results, "B7-H3")
+    assert set(dec["absent_axes"]) == {"safety", "genetics", "tractability"}
+    assert "No information on:" in dec["explanation"]
+    assert "no_information(B7-H3, safety)" in dec["facts"]
+
+
 def test_decision_conditional_go_at_threshold() -> None:
     """Score == conditional threshold with safety covered → CONDITIONAL_GO."""
     results = [

@@ -11,6 +11,8 @@ tied to any one vendor or to Claude Code being installed. A single entry point,
   - ``OpenAIRunner``    — an OpenAI-compatible client (``OPENAI_API_KEY``,
                           optional ``OPENAI_BASE_URL``) using JSON mode, so the
                           harness runs from Cursor or any other environment.
+  - ``GeminiRunner``    — Google Gemini via its OpenAI-compatible endpoint
+                          (``GEMINI_API_KEY``), reusing the ``openai`` SDK.
 
 If no backend is configured, ``select_runner`` returns a ``StubRunner`` that
 raises ``NoBackendError`` — the harness catches it and falls back to cso.py's
@@ -29,6 +31,41 @@ import re
 import shutil
 import subprocess
 from typing import Any, Protocol
+
+
+def load_dotenv(start: str | None = None) -> None:
+    """Populate os.environ from the nearest ``.env`` (zero-dependency).
+
+    Walks up from ``start`` (this file's dir by default) to the filesystem root,
+    loading the first ``.env`` found. Existing env vars win — an exported key is
+    never overwritten by the file — so CI / shell overrides still take precedence.
+    Lines are ``KEY=value`` (``#`` comments and blanks ignored); surrounding
+    quotes are stripped. Best-effort: any read error is swallowed so a missing or
+    malformed ``.env`` never breaks import. Called once at module import.
+    """
+    here = os.path.abspath(start or os.path.dirname(__file__))
+    while True:
+        candidate = os.path.join(here, ".env")
+        if os.path.isfile(candidate):
+            try:
+                for line in open(candidate, encoding="utf-8"):
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key, val = key.strip(), val.strip().strip('"').strip("'")
+                    if val and not os.environ.get(key):
+                        os.environ[key] = val
+            except OSError:
+                pass
+            return
+        parent = os.path.dirname(here)
+        if parent == here:
+            return
+        here = parent
+
+
+load_dotenv()
 
 
 class NoBackendError(RuntimeError):
@@ -163,6 +200,46 @@ class OpenAIRunner:
         return _extract_json(resp.choices[0].message.content or "")
 
 
+class GeminiRunner:
+    """Google Gemini backend via its OpenAI-compatible endpoint.
+
+    Gemini exposes an OpenAI-shaped API, so we reuse the ``openai`` SDK pointed at
+    Google's compat base_url and authenticated with ``GEMINI_API_KEY`` (Google AI
+    Studio's free tier). No extra dependency beyond ``openai``. JSON mode keeps the
+    role's structured-output contract.
+    """
+
+    DEFAULT_MODEL = "gemini-2.5-flash"
+    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+    def __init__(self, model: str | None = None) -> None:
+        from openai import OpenAI  # lazy optional dep (shared with OpenAIRunner)
+
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not key:
+            raise NoBackendError("set GEMINI_API_KEY to use the Gemini backend")
+        self.name = "gemini"
+        self.model = model or os.environ.get("VBIO_MODEL") or self.DEFAULT_MODEL
+        self.last_usage: dict[str, int] = {}
+        self._client = OpenAI(api_key=key, base_url=self.BASE_URL)
+
+    def run(self, prompt: str, context: str, schema: dict[str, Any]) -> dict[str, Any]:
+        resp = self._client.chat.completions.create(
+            model=self.model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": _compose(prompt, context, schema)},
+            ],
+        )
+        usage = getattr(resp, "usage", None)
+        self.last_usage = {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        } if usage else {}
+        return _extract_json(resp.choices[0].message.content or "")
+
+
 class ClaudeCLIRunner:
     """Claude Code CLI backend — reuses local Claude Code auth, no API key.
 
@@ -236,20 +313,30 @@ def select_runner(backend: str = "auto", model: str | None = None) -> Runner:
     backend = (backend or "auto").lower()
     has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
 
     if backend == "anthropic":
         return AnthropicRunner(model)
     if backend == "openai":
         return OpenAIRunner(model)
+    if backend == "gemini":
+        return GeminiRunner(model)
     if backend == "claude-cli":
         return ClaudeCLIRunner(model)
+    if backend == "stub":
+        # Explicit offline path: honest, deterministic, no LLM call. The frontend's
+        # "live agents" toggle selects this when unchecked (instant demo).
+        return StubRunner()
     if backend not in ("auto",):
-        raise ValueError(f"unknown backend {backend!r} (use auto|anthropic|openai|claude-cli)")
+        raise ValueError(
+            f"unknown backend {backend!r} (use auto|anthropic|openai|gemini|claude-cli|stub)")
 
     if has_anthropic:
         return AnthropicRunner(model)
     if has_openai:
         return OpenAIRunner(model)
+    if has_gemini:
+        return GeminiRunner(model)
     if shutil.which("claude"):
         return ClaudeCLIRunner(model)
     return StubRunner()

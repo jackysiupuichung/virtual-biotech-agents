@@ -31,7 +31,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+# Structured phase-event sink: emit(event_name, payload). The frontend supplies
+# one to stream the live loop as SSE; the CLI leaves it unset (console only).
+Emit = Callable[[str, dict[str, Any]], None]
 
 import cso  # sibling module — reused, never modified
 import runners
@@ -98,17 +102,35 @@ def _evidence_context(results: list[dict[str, Any]]) -> str:
 
 
 class Trace:
-    """Prints a per-step trace so the multi-agent loop is visible in the demo."""
+    """Prints a per-step trace so the multi-agent loop is visible in the demo.
 
-    def __init__(self, backend: str, model: str) -> None:
-        print("┌─ virtual-biotech CSO · live multi-agent loop")
-        print(f"│  backend: {backend}  model: {model}\n│")
+    Also carries an optional structured ``emit(event, payload)`` callback. The CLI
+    leaves it None (console only); the frontend passes one so the SAME loop streams
+    per-phase events to the UI — keeping one source of truth for the multi-agent
+    loop instead of a re-implementation that drifts. ``event`` is a no-op when no
+    emitter is set, so threading it through the helpers costs the CLI nothing.
+    """
+
+    def __init__(self, backend: str, model: str,
+                 emit: "Emit | None" = None, *, quiet: bool = False) -> None:
+        self._emit = emit
+        self._quiet = quiet
+        if not quiet:
+            print("┌─ virtual-biotech CSO · live multi-agent loop")
+            print(f"│  backend: {backend}  model: {model}\n│")
 
     def step(self, icon: str, msg: str) -> None:
-        print(f"│  {icon} {msg}")
+        if not self._quiet:
+            print(f"│  {icon} {msg}")
+
+    def event(self, name: str, payload: dict[str, Any]) -> None:
+        """Emit a structured phase event to the UI (no-op without an emitter)."""
+        if self._emit is not None:
+            self._emit(name, payload)
 
     def done(self, report: str) -> None:
-        print(f"│\n└─ wrote {report}")
+        if not self._quiet:
+            print(f"│\n└─ wrote {report}")
 
 
 def _agent_or_stub(trace: Trace, role: str, runner: runners.Runner, prompt: Path,
@@ -194,6 +216,13 @@ def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, 
     prompt = _read_prompt(cso.REVIEWER_PROMPT)
     evidence = _evidence_context(results)
 
+    # Announce the panel: one running phase per lens (concurrent reviewer agents).
+    trace.event("phase", {"id": "review", "role": "Scientific Reviewer panel",
+                          "kind": "agent", "division": "Audit loop",
+                          "title": f"{len(cso.REVIEWER_LENSES)} lens reviewers audit evidence",
+                          "status": "running",
+                          "lenses": [l["key"] for l in cso.REVIEWER_LENSES]})
+
     def _one(lens: dict[str, str]) -> tuple[str, dict[str, Any]]:
         ctx = f"## Your review lens: {lens['key']}\nFocus on: {lens['focus']}\n\n{evidence}"
         with rec.span(f"reviewer:{lens['key']}", kind="agent",
@@ -221,6 +250,16 @@ def _review_panel(trace: Trace, runner: runners.Runner, results: list[dict[str, 
     forced = " (engine-forced)" if panel.get("forced_by_engine") else ""
     trace.step("👥", f"reviewer panel: {panel['reroute_votes']}/{panel['n_lenses']} lenses "
                f"flag re-route → verdict {review['verdict']}{forced}")
+    # Per-lens verdicts so the UI can render the panel vote, then the engine's
+    # structural gaps as a distinct (non-silenceable) voice, then the folded review.
+    trace.event("panel", {"lenses": [{"key": k, "verdict": r.get("verdict"),
+                                      "scores": r.get("scores", {})}
+                                     for k, r in lens_reviews],
+                          "reroute_votes": panel["reroute_votes"],
+                          "n_lenses": panel["n_lenses"]})
+    trace.event("engine_gaps", {"gaps": engine_gaps,
+                                "forced": any(g.get("forces_reroute") for g in engine_gaps)})
+    trace.event("review", {"review": review})
     return review
 
 
@@ -309,10 +348,13 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                 review = _review_panel(trace, runner, results, routing, rec, query)
                 review_src = AGENT_SOURCE
             else:
+                trace.event("phase", {"id": "review", "role": "Scientific Reviewer",
+                                      "kind": "agent", "division": "Audit loop",
+                                      "title": "Audit evidence", "status": "running"})
                 review, review_src = _agent_or_stub(
                     trace, "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
                     _evidence_context(results), REVIEW_SCHEMA,
-                    stub=cso.load_review(query, case, results, demo=False), rec=rec)
+                    stub=cso.load_review(query, case, results, demo=demo), rec=rec)
                 # The Prometheux gap-detector is deterministic — it runs on the stub
                 # path too, and a forcing structural gap re-routes even when no live
                 # reviewer panel is available (the engine is the non-silenceable voter).
@@ -322,6 +364,10 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                         [("scientific_reviewer", review)], routing, extra_gaps=engine_gaps)
                     review = {**review, "verdict": merged["verdict"],
                               "gaps": merged["gaps"], "panel": merged["panel"]}
+                trace.event("engine_gaps", {
+                    "gaps": engine_gaps,
+                    "forced": any(g.get("forces_reroute") for g in engine_gaps)})
+                trace.event("review", {"review": review})
             review.setdefault("source", review_src)
 
             if review.get("verdict") != "re-route":
@@ -332,15 +378,39 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
                            "synthesizing with residual gaps")
                 break
 
-            gap = (review.get("gaps") or [{}])[0]
-            followup = cso._reroute_task(gap, routing, step_n=6 + i)
+            # Convergence: a reroute only adds evidence if it runs a skill we have
+            # not already run. Resolve each gap to its *actual* skill (via
+            # _reroute_task, which validates the reviewer's route_to and falls back
+            # to the catalog reroute target for an invalid/missing one), then pick
+            # the first gap whose resolved skill is not yet executed. Forcing engine
+            # gaps sort first, so a required uncovered axis is always preferred. If
+            # every gap resolves to an already-run skill — a weak/absent axis that
+            # re-running cannot improve — stop and synthesize with the residual gaps
+            # rather than thrash on the same skill (the loop's old failure).
+            executed = {e.get("skill") for e in results if e.get("skill")}
+            followup = None
+            for g in review.get("gaps") or []:
+                cand = cso._reroute_task(g, routing, step_n=6 + i, executed=executed)
+                if cand.skill not in executed:
+                    gap, followup = g, cand
+                    break
+            if followup is None:
+                trace.step("✅", "no actionable gap left (every gap re-runs a covered "
+                           "skill) → synthesize with residual gaps")
+                break
             trace.step("🔁", f"reroute {i + 1}/{MAX_REROUTES} → {followup.skill} "
                        f"({gap.get('missing', 'gap')})")
+            trace.event("phase", {"id": followup.step, "role": followup.skill,
+                                  "kind": "skill", "division": followup.division + " (re-route)",
+                                  "title": followup.question, "status": "running",
+                                  "reroute": True, "why": gap.get("missing", "")})
             with rec.span(f"reroute:{followup.skill}", kind="tool", iteration=i + 1,
                           missing=gap.get("missing")):
                 # pass the query as the live target so a reroute to lit-synthesizer
                 # runs a real-time Tavily search for this target, not the cached demo.
-                results.append(cso.execute_skill(followup, case, demo, live, target=query))
+                env = cso.execute_skill(followup, case, demo, live, target=query)
+                results.append(env)
+            trace.event("evidence", {**_evidence_event(env), "reroute": True})
 
             # A cached/stub reviewer can't re-evaluate the new evidence — its verdict is
             # fixed, so looping would just append duplicate re-routes. Only a *live*
@@ -352,24 +422,48 @@ def _review_loop(trace: Trace, runner: runners.Runner, query: str, case: str,
     return review
 
 
-def run(query: str, out_dir: Path, *, backend: str, model: str | None,
-        demo: bool, live: bool, argv: list[str]) -> dict[str, Any]:
+def run(query: str, out_dir: Path | None, *, backend: str, model: str | None,
+        demo: bool, live: bool, argv: list[str], emit: "Emit | None" = None,
+        quiet: bool = False) -> dict[str, Any]:
+    """Run the live multi-agent loop.
+
+    ``emit`` is an optional structured-event sink: when set (the frontend supplies
+    one), each phase pushes an event the UI streams as SSE — so the browser shows
+    the SAME loop the CLI prints, not a re-implementation. ``quiet`` suppresses the
+    console trace (the server doesn't want it). ``out_dir=None`` skips writing the
+    report/result files (the streaming caller renders from the events + final dict).
+    """
     case = cso.case_key(query)
     routing = cso.load_routing()
     runner = runners.select_runner(backend, model)
-    trace = Trace(runner.name, runner.model)
+    trace = Trace(runner.name, runner.model, emit=emit, quiet=quiet)
     rec = TraceRecorder(out_dir, run_name=case, backend=runner.name, model=runner.model)
 
+    calls_llm = runner.name != "stub"
+    trace.event("start", {
+        "query": query, "case": case,
+        "backend": runner.name if calls_llm else "none",
+        "model": runner.model if calls_llm else "none",
+        "calls_llm": calls_llm,
+        "mode": "demo" if demo else ("live" if live else "default"),
+    })
+
     # 1 — BRIEF (live agent role) ------------------------------------------- #
+    trace.event("phase", {"id": "briefing", "role": "Chief of Staff", "kind": "agent",
+                          "division": "Office of CSO", "title": "Field briefing",
+                          "status": "running"})
     briefing, brief_src = _agent_or_stub(
         trace, "chief_of_staff", runner, cso.CHIEF_OF_STAFF_PROMPT,
         f"User query: {query}", BRIEFING_SCHEMA,
-        stub=cso.load_briefing(query, case, demo=False), rec=rec)
+        stub=cso.load_briefing(query, case, demo=demo), rec=rec)
     briefing.setdefault("source", brief_src)
+    trace.event("briefing", {"briefing": briefing, "source": brief_src})
 
     # 2 — PLAN (live agent role; validated against routing.yaml, else deterministic) #
     subtasks, plan_src = _plan(trace, runner, query, briefing, case, routing, rec)
     trace.step("🧭", f"plan → {len(subtasks)} routed sub-tasks ({plan_src})")
+    trace.event("plan", {"subtasks": [t.as_plan_entry() for t in subtasks],
+                         "source": plan_src})
 
     # 3 — DIVISION SCIENTISTS (one agent per division; runs its skills + interprets) #
     #     Virtual-Biotech structure: the CSO delegates each division to a domain
@@ -400,26 +494,51 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         f"Evidence:\n{_evidence_context(results)}\n\n"
         f"Reviewer:\n{json.dumps(review, default=str)}{decision_ctx}"
     )
+    trace.event("phase", {"id": "synth", "role": "CSO Orchestrator", "kind": "agent",
+                          "division": "Synthesis", "title": "Synthesize recommendation",
+                          "status": "running", "terminal": True})
     synthesis: dict[str, Any] | None
     synthesis, _ = _agent_or_stub(
         trace, "cso_synthesis", runner, cso.ORCHESTRATOR_PROMPT,
         syn_context, SYNTHESIS_SCHEMA, stub={}, rec=rec)
     if not synthesis:  # stub path returns {} → let the report show "pending"
         synthesis = None
+    trace.event("synthesis", {"synthesis": synthesis})
+
+    # The derived tier is the Decision of record; the agent's free-text is rationale.
+    agent_decision = (synthesis or {}).get("decision")
+    decision_tier = (decision or {}).get("tier") or agent_decision or "REVIEW"
+    trace.event("decision", {
+        "decision": decision_tier,
+        "decision_source": "prometheux" if decision else "agent",
+        "agent_decision": agent_decision,
+        "engine": decision,
+        "diverges": bool(decision and agent_decision
+                         and agent_decision != decision["tier"]),
+        "confidence": (synthesis or {}).get("confidence", "n/a"),
+    })
 
     # 6 — ASSEMBLE (reuse cso's renderer + output contract) ----------------- #
     report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis,
                                       demo, decision_engine=decision)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    report_path = out_dir / "report.md"
-    report_path.write_text(report_md, encoding="utf-8")
+    report_path = result_path = None
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = out_dir / "report.md"
+        report_path.write_text(report_md, encoding="utf-8")
 
-    summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
-                                    synthesis, runner, backend, demo, live,
-                                    division_findings=division_findings,
-                                    decision_engine=decision)
-    result_path = cso._write_result_json(out_dir, summary, data)
-    cso._write_reproducibility(out_dir / "reproducibility", argv, [report_path, result_path])
+        summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
+                                        synthesis, runner, backend, demo, live,
+                                        division_findings=division_findings,
+                                        decision_engine=decision)
+        result_path = cso._write_result_json(out_dir, summary, data)
+        cso._write_reproducibility(out_dir / "reproducibility", argv,
+                                   [report_path, result_path])
+    else:
+        summary, data = _build_envelope(query, case, briefing, subtasks, results, review,
+                                        synthesis, runner, backend, demo, live,
+                                        division_findings=division_findings,
+                                        decision_engine=decision)
 
     # Finalise the execution trace (span tree + timing + token totals).
     trace_path = rec.close(query=query, decision=summary.get("decision"),
@@ -430,9 +549,21 @@ def run(query: str, out_dir: Path, *, backend: str, model: str | None,
         trace.step("🧾", f"trace: {tok} tokens across spans → {trace_path.name}")
     summary["trace_tokens"] = rec.totals.get("total_tokens", 0)
 
-    trace.done(str(report_path))
-    return {"report": str(report_path), "result": str(result_path),
-            "trace": str(trace_path) if trace_path else None, "summary": summary}
+    trace.event("done", {
+        "report_md": report_md,
+        "decision": summary.get("decision"),
+        "decision_source": summary.get("decision_source"),
+        "confidence": summary.get("confidence"),
+        "n_steps": summary.get("n_steps"),
+        "reviewer_verdict": summary.get("reviewer_verdict"),
+    })
+    if report_path is not None:
+        trace.done(str(report_path))
+    return {"report": str(report_path) if report_path else None,
+            "result": str(result_path) if result_path else None,
+            "trace": str(trace_path) if trace_path else None,
+            "summary": summary, "data": data, "report_md": report_md,
+            "decision_engine": decision}
 
 
 def _execute_steps(subtasks: list[cso.Subtask], case: str, demo: bool, live: bool,
@@ -473,6 +604,13 @@ def _run_divisions(subtasks: list[cso.Subtask], runner: runners.Runner, query: s
     groups = cso.group_by_division(subtasks)
     prompt = _read_prompt(cso.DIVISION_SCIENTIST_PROMPT)
 
+    # Announce every routed skill as a running phase up front (in plan order), so
+    # the UI shows the full division roster before the concurrent agents report back.
+    for t in subtasks:
+        trace.event("phase", {"id": t.step, "role": t.skill, "kind": "skill",
+                              "division": t.division, "title": t.question,
+                              "status": "running"})
+
     def _scientist(division: str, tasks: list[cso.Subtask]
                    ) -> tuple[str, dict[str, dict[str, Any]], dict[str, Any]]:
         with rec.span(f"scientist:{division}", kind="agent", backend=runner.name,
@@ -512,8 +650,29 @@ def _run_divisions(subtasks: list[cso.Subtask], runner: runners.Runner, query: s
             f"{finding.get('evidence_grade', '?')}"
         trace.step("🔬", f"division scientist [{division}]: {len(done)} skill(s) "
                    f"→ {live_tag}")
+        trace.event("division_finding", {"division": division, "finding": finding,
+                                         "n_skills": len(done)})
+    # Stream each completed step's evidence in stable plan order (the work ran
+    # concurrently; ordered emission keeps the SSE stream + graph build deterministic).
     evidence = [merged[t.step] for t in subtasks]
+    for env in evidence:
+        trace.event("evidence", _evidence_event(env))
     return evidence, findings
+
+
+def _evidence_event(env: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one routed-step result into a graph/report-ready event payload.
+
+    Shared by the streaming UI (graph ingestion) and any caller that wants the
+    graded, provenance-tagged view of a step without reaching into cso internals."""
+    prov_icon, prov_note = cso._provenance(env)
+    return {
+        "step": env["step"], "division": env["division"], "skill": env["skill"],
+        "question": env.get("question", ""), "result": env.get("result", {}),
+        "grade": cso._evidence_grade(env), "provenance": prov_icon,
+        "provenance_note": prov_note, "reference": cso._evidence_reference(env),
+        "digest": cso._result_digest(env), "source": env.get("source", ""),
+    }
 
 
 def _build_envelope(query, case, briefing, subtasks, results, review, synthesis,
@@ -575,7 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(Chief of Staff · division scientists · Scientific Reviewer · CSO synthesis).")
     p.add_argument("--query", type=str, default=cso.DEFAULT_QUERY,
                    help=f"Target-assessment query (default: {cso.DEFAULT_QUERY!r})")
-    p.add_argument("--backend", choices=["auto", "anthropic", "openai", "claude-cli"],
+    p.add_argument("--backend", choices=["auto", "anthropic", "openai", "gemini", "claude-cli"],
                    default="auto",
                    help="Agent backend (default: auto — Anthropic/OpenAI key, else claude CLI)")
     p.add_argument("--model", type=str, default=None, help="Override the model id")

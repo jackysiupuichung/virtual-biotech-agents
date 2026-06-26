@@ -296,14 +296,22 @@ def group_by_division(subtasks: list[Subtask]) -> list[tuple[str, list[Subtask]]
 
 
 def _reroute_task(gap: dict[str, Any], routing: dict[str, Any] | None = None,
-                  step_n: int = 6) -> Subtask:
+                  step_n: int = 6, executed: set[str] | None = None) -> Subtask:
     """Build a follow-up Subtask from a reviewer gap (change #3: validated target).
 
     The reviewer *chooses* ``route_to``; we keep it honest — if it names a skill that
     isn't in the catalog (or names none), fall back to the routing.yaml-designated
     reroute target rather than executing an invented skill. ``step_n`` lets the
     bounded review loop (change #2) number successive reroutes step_06, step_07, ….
+
+    ``executed`` is the set of skills already run this assessment. It is used by
+    the caller for convergence (a reroute that names an already-run skill adds no
+    evidence, so the loop stops); we surface it here only so the returned Subtask
+    carries the chosen skill faithfully — we do **not** substitute an arbitrary
+    unrun skill, since an off-axis skill (e.g. a pharmacogenomics tool for a
+    specificity gap) is worse than not re-routing at all.
     """
+    executed = executed or set()
     chosen = gap.get("route_to")
     if routing is not None and chosen not in catalog_skills(routing):
         chosen = REROUTE_FALLBACK_SKILL
@@ -474,6 +482,7 @@ LOCAL_SKILLS: dict[str, str] = {
     "lit-synthesizer": "lit-synthesizer/lit_synthesizer.py",
     "openfda-safety": "openfda-safety/openfda_safety.py",
     "celltype-specificity-profiler": "celltype-specificity-profiler/profiler.py",
+    "clinical-trial-finder": "clinical-trial-finder/clinical_trial_finder.py",
 }
 
 
@@ -487,6 +496,10 @@ def _local_skill_args(skill: str, live: bool, target: str | None) -> list[str]:
     the run still produces honest, labelled evidence rather than failing.
     """
     if live and skill == "lit-synthesizer" and target and os.environ.get("TAVILY_API_KEY"):
+        return ["--target", target]
+    # clinical-trial-finder hits the public ClinicalTrials.gov API v2 — no key needed,
+    # so a live run queries real trials (and real NCT deep links) whenever a target is set.
+    if live and skill == "clinical-trial-finder" and target:
         return ["--target", target]
     return ["--demo"]
 
@@ -660,6 +673,22 @@ def _evidence_grade(env: dict[str, Any]) -> str:
         src, "absent")
 
 
+_NCT_RE = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+_EUCTR_RE = re.compile(r"\b\d{4}-\d{6}-\d{2}\b")
+
+
+def _trial_deep_link(text: str) -> str:
+    """Deep link to the actual trial record if `text` names a registry id, else ""."""
+    m = _NCT_RE.search(text or "")
+    if m:
+        return f"https://clinicaltrials.gov/study/{m.group(0).upper()}"
+    m = _EUCTR_RE.search(text or "")
+    if m:
+        return ("https://www.clinicaltrialsregister.eu/ctr-search/search"
+                f"?query={m.group(0)}")
+    return ""
+
+
 def _evidence_reference(env: dict[str, Any]) -> str:
     """A traceable citation for one evidence step: registry source + harvested provenance."""
     skill = env.get("skill", "")
@@ -673,8 +702,12 @@ def _evidence_reference(env: dict[str, Any]) -> str:
         if res.get("source") and str(res["source"]) not in bits:
             bits.append(str(res["source"]))
     cite = "; ".join(_md_escape(str(b)) for b in bits if b)
-    if reg.get("url"):
-        cite += f" — {reg['url']}"
+    # Prefer a deep link to the *actual* trial record (NCT…/EUCTR id) over the
+    # registry homepage, so trial citations point at the study, not clinicaltrials.gov/.
+    deep = _trial_deep_link(json.dumps(res, default=str)) if isinstance(res, dict) else ""
+    url = deep or reg.get("url", "")
+    if url:
+        cite += f" — {url}"
     return cite
 
 
@@ -721,7 +754,12 @@ def synthesize_report(query: str, case: str, briefing: dict[str, Any],
         L += [f"- **Decision:** {tier} "
               f"_(derived · coverage {decision_engine['score']}/{decision_engine['max_score']})_",
               f"- **Confidence:** {confidence}",
-              f"- **Basis:** {decision_engine['explanation']}", ""]
+              f"- **Basis:** {decision_engine['explanation']}"]
+        absent = decision_engine.get("absent_axes") or []
+        if absent:
+            L += [f"- **No information on:** {', '.join(absent)} "
+                  "— absent (not weak evidence); the score reflects absence."]
+        L += [""]
         if agent_decision and agent_decision != tier:
             L += [f"> ⚠️ **Divergence:** the synthesis agent proposed **{agent_decision}**, "
                   f"but the deductive decision layer derives **{tier}** from the evidence "

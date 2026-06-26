@@ -26,13 +26,18 @@ class FakeRunner:
     name = "fake"
     model = "fake-1"
 
-    def __init__(self, verdict="synthesize", reroute_times=None, route_to="scrna-orchestrator"):
+    def __init__(self, verdict="synthesize", reroute_times=None, route_to="scrna-orchestrator",
+                 plan="full"):
         # verdict: the steady-state verdict. reroute_times: if set, re-route exactly
         # this many times then return 'synthesize' (lets us test loop convergence).
         # route_to: the skill the reviewer chooses (to exercise catalog validation).
+        # plan: "full" covers all four required axes so the Prometheux gap-detector is
+        # satisfied (these tests isolate the LLM-verdict path); "minimal" plans only
+        # two steps to exercise plan-binding and the engine's structural-gap forcing.
         self._verdict = verdict
         self._reroute_times = reroute_times
         self._route_to = route_to
+        self._plan = plan
         self._reviews = 0
         self.calls = []
 
@@ -45,13 +50,26 @@ class FakeRunner:
         # The planner reuses the Orchestrator prompt but is the only call whose
         # schema asks for `subtasks` — dispatch on that before the synthesis branch.
         if "subtasks" in schema:
-            return {"subtasks": [
+            minimal = [
                 {"division": "target_id_and_prioritization",
                  "intent": "germline_genetic_support", "question": "germline?",
                  "depends_on": []},
                 {"division": "clinical_officers",
                  "intent": "prior_trials_and_outcomes", "question": "prior trials?",
                  "depends_on": []},
+            ]
+            if self._plan == "minimal":
+                return {"subtasks": minimal}
+            # full plan: covers all four required axes (genetics, specificity, safety,
+            # tractability) so the Prometheux gap-detector finds no structural gap.
+            return {"subtasks": minimal[:1] + [
+                {"division": "target_id_and_prioritization",
+                 "intent": "cell_type_specificity", "question": "specific?",
+                 "depends_on": []},
+                {"division": "target_safety",
+                 "intent": "post_market_adverse_events", "question": "safe?",
+                 "depends_on": []},
+                minimal[1],
             ]}
         if "Chief of Staff" in title:
             return {"context": "ctx", "data_availability": [], "priority_questions": ["q"],
@@ -67,9 +85,14 @@ class FakeRunner:
                 verdict = "re-route" if self._reviews <= self._reroute_times else "synthesize"
             else:
                 verdict = self._verdict
+            # route_to may be a single skill or a per-pass list — a re-route only
+            # adds evidence by running an *unrun* skill, so a multi-reroute test
+            # supplies a distinct catalog skill per pass (the loop dedups otherwise).
+            route = (self._route_to[min(self._reviews - 1, len(self._route_to) - 1)]
+                     if isinstance(self._route_to, (list, tuple)) else self._route_to)
             return {"verdict": verdict,
                     "scores": {"relevance": 5, "evidence": 4, "thoroughness": 3},
-                    "gaps": [{"missing": "spatial", "route_to": self._route_to,
+                    "gaps": [{"missing": "spatial", "route_to": route,
                               "why": "lost context"}] if verdict == "re-route" else [],
                     "experiments": []}
         if "Orchestrator" in title:
@@ -94,14 +117,32 @@ def test_live_loop_writes_contract_and_marks_llm(monkeypatch, tmp_path):
     summary = out["summary"]
     assert summary["calls_llm"] is True
     assert summary["backend"] == "fake"
-    assert summary["decision"] == "CONDITIONAL_GO"
-    # synthesis recommendation reached the rendered report
+    # The decision is now the Prometheux-derived tier, authoritative over the agent's
+    # proposal. Demo steps grade 'absent' → low coverage → REVIEW (the engine declines
+    # to upgrade to the agent's CONDITIONAL_GO without real evidence).
+    assert summary["decision"] == "REVIEW"
+    assert summary["decision_source"] == "prometheux"
+    # synthesis recommendation still reached the rendered report (agent rationale)
     assert "rec [step_03]" in Path(out["report"]).read_text()
+
+
+def test_engine_decision_overrides_agent_and_flags_divergence(monkeypatch, tmp_path):
+    """The derived tier is authoritative; when it disagrees with the agent's
+    proposal the report surfaces the divergence rather than silently overriding."""
+    out = _run(monkeypatch, FakeRunner("synthesize"), tmp_path)
+    summary = out["summary"]
+    # engine derived REVIEW; the FakeRunner agent proposed CONDITIONAL_GO
+    assert summary["decision"] == "REVIEW"
+    assert summary["decision_engine"]["tier"] == "REVIEW"
+    assert summary["agent_decision"] == "CONDITIONAL_GO"
+    report = Path(out["report"]).read_text()
+    assert "Divergence" in report
+    assert "CONDITIONAL_GO" in report  # the agent's proposal is still shown
 
 
 # --------------------- agent-proposed plan (change #1) -------------------- #
 def test_agent_proposed_plan_is_validated_and_used(monkeypatch, tmp_path):
-    runner = FakeRunner("synthesize")
+    runner = FakeRunner("synthesize", plan="minimal")
     out = _run(monkeypatch, runner, tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     steps = [e["step"] for e in data["evidence"]]
@@ -170,16 +211,37 @@ def _reroute_steps(out):
     return [e["step"] for e in data["evidence"] if "reroute" in e["step"]]
 
 
+# distinct catalog skills (none run by the full plan) so each re-route adds a
+# genuinely new skill — the loop dedups re-routes that re-run a covered skill.
+_FRESH_SKILLS = ["pathway-enricher", "tcga-somatic-profiler", "struct-predictor"]
+
+
 def test_live_loop_converges_when_reviewer_synthesizes(monkeypatch, tmp_path):
-    # re-route twice, then synthesize → exactly two follow-up steps, numbered.
-    out = _run(monkeypatch, FakeRunner(reroute_times=2), tmp_path)
+    # re-route twice (to distinct unrun skills), then synthesize → exactly two
+    # follow-up steps, numbered.
+    out = _run(monkeypatch, FakeRunner(reroute_times=2, route_to=_FRESH_SKILLS), tmp_path)
     assert _reroute_steps(out) == ["step_06_reroute", "step_07_reroute"], _reroute_steps(out)
 
 
 def test_live_loop_is_bounded_at_max_reroutes(monkeypatch, tmp_path):
-    # a reviewer that never stops is capped at MAX_REROUTES follow-ups.
-    out = _run(monkeypatch, FakeRunner("re-route"), tmp_path)
+    # a reviewer that never stops, each pass naming a fresh skill, is still capped
+    # at MAX_REROUTES follow-ups.
+    out = _run(monkeypatch, FakeRunner("re-route", route_to=_FRESH_SKILLS), tmp_path)
     assert len(_reroute_steps(out)) == harness.MAX_REROUTES
+
+
+def test_loop_stops_when_reroute_would_rerun_a_covered_skill(monkeypatch, tmp_path):
+    """Convergence: a reviewer that re-routes forever to the *same* skill must not
+    thrash. The first re-route runs that skill; subsequent passes resolve to the
+    same (now-covered) skill and add no evidence, so the loop stops at one re-route
+    even though the reviewer keeps voting re-route."""
+    out = _run(monkeypatch, FakeRunner("re-route", route_to="pathway-enricher"), tmp_path)
+    steps = _reroute_steps(out)
+    assert steps == ["step_06_reroute"], steps
+    skills = [e["skill"] for e in
+              json.loads(Path(out["result"]).read_text())["data"]["evidence"]
+              if "reroute" in e["step"]]
+    assert skills == ["pathway-enricher"]  # ran once, never re-run
 
 
 # --------------------- agent-chosen reroute target (change #3) ------------ #
@@ -201,9 +263,32 @@ def test_valid_reroute_target_is_honored(monkeypatch, tmp_path):
 
 
 def test_synthesize_verdict_has_no_reroute(monkeypatch, tmp_path):
+    # full plan covers all four axes → no structural gap → the LLM 'synthesize'
+    # verdict stands and the loop does not re-route.
     out = _run(monkeypatch, FakeRunner("synthesize"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     assert "step_06_reroute" not in [e["step"] for e in data["evidence"]]
+
+
+# --------------------- Prometheux gap-detector forces re-route ------------- #
+def test_engine_forces_reroute_on_unassessed_axis(monkeypatch, tmp_path):
+    """A minimal plan leaves safety + specificity unassessed; the Prometheux
+    gap-detector forces re-routes even though every LLM lens says 'synthesize'.
+
+    The forced re-routes target the bound skills for the missing axes, and each is
+    attributed to the prometheux lens — so the engine, not the LLM, drove control
+    flow. (The loop converges once every axis has been attempted.)"""
+    out = _run(monkeypatch, FakeRunner("synthesize", plan="minimal"), tmp_path)
+    data = json.loads(Path(out["result"]).read_text())["data"]
+    # the engine forced follow-up steps despite 0 LLM re-route votes
+    reroutes = [e for e in data["evidence"] if "reroute" in e["step"]]
+    assert reroutes, "engine should have forced at least one re-route"
+    skills = {e["skill"] for e in reroutes}
+    # re-routes went to the skills bound to the unassessed axes (safety/specificity)
+    assert {"openfda-safety", "celltype-specificity-profiler"} & skills
+    # the trace records the engine as the forcing voter on at least one pass
+    trace = (tmp_path / "trace.jsonl").read_text()
+    assert '"forced_by_engine": true' in trace.replace("True", "true")
 
 
 # --------------------- graceful degradation ------------------------------- #
@@ -242,8 +327,8 @@ def test_extract_json_handles_fences_and_prose():
 
 
 def test_select_runner_no_keys_no_cli_returns_stub(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(runners.shutil, "which", lambda _: None)
     r = runners.select_runner("auto")
     assert isinstance(r, runners.StubRunner)
@@ -251,10 +336,22 @@ def test_select_runner_no_keys_no_cli_returns_stub(monkeypatch):
         r.run("p", "c", {})
 
 
+def test_select_runner_explicit_stub_backend(monkeypatch):
+    # The frontend "live agents" toggle (off) selects backend="stub" explicitly,
+    # even when a key IS present — an honest, instant, deterministic offline run.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-present")
+    assert isinstance(runners.select_runner("stub"), runners.StubRunner)
+
+
+def test_select_runner_unknown_backend_raises(monkeypatch):
+    with pytest.raises(ValueError, match="unknown backend"):
+        runners.select_runner("nope")
+
+
 # --------------------------- Claude CLI backend --------------------------- #
 def test_auto_selects_cli_when_no_key_but_binary(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(runners.shutil, "which", lambda _: "/usr/local/bin/claude")
     r = runners.select_runner("auto")
     assert isinstance(r, runners.ClaudeCLIRunner)
@@ -295,7 +392,13 @@ class DivRunner(FakeRunner):
 
     def run(self, prompt, context, schema):
         if "Division Scientist" in prompt.splitlines()[0]:
-            div = "clinical_officers" if "clinical" in context else "target_id_and_prioritization"
+            # label the finding by the division named in the context (the harness puts
+            # "Your division: <name>" at the top of each scientist's context).
+            div = "target_id_and_prioritization"
+            for d in ("clinical_officers", "target_safety", "target_id_and_prioritization"):
+                if d in context:
+                    div = d
+                    break
             return {"division": div, "interpretation": f"{div} interp [step_01]",
                     "confidence": "medium", "caveats": ["c"], "evidence_grade": "supporting"}
         return super().run(prompt, context, schema)
@@ -305,9 +408,11 @@ def test_division_scientists_run_and_interpret(monkeypatch, tmp_path):
     out = _run(monkeypatch, DivRunner("synthesize"), tmp_path)
     data = json.loads(Path(out["result"]).read_text())["data"]
     findings = data["division_findings"]
-    # plan has target_id (germline) + clinical → two division scientist agents
+    # full plan spans target_id (germline+specificity), target_safety, clinical →
+    # one division scientist agent per distinct division.
     divisions = sorted(f["division"] for f in findings)
-    assert divisions == ["clinical_officers", "target_id_and_prioritization"], findings
+    assert divisions == ["clinical_officers", "target_id_and_prioritization",
+                         "target_safety"], findings
     assert all(f["source"] == harness.AGENT_SOURCE for f in findings)
     assert all(f["evidence_grade"] == "supporting" for f in findings)
     # each scientist is its own trace span
