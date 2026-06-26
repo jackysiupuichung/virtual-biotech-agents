@@ -1,94 +1,189 @@
-# virtual-biotech-agents
+<div align="center">
 
-**Replicating "The Virtual Biotech" as composable ClawBio skills — built for the ClawBio Hackathon: Agentic Genomics @ King's (18 Jun 2026).**
+<img src="docs/assets/hero.png" alt="Virtual Biotech CSO — evidence graph over a protein target" width="100%" />
 
-This repo reconstructs the multi-agent therapeutic-discovery framework from the bioRxiv preprint **"The Virtual Biotech: A Multi-Agent AI Framework for Therapeutic Discovery and Development"** (Harrison G. Zhang, Peter Eckmann, Jiacheng Miao, Andrew B. Mahon & James Zou, Stanford / PHD Biosciences, 2026 — [doi:10.64898/2026.02.23.707551](https://www.biorxiv.org/content/10.64898/2026.02.23.707551v1)) on top of the **[ClawBio](https://github.com/ClawBio/ClawBio)** skill platform.
+# 🧬 Virtual Biotech CSO
 
-The paper's system is a "virtual R&D org": a **virtual CSO** breaks queries into sub-tasks, routes them to specialized scientist agents, and a **scientific reviewer** audits results before synthesis. ClawBio mirrors this with the same separation the paper relies on — a **routing layer** (the LLM/CSO) over a **validated, reproducible execution layer** (peer-reviewable skills, each exporting `commands.sh` + `environment.yml` + SHA-256 checksums). So we don't rebuild the stack; we map the org onto ClawBio's ~128 existing skills and contribute the two capabilities that are missing — a single-cell specificity primitive and the CSO orchestration skill itself — as upstream PRs.
+### A multi-agent AI that nominates drug targets — and *shows its work*
 
----
+**[Multiagents Hackathon](https://multiagents-hackathon.devpost.com/) · Tessl AI · London · 26 Jun 2026**
 
-## The framework (precise architecture from the paper)
+[![Reasoning: Prometheux](https://img.shields.io/badge/reasoning-Prometheux%20Vadalog-fbbf24)](https://prometheux.ai)
+[![Search: Tavily](https://img.shields.io/badge/search-Tavily-38bdf8)](https://tavily.com)
+[![Built on ClawBio](https://img.shields.io/badge/built%20on-ClawBio-34d399)](https://github.com/ClawBio/ClawBio)
+[![Paper](https://img.shields.io/badge/paper-The%20Virtual%20Biotech%20(bioRxiv)-94a3b8)](https://www.biorxiv.org/content/10.64898/2026.02.23.707551v1)
 
-**4 scientific divisions · 11 agents · 100+ MCP tools**, spanning 78,726 targets, 39,530 diseases, 14.5M protein–protein interactions, 3M+ genetic credible sets, 100M+ single-cell profiles, 18,119 drugs, and 4B+ drug-perturbation expression measurements (Tahoe-100M).
-
-**Office of the CSO** — `CSO Orchestrator` (plans, routes, synthesizes; runs no analysis itself), `Chief of Staff` (field-awareness briefing via web + infra review), `Scientific Reviewer` (audits methodology/evidence/thoroughness; triggers re-routing).
-
-**Divisions & scientist agents:**
-| Division | Agents | MCP data sources |
-|---|---|---|
-| **Target ID & Prioritization** | Statistical Genetics, Functional Genomics & Perturbation, Single Cell Atlas | GWAS, QTL, gnomAD, ClinVar, dbSNP, pLOF rare variants, PharmGKB; DepMap CRISPR, Tahoe-100M; CELLxGENE Census, Tabula Sapiens v2 |
-| **Target Safety** | Bio Pathways & PPI, FDA Safety Officer, Single Cell Atlas | IntAct, Reactome, STRING, SignaLink, GO; OpenFDA, DailyMed; GTEx v8 |
-| **Modality Selection** | Target Biologist, Pharmacologist | Human Protein Atlas, Tractability by Modality, Chemical Probes, Mouse KO phenotypes; ChEMBL, Drug Molecular Targets |
-| **Clinical Officers** | Clinical Trialist, FDA Safety Officer | ClinicalTrials.gov, PubMed; OpenFDA AE reports; cBioPortal (TCGA) |
-
-**Workflow:** query → CSO clarifies intent + Chief-of-Staff briefing (parallel) → task decomposition & routing → scientist analyses → Scientific Reviewer audit → re-route to fill gaps *or* synthesize report + reproducible codebase.
-
-**Headline result we anchor on:** by curating 55,984 trials (37,075 parallel clinical-trialist agents using a 3-tier ClinicalTrials.gov → PubMed → press-release cascade), the system found **single-cell features of drug targets predict trial success** — cell-type-specific targets were **40% more likely** to progress Phase I→II, **48% more likely** to reach Phase IV, with **32% lower** adverse-event rates. Case studies: **B7-H3** lung-cancer ADC and a terminated **OSMRβ** ulcerative-colitis trial.
+</div>
 
 ---
 
-## How this maps onto ClawBio (assembly, not new code)
+## The pitch (60 seconds)
 
-| Paper agent | Existing ClawBio skill(s) |
+Picking a drug target is the most expensive guess in biotech — **90% of clinical programs fail**, most because the target was wrong. The Stanford "[Virtual Biotech](https://www.biorxiv.org/content/10.64898/2026.02.23.707551v1)" paper showed a multi-agent AI org can do this work at scale, and found a striking signal: **single-cell-specific targets are 40% more likely to clear Phase I→II and carry 32% lower adverse-event rates.**
+
+We turn that paper into a **real, running multi-agent system** — and we add the one thing a scientist actually needs to trust an AI verdict: **provenance**. The GO / NO-GO is *not* generated by an LLM. It is **derived deductively** from cited evidence by a **Prometheux Vadalog** engine, with a replayable reasoning chain behind every conclusion.
+
+> **A virtual R&D org as code:** a CSO orchestrator plans and routes, four scientist divisions run real bioinformatics over live public databases, a reviewer panel audits and *forces re-work*, and a reasoning engine turns the cited evidence into an explainable verdict. Runs fully offline with `--demo`; goes live with real models + databases on a flag.
+
+### Why it fits the brief — *"build something real with multi-agent systems"*
+
+| Judging criterion | How this project answers it |
 |---|---|
-| CSO orchestration | `bio-orchestrator` + our `virtual-biotech-cso` skill |
-| Statistical Genetics | `gwas-lookup`, `fine-mapping`, `mendelian-randomisation`, `gwas-catalog-region-fetch`, `eqtl-catalogue-region-fetch` |
-| Single Cell Atlas | `scrna-embedding`, `scrna-orchestrator` |
-| Functional Genomics & Perturbation | `drug-repurposing-screen`, `crispr-screen-triage` |
-| Bio Pathways & PPI | `pathway-enricher`, `turingdb-graph` |
-| Target Biologist / Pharmacologist | `omics-target-evidence-mapper`, `target-validation-scorer`, `struct-predictor` |
-| FDA Safety / Clinical Trialist | `clinical-trial-finder`, `clinpgx` |
-| HEIM / equity (Track 3) | `equity-scorer`, `claw-ancestry-pca` |
+| **Meaningful problem** | Target selection is the costliest guess in biotech (90% clinical failure); we operationalise a peer-reviewed result that predicts trial success. |
+| **Technical implementation** | A true agent org — orchestrator + 4 scientist divisions + a voting reviewer panel + a deductive gap-detector — with a re-route control loop, not a single prompt chain. |
+| **Effective tool use** | **Prometheux** derives the verdict; **Tavily** powers live literature search; agents call real databases (Open Targets, CELLxGENE, TCGA, DepMap, openFDA, ClinicalTrials.gov). |
+| **Agent autonomy on real-time data** | The reviewer panel autonomously detects missing evidence and re-routes the org to fetch it — no human in the loop. |
+| **Demo quality** | One command reproduces a full verdict bit-for-bit, offline; a live mode swaps in real models + databases. |
+
+> 🎯 **Targeting the Prometheux Intelligence Prize:** the entire verdict layer is a **Vadalog program** ([`prometheux_reason.py`](skills/virtual-biotech-cso/prometheux_reason.py)) — recursive rules, `@model`/`@explain` annotations, and a non-silenceable structural gap-detector that turns "a prioritization axis is missing" into a *deductive fact* that forces agent re-work. Tavily (lit search) and ClawBio (skill runtime) round out the sponsor stack.
 
 ---
 
-## ⭐ Primary deliverable: the `virtual-biotech-cso` ClawBio skill (Track 2)
+## 🗺️ How it works
 
-Our submission reproduces the paper's **orchestration** as a first-class ClawBio skill — [`skills/virtual-biotech-cso/`](skills/virtual-biotech-cso/) — submitted upstream as PR #2. It sits **below** `bio-orchestrator` (which routes target-assessment queries to it) and runs the paper's loop over the existing ClawBio skills:
+![Virtual Biotech CSO architecture](docs/assets/architecture.svg)
 
-- **Chief of Staff** ([`prompts/chief_of_staff.md`](skills/virtual-biotech-cso/prompts/chief_of_staff.md)) — before any expensive analysis, a briefing: field context, data availability, and the sub-questions worth prioritizing.
-- **Scientific Reviewer** ([`prompts/reviewer.md`](skills/virtual-biotech-cso/prompts/reviewer.md)) — after the scientist skills run, audits the outputs (does it answer the query? is the evidence strong? is it thorough?) and either **re-routes once** to fill a gap or clears the CSO to synthesize.
+The system has three layers, top to bottom in the diagram:
 
-**Keyless, ClawBio-aligned:** the skill makes **no LLM call itself** — like `lit-synthesizer`, it is deterministic routing + report assembly. The three reasoning roles are delegated to the *driving agent* (e.g. Claude Code subagents) via [`prompts/`](skills/virtual-biotech-cso/prompts/) and surfaced as an `agent_tasks` list in `result.json`. No API key required.
+1. **Agentic reasoning loop** — `query → Chief-of-Staff briefing → CSO decomposes & routes → four scientist divisions → Scientific Reviewer panel → (re-route to fill gaps) → CSO synthesis → GO/NO-GO`. The reviewer can **force exactly one re-route** when a prioritization axis is missing — that loop is the gold dashed arc.
+2. **Expert tools over real databases** — each division calls deterministic **ClawBio** skills (Open Targets, CELLxGENE Census, TCGA/GDC, DepMap, GWAS Catalog, openFDA/FAERS, ClinicalTrials.gov, Tavily). Nothing in a verdict is ungrounded.
+3. **Verifiable reasoning store** — a canonical **knowledge graph** of cited edges → a **Prometheux Vadalog** engine that *derives* the verdict tier with `@explain` rule chains → an **execution trace** (`trace.jsonl`, optional Langfuse mirror) so the whole run replays.
 
-```text
-query → Chief-of-Staff briefing
-      → CSO decomposes & routes → ClawBio skills (via routing.yaml)
-      → Scientific Reviewer audit ──gap?──> re-route (once)
-                                  └─ok──> synthesize report.md + result.json + reproducible bundle
+---
+
+## 🤖 The multi-agent framework, demonstrated
+
+This is the heart of the submission. Run it and watch the org work — fully offline, no keys:
+
+```bash
+python skills/virtual-biotech-cso/harness.py --demo
+#  or:  clawbio run virtual-biotech-cso --demo
 ```
 
-**Scoped to one case study** (B7-H3 lung cancer — 6 routed steps + a reviewer re-route). `clawbio run virtual-biotech-cso --demo` runs **fully offline** from cached, clearly-labelled fixtures; `--live` executes the routed skills through the ClawBio runtime. See [workflows/b7h3_adc_nomination.md](workflows/b7h3_adc_nomination.md).
+You'll see the agent roles execute and the re-route loop fire, e.g.:
+
+```text
+📋  Chief of Staff: briefing on "Assess B7-H3 in lung cancer"  (field context · data availability)
+🧭  CSO: decomposed into 6 sub-tasks → routed across 4 divisions
+     ├─ Target ID & Prioritization   → cellxgene-fetch · celltype-specificity-profiler · tcga-somatic-profiler
+     ├─ Target Safety                → opentargets-target-factors · openfda-safety
+     ├─ Modality & Tractability      → struct-predictor · omics-target-evidence-mapper
+     └─ Clinical & Literature        → clinical-trial-finder · lit-synthesizer
+🔬  scientist:target_id … writes cited edges → knowledge graph (kg.json)
+👥  reviewer panel: 2/4 lenses vote re-route  (gap: malignant-cell localisation absent)
+🟡  re-route → malignant-expression-profiler  (one pass, then synthesize)
+🧠  prometheux: derive GO/NO-GO  →  TIER = SUPPORTED  (@explain: τ-specific ∧ tumour-localised ∧ trial-active)
+✅  reviewer verdict: synthesize
+📝  report.md · result.json · trace.jsonl  written to ./output
+```
+
+**Why this is genuinely multi-agent — not one prompt in a trench coat:**
+
+| Role | What it does | Where it lives |
+|---|---|---|
+| **CSO Orchestrator** | Clarifies intent, decomposes the query, routes sub-tasks, synthesizes. *Runs no analysis itself.* | [`cso.py`](skills/virtual-biotech-cso/cso.py) · [`prompts/orchestrator.md`](skills/virtual-biotech-cso/prompts/orchestrator.md) |
+| **Chief of Staff** | A pre-analysis briefing: field context + data availability, so effort goes where it counts. | [`prompts/chief_of_staff.md`](skills/virtual-biotech-cso/prompts/chief_of_staff.md) |
+| **Scientist divisions** (×4) | Each calls real ClawBio skills over public databases and records **cited edges**. | [`routing.yaml`](skills/virtual-biotech-cso/routing.yaml) |
+| **Scientific Reviewer panel** | Multiple lenses (completeness · methodology · …) vote; a majority **forces a re-route**. | [`prompts/reviewer.md`](skills/virtual-biotech-cso/prompts/reviewer.md) · [`harness.py`](skills/virtual-biotech-cso/harness.py) |
+| **Prometheux gap-detector** | A *non-silenceable* panel member: a provably-missing axis is a deductive fact, so it forces re-work on its own. | [`prometheux_reason.py`](skills/virtual-biotech-cso/prometheux_reason.py) |
+
+Two execution modes, **identical output shape**:
+
+```bash
+# OFFLINE / reproducible — cached fixtures, in-process reasoner, no LLM, no keys
+python skills/virtual-biotech-cso/harness.py --demo
+
+# LIVE — real LLM agents (Anthropic→OpenAI→Gemini→Claude CLI) + live ClawBio skills + Prometheux
+python skills/virtual-biotech-cso/harness.py --live --backend auto \
+       --query "Assess KRAS G12C in colorectal cancer"
+```
+
+`--demo` exists so a judge can reproduce a verdict bit-for-bit with zero setup; `--live` is the same loop with the real backends swapped in.
 
 ---
 
-## 🎯 Supporting contribution (also the upstream PR): `celltype-specificity-profiler`
+## 🧱 The framework (architecture from the paper)
 
-The workflow needs a skill that doesn't exist yet — so building it is both the missing link in the chain **and** a clean PR to ClawBio.
+**4 scientific divisions · 11 agents · 100+ data tools**, spanning 78,726 targets, 39,530 diseases, 14.5M protein–protein interactions, 100M+ single-cell profiles, and 4B+ drug-perturbation measurements (Tahoe-100M).
 
-**Gap (verified against all 128 catalog skills):** `scrna-embedding` and `omics-target-evidence-mapper` exist, but **none compute per-gene cell-type specificity metrics** — the tau index and expression-distribution shape that the paper shows predict trial outcomes. We contribute that as a **general, reusable primitive**, with the paper's trial-success scoring behind an optional flag (so the skill isn't locked to one preprint's coefficients).
+| Division | Scientist agents | Data sources |
+|---|---|---|
+| **Target ID & Prioritization** | Statistical Genetics, Functional Genomics, Single-Cell Atlas | GWAS, QTL, gnomAD, ClinVar, DepMap CRISPR, CELLxGENE Census, Tahoe-100M |
+| **Target Safety** | Bio Pathways & PPI, FDA Safety Officer, Single-Cell Atlas | IntAct, Reactome, STRING, GO, openFDA/FAERS, GTEx |
+| **Modality Selection** | Target Biologist, Pharmacologist | Human Protein Atlas, Tractability, ChEMBL, Mouse-KO |
+| **Clinical Officers** | Clinical Trialist, FDA Safety Officer | ClinicalTrials.gov, PubMed, cBioPortal (TCGA) |
 
-**`skills/celltype-specificity-profiler/`** — see its [README](skills/celltype-specificity-profiler/README.md).
-- **Input:** a gene symbol (+ optional tissue/atlas).
-- **Core output (general):** tau cell-type specificity index (0 = ubiquitous → 1 = single-cell-type restricted), **bimodality coefficient** (skewness/kurtosis "on/off" signal — the paper's novel cross-domain transfer from psychometrics, ρ≈0.54 with tau), ranked expressing cell types, per-cell-type expression stats. Clean JSON/CSV.
-- **Optional `--trial-prior`:** maps the two features to the paper's published odds ratios for phase-progression / endpoint-success / AE-risk (clearly labeled *Zhang et al. 2026*).
-- **Chains:** `omics-target-evidence-mapper` → `celltype-specificity-profiler` → `target-validation-scorer` → `clinical-trial-finder`.
-- **Demo:** `clawbio run celltype-specificity-profiler --demo` runs on a bundled real dataset (scanpy `pbmc3k`, gene MS4A1), fully offline. **Open as [ClawBio#307](https://github.com/ClawBio/ClawBio/pull/307).**
-
-Contribution contract (per ClawBio `templates/SKILL-TEMPLATE.md`): `SKILL.md` spec (loud triggers, workflow, ≥3 stress-tested gotchas, citations), Python implementation, `demo_data/`, `tests/`, and a `reproducibility/` bundle.
-
-> **Stretch PR:** a `target-perturbation-hallmark` skill scoring the paper's six Tahoe-100M hallmark signatures (apoptosis, proliferation suppression, cell-cycle arrest, DNA-damage response, stress, resistance) for oncology targets — also absent from the catalog.
+**Office of the CSO** — `CSO Orchestrator` (plans/routes/synthesizes), `Chief of Staff` (briefing), `Scientific Reviewer` (audits, triggers re-routing).
 
 ---
 
-## 🛠️ Hackathon tracks
+## ⭐ What we built
 
-**Submitting under Track 2 (Agentic Workflows)**, with the Track 1 skill as the enabling contribution.
+The org is assembled on the **ClawBio** skill platform — we reuse its ~128 existing bioinformatics skills as the scientist agents' tools, and contribute the two pieces the workflow needed (both also clean upstream PRs):
 
-2. **Track 2 — Agentic workflow (primary):** the `virtual-biotech-cso` skill above — Chief-of-Staff briefing → routing over ClawBio skills → Scientific-Reviewer audit loop → synthesis — reproducing the B7-H3 ADC nomination (PR #2).
-1. **Track 1 — New skill (supporting):** `celltype-specificity-profiler`, the missing single-cell primitive the workflow depends on, submitted upstream as [ClawBio#307](https://github.com/ClawBio/ClawBio/pull/307).
-3. **Track 3 — Equity (HEIM, stretch):** have the reviewer call `equity-scorer` so each target assessment also reports cross-population coverage of the single-cell/GWAS references used (the paper's atlases skew to specific ancestries).
+### 1. `virtual-biotech-cso` — the multi-agent orchestrator
+The paper's loop as a first-class, **keyless** ClawBio skill ([`skills/virtual-biotech-cso/`](skills/virtual-biotech-cso/)). The skill itself makes **no LLM call** — it's deterministic routing + report assembly; the reasoning roles are delegated to the *driving agent* via [`prompts/`](skills/virtual-biotech-cso/prompts/), and the verdict is derived by the Prometheux engine. Demonstrated on the **B7-H3 lung-cancer ADC** case study ([workflows/b7h3_adc_nomination.md](workflows/b7h3_adc_nomination.md)).
+
+### 2. `celltype-specificity-profiler` — the missing single-cell primitive
+**Verified gap:** none of the 128 catalog skills compute per-gene cell-type specificity — the very signal the paper shows predicts trial success. We add it ([README](skills/celltype-specificity-profiler/README.md)):
+- **τ specificity index** (0 = ubiquitous → 1 = single-cell-type restricted)
+- **bimodality coefficient** — the paper's cross-domain transfer from psychometrics (ρ≈0.54 with τ)
+- Optional `--trial-prior` maps both features to the paper's published odds ratios (labeled *Zhang et al. 2026*)
+- `clawbio run celltype-specificity-profiler --demo` runs offline on bundled real data (scanpy `pbmc3k`, gene MS4A1).
+
+> **Stretch:** the reviewer can call `equity-scorer` so each assessment reports cross-population coverage of its single-cell / GWAS references — the paper's atlases skew to specific ancestries.
+
+---
+
+## 🧰 Sponsor tools
+
+Every integration is **optional and degrades to an offline, reproducible path** — the workflow always runs with no keys. Set vars in `.env` (copy [`.env.example`](.env.example)) to go live.
+
+| Sponsor tool | Powers | Live trigger | Offline fallback |
+|---|---|---|---|
+| **ClawBio** | Skill platform + runtime | `clawbio run <skill>` / `--live` | `--demo` cached fixtures |
+| **Prometheux** (Vadalog) | Explainable verdict + reviewer gap-detector | `PMTX_TOKEN` + `JARVISPY_URL` | In-process Datalog (same result shape) |
+| **Langfuse** | Hosted nested trace of the loop | `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` | local `trace.jsonl` |
+| **Tavily** | Live web search (`lit-synthesizer`) | `TAVILY_API_KEY` | cached `--demo` response |
+
+<details>
+<summary><b>Setup details for each</b></summary>
+
+**ClawBio** — `pip install clawbio` (or `/plugin install clawbio` in Claude Code). `--backend auto` picks the first available LLM: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY`/`GOOGLE_API_KEY` → Claude Code CLI (no key).
+
+**Prometheux** — powers `differentiates`/`co_niche`/`strong_claim` reasoning and the reviewer's structural gap-detector ([`prometheux_reason.py`](skills/virtual-biotech-cso/prometheux_reason.py)).
+```bash
+PMTX_TOKEN=<token>
+JARVISPY_URL=https://api.prometheux.ai/jarvispy/{org}/{username}   # org/user from token JWT
+```
+Both vars required for the live path (SDK defaults to `localhost:8000`), plus an **active compute machine** (Prometheux app → Compute Management) or calls return `NO_ACTIVE_COMPUTE`. Unset → the in-process reasoner runs the identical rule set, no network.
+
+**Langfuse** — `pip install 'langfuse>=4.0'` then set `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (`LANGFUSE_HOST` for self-hosted). Mirrors the full span tree to a hosted trace; the local `trace.jsonl` is always the source of truth.
+
+**Tavily** — set `TAVILY_API_KEY` for live three-angle web search in `lit-synthesizer`; every result carries its source URL. `--demo` needs no key or network.
+
+</details>
+
+---
+
+## 🚀 Quick start
+
+```bash
+# 1. Install the platform (~128 skills + runtime)
+pip install clawbio            # or: /plugin install clawbio  (Claude Code)
+
+# 2. The headline demo — full multi-agent loop, fully offline
+clawbio run virtual-biotech-cso --demo
+#   → briefing → routed scientist chain → reviewer re-route → Prometheux verdict
+#   → report.md · result.json · trace.jsonl
+
+# 3. The new single-cell primitive on bundled real data
+clawbio run celltype-specificity-profiler --demo
+
+# 4. Drive the loop directly + go live
+python skills/virtual-biotech-cso/harness.py --live --backend auto \
+       --query "Assess <target> in <disease>"
+```
 
 ---
 
@@ -96,49 +191,29 @@ Contribution contract (per ClawBio `templates/SKILL-TEMPLATE.md`): `SKILL.md` sp
 
 ```text
 ├── skills/
-│   ├── celltype-specificity-profiler/  # NEW skill — PR #1 (ClawBio#307)
-│   │   ├── SKILL.md                    # ClawBio spec: triggers, workflow, gotchas, citations
-│   │   ├── README.md                   # Human-facing overview
-│   │   ├── profiler.py                 # tau + bimodality; optional --trial-prior
-│   │   └── tests/
-│   └── virtual-biotech-cso/            # NEW orchestration skill — PR #2
-│       ├── SKILL.md                    # ClawBio spec
-│       ├── cso.py                      # the loop: brief → route → reviewer → synthesize (no LLM call)
-│       ├── routing.yaml                # query intent → ClawBio skill map
-│       ├── prompts/                    # chief_of_staff / reviewer / orchestrator (run by the driving agent)
-│       ├── demo_data/b7h3/             # cached, offline B7-H3 fixtures
-│       └── tests/
-├── workflows/
-│   └── b7h3_adc_nomination.md          # Case study: B7-H3 lung-cancer ADC nomination
-├── data/                               # Sample configs & schemas
-└── README.md
+│   ├── virtual-biotech-cso/            # PRIMARY — the orchestration skill (PR #2)
+│   │   ├── cso.py / harness.py         # the loop: brief → route → reviewer → synthesize
+│   │   ├── routing.yaml                # query intent → ClawBio skill map
+│   │   ├── prompts/                    # chief_of_staff · reviewer · orchestrator
+│   │   ├── prometheux_reason.py        # Vadalog reasoning + gap-detector
+│   │   ├── tracing.py                  # trace.jsonl (+ optional Langfuse)
+│   │   └── demo_data/b7h3/             # cached, offline B7-H3 fixtures
+│   ├── celltype-specificity-profiler/  # SUPPORTING — the missing primitive (ClawBio#307)
+│   └── …                               # cellxgene-fetch · openfda-safety · lit-synthesizer · …
+├── frontend/                           # interactive UI + system schematic
+├── docs/                               # design notes, evidence-gap analysis, applicability reviews
+├── workflows/b7h3_adc_nomination.md    # the case study walkthrough
+└── data/
 ```
-
-> Layout mirrors ClawBio's `skills/<name>/SKILL.md` convention so each skill lifts directly into a ClawBio fork for its PR.
 
 ---
 
-## 🚀 Getting started
+## 📚 References
 
-```bash
-# 1. Install ClawBio (provides ~128 existing skills + runtime)
-pip install clawbio            # or: /plugin install clawbio  (Claude Code)
+- **Hackathon:** [Multiagents Hackathon](https://multiagents-hackathon.devpost.com/) — Tessl AI, London, 26 Jun 2026 · sponsors: Google DeepMind · ClickHouse · Gensyn · **Prometheux** · **Tavily** · Cursor · ElevenLabs · Twilio · Senso
+- **Paper:** [The Virtual Biotech (bioRxiv)](https://www.biorxiv.org/content/10.64898/2026.02.23.707551v1) — Zhang, Eckmann, Miao, Mahon & Zou, Stanford / PHD Biosciences, 2026 · mirror [PMC12970349](https://pmc.ncbi.nlm.nih.gov/articles/PMC12970349/)
+- **Platform:** [ClawBio](https://github.com/ClawBio/ClawBio) · [clawbio.ai](https://clawbio.ai/)
+- **Sponsor tools:** [Prometheux](https://prometheux.ai) (Vadalog reasoning) · [Tavily](https://tavily.com) (search)
+- **Methods/data:** Tabula Sapiens v2 · CELLxGENE Census · Tahoe-100M · Open Targets · ClinicalTrials.gov · τ specificity index · bimodality coefficient
 
-# 2. Sanity-check an existing domain skill
-clawbio run omics-target-evidence-mapper --demo
-
-# 3. Run the new skill on demo data
-clawbio run celltype-specificity-profiler --demo
-
-# 4. Run the full Virtual-Biotech CSO skill (primary deliverable) — offline demo
-clawbio run virtual-biotech-cso --demo
-# → briefing → routed skill chain → Reviewer re-route → synthesized report.md + result.json
-```
-
-## References & links
-
-- Paper: [The Virtual Biotech (bioRxiv)](https://www.biorxiv.org/content/10.64898/2026.02.23.707551v1) · open-access mirror: [PMC12970349](https://pmc.ncbi.nlm.nih.gov/articles/PMC12970349/)
-- Platform: [ClawBio on GitHub](https://github.com/ClawBio/ClawBio) · [clawbio.ai](https://clawbio.ai/) · [hackathon](https://dorahacks.io/hackathon/clawbio/detail)
-- Context: Manuel Corpas — [Agentic Genomics](https://manuelcorpas.com/2026/03/09/agentic-genomics-why-the-future-of-biology-belongs-to-ai-agents/)
-- Key methods/data: Tabula Sapiens v2, CELLxGENE Census, Tahoe-100M, Open Targets, ClinicalTrials.gov, tau specificity index, bimodality coefficient
-```
+<div align="center"><sub>ClawBio is a research and educational tool — not a medical device.</sub></div>
