@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Virtual Biotech CSO — system schematic · automatic target ID & validation</title>
+<meta name="description" content="Schematic of an AI system for automatic therapeutic-target identification and validation: an agentic reasoning loop, expert tool-calling over real biomedical databases, in-silico + experimental validation, and a verifiable reasoning store (canonical knowledge graph + Vadalog reasoning + traced provenance)." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --navy-900:#0a0e1a; --navy-850:#0c1322; --navy-800:#0f1729; --navy-700:#16203a;
+    --line:#1e293b; --ink:#e2e8f0; --ink-dim:#94a3b8; --ink-faint:#64748b;
+    --strong:#34d399; --supported:#38bdf8; --suggestive:#fbbf24; --absent:#475569; --no-go:#fb7185;
+    --display:'Space Grotesk',system-ui,sans-serif; --body:'Inter',system-ui,sans-serif; --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--navy-900); color:var(--ink); font-family:var(--body); -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1240px; margin:0 auto; padding:0 28px; }
+  a { color:inherit; text-decoration:none; }
+
+  /* header */
+  header.bar { border-bottom:1px solid var(--line); background:color-mix(in srgb,var(--navy-900) 86%,transparent); position:sticky; top:0; z-index:10; backdrop-filter:blur(10px); }
+  .bar-in { display:flex; align-items:center; gap:13px; height:60px; }
+  .bar-in img { width:28px; height:28px; border-radius:7px; }
+  .bar-in .t { font-family:var(--display); font-weight:600; font-size:0.95rem; }
+  .bar-in .t small { display:block; font-family:var(--mono); font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--ink-faint); }
+  .bar-in .back { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink-dim); }
+  .bar-in .back:hover { color:var(--ink); }
+
+  /* title block */
+  .head { padding:54px 0 30px; }
+  .kicker { font-family:var(--mono); font-size:12px; letter-spacing:0.14em; text-transform:uppercase; color:var(--ink-faint); display:inline-flex; align-items:center; gap:8px; }
+  .kicker::before { content:""; width:18px; height:1px; background:currentColor; opacity:.7; }
+  .head h1 { font-family:var(--display); font-weight:600; font-size:clamp(1.9rem,4vw,3rem); letter-spacing:-0.02em; line-height:1.08; margin:16px 0 0; max-width:880px; }
+  .head h1 .hl { color:var(--strong); }
+  .head p { color:var(--ink-dim); font-size:1.05rem; line-height:1.6; max-width:760px; margin:18px 0 0; }
+
+  /* the diagram frame */
+  .diagram { border:1px solid var(--line); border-radius:16px; overflow:hidden; background:
+      radial-gradient(120% 90% at 80% -10%, color-mix(in srgb,var(--supported) 7%, transparent), transparent 55%),
+      var(--navy-850); box-shadow:0 50px 120px -50px #000; margin:8px 0 40px; }
+  .diagram svg { display:block; width:100%; height:auto; }
+
+  /* legend below */
+  .layers { display:grid; grid-template-columns:repeat(3,1fr); gap:18px; margin-bottom:60px; }
+  .layer { border:1px solid var(--line); border-radius:13px; background:var(--navy-850); padding:24px 22px 26px; border-top:3px solid; }
+  .layer.l1 { border-top-color:var(--strong); }
+  .layer.l2 { border-top-color:var(--supported); }
+  .layer.l3 { border-top-color:var(--suggestive); }
+  .layer h3 { font-family:var(--display); font-weight:600; font-size:1.08rem; margin:6px 0 4px; }
+  .layer .tag { font-family:var(--mono); font-size:10.5px; letter-spacing:0.1em; text-transform:uppercase; color:var(--ink-faint); }
+  .layer p { font-size:0.9rem; color:var(--ink-dim); line-height:1.55; margin:12px 0 0; }
+  .layer ul { margin:14px 0 0; padding:0; list-style:none; display:grid; gap:7px; }
+  .layer li { font-size:0.82rem; color:var(--ink-dim); display:flex; gap:9px; align-items:baseline; }
+  .layer li code { font-family:var(--mono); font-size:0.76rem; color:var(--ink); background:var(--navy-700); padding:1px 6px; border-radius:4px; }
+  .layer li b { color:var(--ink); font-weight:600; }
+  .layer li::before { content:"▸"; color:var(--ink-faint); flex:none; }
+  @media (max-width:920px) { .layers { grid-template-columns:1fr; } }
+
+  footer { border-top:1px solid var(--line); padding:30px 0 50px; font-family:var(--mono); font-size:11px; color:var(--ink-faint); display:flex; justify-content:space-between; gap:14px; flex-wrap:wrap; }
+  :focus-visible { outline:2px solid var(--supported); outline-offset:3px; }
+
+  /* svg text helpers via classes */
+  .svg-disp { font-family:'Space Grotesk',sans-serif; }
+  .svg-mono { font-family:'JetBrains Mono',monospace; }
+  .svg-body { font-family:'Inter',sans-serif; }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap bar-in">
+    <img src="/assets/logo-mark.png" alt="" />
+    <span class="t">Virtual Biotech CSO<small>System Schematic</small></span>
+    <a class="back" href="/">← back to overview</a>
+  </div>
+</header>
+
+<div class="wrap head">
+  <span class="kicker">System architecture · automatic target identification & validation</span>
+  <h1>An agentic AI system that <span class="hl">identifies, researches, and validates</span> therapeutic targets — and can prove every step.</h1>
+  <p>A chief-of-staff agent decomposes a target question, routes it across specialist divisions that
+    call expert tools against real biomedical databases, validates the signal in silico and against
+    experimental & clinical evidence, audits itself, and synthesizes a graded GO / NO-GO call — with
+    every claim recorded as a verifiable, replayable reasoning chain.</p>
+</div>
+
+<!-- ============================== THE DIAGRAM ============================== -->
+<div class="wrap">
+<div class="diagram">
+<svg viewBox="0 0 1180 600" role="img" aria-label="Horizontal flow of the Virtual Biotech CSO target identification and validation loop, with a re-route loop from the Scientific Reviewer back to the orchestrator">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9" fill="none" stroke="#64748b" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrLoop" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9" fill="none" stroke="#fbbf24" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { fill:#e2e8f0; }
+      .disp  { font-family:'Space Grotesk',sans-serif; font-weight:600; }
+      .body  { font-family:'Inter',sans-serif; }
+      .mono  { font-family:'JetBrains Mono',monospace; }
+      .dim   { fill:#94a3b8; }
+      .faint { fill:#64748b; }
+      .node  { fill:#0f1729; stroke:#243049; stroke-width:1.2; }
+      .flow  { fill:none; stroke:#64748b; stroke-width:1.5; }
+    </style>
+  </defs>
+
+  <!-- ================= MAIN HORIZONTAL FLOW (y ≈ 150) ================= -->
+
+  <!-- Input query -->
+  <rect class="node" x="34" y="116" width="118" height="74" rx="11"/>
+  <text x="93" y="142" class="mono faint" font-size="9.5" text-anchor="middle">INPUT QUERY</text>
+  <text x="93" y="162" class="body" font-size="10.5" text-anchor="middle">“Assess B7-H3</text>
+  <text x="93" y="176" class="body" font-size="10.5" text-anchor="middle">in lung cancer”</text>
+
+  <line class="flow" x1="152" y1="153" x2="196" y2="153" marker-end="url(#arr)"/>
+
+  <!-- CSO orchestrator (entry) -->
+  <rect class="node" x="198" y="118" width="120" height="70" rx="11" stroke="#34d399" stroke-opacity="0.5"/>
+  <circle cx="228" cy="143" r="9" fill="none" stroke="#34d399" stroke-width="1.4"/>
+  <circle cx="228" cy="143" r="3" fill="#34d399"/>
+  <text x="246" y="139" class="disp" font-size="12.5">CSO</text>
+  <text x="246" y="153" class="dim body" font-size="8.5">orchestrator</text>
+  <text x="258" y="178" class="faint mono" font-size="8" text-anchor="middle">clarify · plan · route</text>
+
+  <!-- Chief of Staff (above) + planning (below), light side roles -->
+  <line class="flow" x1="318" y1="140" x2="360" y2="96"  marker-end="url(#arr)"/>
+  <line class="flow" x1="318" y1="166" x2="360" y2="210" marker-end="url(#arr)"/>
+  <rect class="node" x="362" y="70" width="150" height="50" rx="10"/>
+  <text x="437" y="90"  class="disp" font-size="11" text-anchor="middle">Chief of Staff</text>
+  <text x="437" y="106" class="faint body" font-size="8.5" text-anchor="middle">intelligence scouting · briefing</text>
+  <rect class="node" x="362" y="186" width="150" height="50" rx="10"/>
+  <text x="437" y="206" class="disp" font-size="11" text-anchor="middle">Planning</text>
+  <text x="437" y="222" class="faint body" font-size="8.5" text-anchor="middle">decompose · scientist routing</text>
+
+  <!-- back into CSO router -->
+  <line class="flow" x1="512" y1="96"  x2="556" y2="140" marker-end="url(#arr)"/>
+  <line class="flow" x1="512" y1="210" x2="556" y2="166" marker-end="url(#arr)"/>
+  <rect class="node" x="558" y="124" width="58" height="58" rx="11" stroke="#34d399" stroke-opacity="0.5"/>
+  <circle cx="587" cy="148" r="9" fill="none" stroke="#34d399" stroke-width="1.4"/>
+  <circle cx="587" cy="148" r="3" fill="#34d399"/>
+  <text x="587" y="174" class="disp" font-size="10" text-anchor="middle">CSO</text>
+
+  <!-- fan-out to four divisions -->
+  <path class="flow" d="M616 153 H648" marker-end="url(#arr)"/>
+  <line class="flow" x1="648" y1="153" x2="648" y2="73"/>
+  <line class="flow" x1="648" y1="153" x2="648" y2="233"/>
+  <path class="flow" d="M648 73  H690" marker-end="url(#arr)"/>
+  <path class="flow" d="M648 126 H690" marker-end="url(#arr)"/>
+  <path class="flow" d="M648 180 H690" marker-end="url(#arr)"/>
+  <path class="flow" d="M648 233 H690" marker-end="url(#arr)"/>
+
+  <!-- four division pills, colour-keyed, light — title line + caption line, no overlap -->
+  <g>
+    <rect class="node" x="692" y="52" width="200" height="40" rx="9"/>
+    <rect x="700" y="64" width="6" height="16" rx="3" fill="#34d399"/>
+    <text x="716" y="72" class="disp" font-size="10.5">Target ID</text>
+    <text x="716" y="84" class="faint mono" font-size="7.5">genetics · scRNA · dependency</text>
+
+    <rect class="node" x="692" y="106" width="200" height="40" rx="9"/>
+    <rect x="700" y="118" width="6" height="16" rx="3" fill="#38bdf8"/>
+    <text x="716" y="126" class="disp" font-size="10.5">Target Safety</text>
+    <text x="716" y="138" class="faint mono" font-size="7.5">off-target · mouse-KO · FAERS</text>
+
+    <rect class="node" x="692" y="160" width="200" height="40" rx="9"/>
+    <rect x="700" y="172" width="6" height="16" rx="3" fill="#38bdf8"/>
+    <text x="716" y="180" class="disp" font-size="10.5">Modality &amp; Tractability</text>
+    <text x="716" y="192" class="faint mono" font-size="7.5">druggability · structure</text>
+
+    <rect class="node" x="692" y="214" width="200" height="40" rx="9"/>
+    <rect x="700" y="226" width="6" height="16" rx="3" fill="#fbbf24"/>
+    <text x="716" y="234" class="disp" font-size="10.5">Clinical &amp; Literature</text>
+    <text x="716" y="246" class="faint mono" font-size="7.5">trials · live web</text>
+  </g>
+
+  <!-- divisions -> reviewer (merge) -->
+  <line class="flow" x1="892" y1="72"  x2="924" y2="72"/>
+  <line class="flow" x1="892" y1="126" x2="924" y2="126"/>
+  <line class="flow" x1="892" y1="180" x2="924" y2="180"/>
+  <line class="flow" x1="892" y1="234" x2="924" y2="234"/>
+  <line class="flow" x1="924" y1="72"  x2="924" y2="234"/>
+  <path class="flow" d="M924 153 H952" marker-end="url(#arr)"/>
+
+  <!-- Scientific Reviewer -->
+  <rect class="node" x="954" y="120" width="92" height="66" rx="11" stroke="#fbbf24" stroke-opacity="0.55"/>
+  <circle cx="1000" cy="143" r="9" fill="none" stroke="#fbbf24" stroke-width="1.4"/>
+  <text x="1000" y="170" class="disp" font-size="10" text-anchor="middle">Reviewer</text>
+  <text x="1000" y="106" class="faint body" font-size="8.5" text-anchor="middle">completeness · methodology</text>
+
+  <!-- Reviewer -> CSO synthesis -->
+  <path class="flow" d="M1046 153 H1058" marker-end="url(#arr)"/>
+  <rect class="node" x="1060" y="124" width="56" height="58" rx="11" stroke="#34d399" stroke-opacity="0.5"/>
+  <circle cx="1088" cy="148" r="9" fill="none" stroke="#34d399" stroke-width="1.4"/>
+  <circle cx="1088" cy="148" r="3" fill="#34d399"/>
+  <text x="1088" y="174" class="disp" font-size="10" text-anchor="middle">CSO</text>
+  <text x="1088" y="112" class="faint body" font-size="8.5" text-anchor="middle">synthesis</text>
+
+  <!-- CSO -> Report -->
+  <path class="flow" d="M1116 153 H1128" marker-end="url(#arr)"/>
+  <rect class="node" x="1130" y="126" width="44" height="54" rx="9" stroke="#34d399" stroke-opacity="0.4"/>
+  <circle cx="1152" cy="145" r="5" fill="#fbbf24"/>
+  <text x="1152" y="169" class="disp" font-size="8" text-anchor="middle">GO /</text>
+  <text x="1152" y="178" class="disp" font-size="8" text-anchor="middle">NO-GO</text>
+
+  <!-- ================= THE RE-ROUTE LOOP (single clean arc beneath) ================= -->
+  <path d="M1000 186 C 1000 300 760 300 587 300 C 440 300 320 300 250 300 L250 188"
+        fill="none" stroke="#fbbf24" stroke-width="1.7" stroke-dasharray="6 5"
+        marker-end="url(#arrLoop)"/>
+  <rect x="470" y="288" width="234" height="24" rx="12" fill="#0c1322" stroke="#fbbf24" stroke-opacity="0.35"/>
+  <text x="587" y="304" class="mono" font-size="10" fill="#fbbf24" text-anchor="middle">re-route to fill missing gaps</text>
+
+  <!-- ================= LIGHT SUPPORTING RAILS (no dense grids) ================= -->
+  <!-- Rail 1: tools / databases the divisions call -->
+  <line x1="40" y1="372" x2="1160" y2="372" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="48" cy="396" r="3.5" fill="#38bdf8"/>
+  <text x="62" y="400" class="disp" font-size="11.5">Expert tools over real databases</text>
+  <text x="320" y="400" class="body dim" font-size="10">— each division calls deterministic ClawBio skills; nothing in a verdict is ungrounded.</text>
+  <text x="62" y="422" class="mono dim" font-size="10">Open Targets · CELLxGENE Census · TCGA/GDC · DepMap CRISPR · GWAS Catalog · openFDA/FAERS · ClinicalTrials.gov · Tavily web</text>
+  <text x="62" y="440" class="mono faint" font-size="9.5">validation:  τ-specificity · malignant-cell localisation · structure  ·  CRISPR dependency · mouse-KO · trial outcomes</text>
+
+  <!-- Rail 2: verifiability store -->
+  <line x1="40" y1="466" x2="1160" y2="466" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="48" cy="490" r="3.5" fill="#fbbf24"/>
+  <text x="62" y="494" class="disp" font-size="11.5">Verifiable reasoning store</text>
+  <text x="270" y="494" class="body dim" font-size="10">— every result is recorded, then the verdict is derived deductively and replayed.</text>
+
+  <g>
+    <rect class="node" x="62" y="508" width="346" height="64" rx="10" stroke="#34d399" stroke-opacity="0.3"/>
+    <text x="80" y="530" class="disp" font-size="11">Canonical knowledge graph</text>
+    <text x="80" y="546" class="mono faint" font-size="8.5">kg.py · kg.json</text>
+    <text x="80" y="563" class="body dim" font-size="9.5">claims live on cited edges — grade, source, URL, step</text>
+
+    <rect class="node" x="418" y="508" width="346" height="64" rx="10" stroke="#fbbf24" stroke-opacity="0.35"/>
+    <text x="436" y="530" class="disp" font-size="11">Vadalog reasoning engine</text>
+    <text x="436" y="546" class="mono faint" font-size="8.5">prometheux_reason.py · Prometheux</text>
+    <text x="436" y="563" class="body dim" font-size="9.5">derives the GO/NO-GO tier with @explain rule chains</text>
+
+    <rect class="node" x="774" y="508" width="346" height="64" rx="10" stroke="#38bdf8" stroke-opacity="0.3"/>
+    <text x="792" y="530" class="disp" font-size="11">Execution trace</text>
+    <text x="792" y="546" class="mono faint" font-size="8.5">tracing.py · trace.jsonl → Langfuse (opt.)</text>
+    <text x="792" y="563" class="body dim" font-size="9.5">every span replayable — the run is inspectable, not just the result</text>
+  </g>
+</svg>
+</div>
+</div>
+
+<!-- ============================== LAYER LEGEND ============================== -->
+<div class="wrap">
+<div class="layers">
+  <div class="layer l1">
+    <span class="tag">Layer 1 · agentic loop</span>
+    <h3>It reasons like a discovery team.</h3>
+    <p>A chief-of-staff agent frames the question and routes it across four scientific divisions; a reviewer audits the evidence and can send the loop back one step before any conclusion is drawn.</p>
+    <ul>
+      <li><b>Chief of Staff</b> — brief, decompose, route</li>
+      <li><b>4 divisions</b> — target ID, safety, modality, clinical/literature</li>
+      <li><b>Scientific Reviewer</b> — gap-gate &amp; re-route</li>
+      <li><b>CSO synthesis</b> — weighs graded evidence into a call</li>
+    </ul>
+  </div>
+  <div class="layer l2">
+    <span class="tag">Layer 2 · tools &amp; validation</span>
+    <h3>Real databases, real validation.</h3>
+    <p>Each division calls deterministic expert tools against live public sources, then validates the signal in silico and against experimental &amp; clinical evidence — never a model guessing from memory.</p>
+    <ul>
+      <li><b>Research:</b> Open Targets · CELLxGENE · TCGA/GDC · GWAS Catalog · openFDA</li>
+      <li><b>In-silico:</b> <code>celltype-specificity</code>, <code>struct-predictor</code></li>
+      <li><b>Experimental:</b> DepMap CRISPR, mouse-KO, trial outcomes</li>
+      <li><b>Live web:</b> <code>lit-synthesizer</code> (agentic Tavily search)</li>
+    </ul>
+  </div>
+  <div class="layer l3">
+    <span class="tag">Layer 3 · verifiability</span>
+    <h3>Every claim is provable.</h3>
+    <p>Results land as cited edges in a persistent knowledge graph; a Vadalog engine derives the verdict deductively with rule-chain explanations; and the whole run is traced span-by-span.</p>
+    <ul>
+      <li><b>Store:</b> canonical KG — <code>kg.py</code> / <code>kg.json</code></li>
+      <li><b>Reason:</b> Vadalog / Prometheux — <code>@explain</code> rule chains</li>
+      <li><b>Trace:</b> <code>trace.jsonl</code> → Langfuse (optional)</li>
+      <li><b>Grade:</b> provenance + confidence on every fact</li>
+    </ul>
+  </div>
+</div>
+</div>
+
+<footer class="wrap">
+  <span>Virtual Biotech CSO — automatic target identification &amp; validation · research prototype</span>
+  <span>Reproduces the Virtual Biotech loop (Zhang et al. 2026) over ClawBio skills.</span>
+</footer>
+
+</body>
+</html>

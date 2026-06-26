@@ -100,6 +100,10 @@ const emptyRun = () => ({
   // Prometheux structural gaps (the non-silenceable voice)
   engineForced: false,
   // a structural gap forced the re-route
+  panel: null,
+  // latest 4-lens reviewer-panel vote {lenses, reroute_votes, n_lenses}
+  divisionFindings: {},
+  // division name -> division_finding event
   confidence: "n/a",
   error: null
 });
@@ -158,6 +162,15 @@ function reduceEvent(run, ev, data) {
     case "engine_gaps":
       r.engineGaps = data.gaps || [];
       r.engineForced = !!data.forced;
+      return r;
+    case "panel":
+      r.panel = data;
+      return r;
+    case "division_finding":
+      r.divisionFindings = {
+        ...(run.divisionFindings || {}),
+        [data.division]: data
+      };
       return r;
     case "review":
       r.review = data.review;
@@ -753,7 +766,8 @@ function LoopStep({
   active,
   onClick,
   engineGaps,
-  engineForced
+  engineForced,
+  panel
 }) {
   const ev = step.evidence;
   const running = step.status === "running";
@@ -831,7 +845,18 @@ function LoopStep({
     className: "text-slate-500"
   }, "→ ", g.route_to))), /*#__PURE__*/React.createElement("div", {
     className: "mt-2 text-[10px] text-slate-500"
-  }, "A proven missing axis is a fact, not a judgement — so the engine re-routes even if the LLM panel said synthesize.")), active && ev && res.top_cell_types && /*#__PURE__*/React.createElement("table", {
+  }, "A proven missing axis is a fact, not a judgement — so the engine re-routes even if the LLM panel said synthesize.")), step.id === "review" && panel && panel.lenses && panel.lenses.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-[10px] uppercase tracking-wide text-slate-500 mb-2"
+  }, "4-lens reviewer panel"), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5"
+  }, panel.lenses.map((l, i) => /*#__PURE__*/React.createElement("span", {
+    key: i,
+    className: `px-2 py-0.5 rounded-md text-xs border ${l.verdict === "re-route" ? "text-rose-300 border-rose-500/40 bg-rose-500/10" : "text-emerald-300 border-emerald-500/40 bg-emerald-500/10"}`
+  }, l.key, " ", l.verdict === "re-route" ? "✗ re-route" : "✓"))), panel.n_lenses != null && /*#__PURE__*/React.createElement("div", {
+    className: "mt-2 text-xs text-slate-400"
+  }, panel.reroute_votes, "/", panel.n_lenses, " lenses flag re-route")), active && ev && res.top_cell_types && /*#__PURE__*/React.createElement("table", {
     className: "mt-3 w-full text-xs"
   }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
     className: "text-slate-500 text-left"
@@ -873,10 +898,29 @@ function LoopTrace({
     active: active === s.id,
     onClick: () => setActive(active === s.id ? null : s.id),
     engineGaps: run.engineGaps,
-    engineForced: run.engineForced
+    engineForced: run.engineForced,
+    panel: run.panel
   })), run.status === "running" && run.steps.length === 0 && /*#__PURE__*/React.createElement("div", {
     className: "text-sm text-slate-500"
-  }, "starting the loop…")));
+  }, "starting the loop…"), Object.keys(run.divisionFindings || {}).length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "text-[10px] uppercase tracking-wide text-slate-500 mb-2"
+  }, "division findings"), /*#__PURE__*/React.createElement("div", {
+    className: "space-y-1.5"
+  }, Object.values(run.divisionFindings).map((df, i) => {
+    const f = df.finding || {};
+    return /*#__PURE__*/React.createElement("div", {
+      key: i,
+      className: "flex items-start gap-2 text-xs"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-slate-300 font-semibold whitespace-nowrap"
+    }, df.division), f.evidence_grade && /*#__PURE__*/React.createElement(Chip, {
+      cls: gradeStyle(f.evidence_grade)
+    }, f.evidence_grade), f.interpretation && /*#__PURE__*/React.createElement("span", {
+      className: "text-slate-400 truncate"
+    }, f.interpretation));
+  })))));
 }
 
 // Prometheux deductive decision: the GO/NO-GO tier derived from per-axis coverage,
@@ -948,21 +992,111 @@ function Panel({
     className: `text-xs uppercase tracking-widest mb-3 ${a}`
   }, title), children);
 }
-function Report({
-  run
+
+// Collect the per-run evidence edges, grouped by validity axis (druggability,
+// modality, linkage, safety, clinical precedence…). The decision engine supplies
+// the axis grade + weight; the streamed edges supply the supporting datasource rows.
+function axisEvidenceFromRun(run) {
+  const axesMeta = run.decisionEngine?.axes || {};
+  const nodes = run.gnodes || {};
+  const byAxis = {};
+  // seed every axis the decision engine evaluated, so empty axes still surface
+  Object.entries(axesMeta).forEach(([ax, a]) => {
+    byAxis[ax] = {
+      meta: a,
+      rows: []
+    };
+  });
+  Object.values(run.gedges || {}).forEach(e => {
+    if (!e.axis) return;
+    (byAxis[e.axis] ||= {
+      meta: null,
+      rows: []
+    }).rows.push({
+      ...e,
+      subjectLabel: nodes[e.s]?.label || e.s,
+      objectLabel: nodes[e.t]?.label || e.t
+    });
+  });
+  return byAxis;
+}
+function AxisEvidence({
+  ax,
+  entry
 }) {
-  const s = run.synthesis;
-  if (run.status !== "done" || !s) {
-    return /*#__PURE__*/React.createElement("div", {
-      className: "rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-10 text-center"
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "text-sm text-slate-400"
-    }, "The report is constructed once the loop completes."), /*#__PURE__*/React.createElement("div", {
-      className: "text-xs text-slate-600 mt-1"
-    }, run.status === "running" ? "synthesis pending — evidence still being gathered…" : "submit a query to begin."));
-  }
-  // The decision of record is the Prometheux-derived tier when the engine ran,
-  // else the agent's. The agent's free-text is always the rationale below.
+  const a = entry.meta;
+  const absent = a?.grade === "absent" || entry.rows.length === 0;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "space-y-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: `rounded-2xl border p-5 ${absent ? "border-rose-500/30 bg-rose-500/5" : "border-slate-700 bg-slate-900/60"}`
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 flex-wrap"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "text-xs uppercase tracking-widest text-slate-400"
+  }, ax), a && /*#__PURE__*/React.createElement(Chip, {
+    cls: gradeStyle(absent ? "absent" : a.grade)
+  }, absent ? "no information" : a.grade), a && /*#__PURE__*/React.createElement(Chip, {
+    cls: "border-slate-600 text-slate-300 bg-slate-800/60"
+  }, "weight ", a.weight), /*#__PURE__*/React.createElement("span", {
+    className: "ml-auto text-xs text-slate-500"
+  }, entry.rows.length, " evidence item", entry.rows.length !== 1 ? "s" : "")), absent && /*#__PURE__*/React.createElement("p", {
+    className: "mt-2 text-xs text-rose-200/80"
+  }, "No information on this axis was gathered — the score reflects absence, not weak evidence.")), entry.rows.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "rounded-2xl border border-slate-800 bg-slate-900/30 overflow-hidden"
+  }, /*#__PURE__*/React.createElement("table", {
+    className: "w-full text-xs"
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    className: "text-slate-500 text-left"
+  }, /*#__PURE__*/React.createElement("th", {
+    className: "px-4 py-2 font-medium"
+  }, "evidence (relation → entity)"), /*#__PURE__*/React.createElement("th", {
+    className: "px-2 py-2 font-medium"
+  }, "value"), /*#__PURE__*/React.createElement("th", {
+    className: "px-2 py-2 font-medium"
+  }, "grade"), /*#__PURE__*/React.createElement("th", {
+    className: "px-2 py-2 font-medium"
+  }, "conf"), /*#__PURE__*/React.createElement("th", {
+    className: "px-2 py-2 font-medium"
+  }, "source"))), /*#__PURE__*/React.createElement("tbody", null, entry.rows.map((r, i) => {
+    const p = PROV[provOf(r.prov)] || PROV.computed;
+    return /*#__PURE__*/React.createElement("tr", {
+      key: i,
+      className: "border-t border-slate-800/60 align-top"
+    }, /*#__PURE__*/React.createElement("td", {
+      className: "px-4 py-2 text-slate-200"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "text-sky-400 mono"
+    }, r.type), " → ", /*#__PURE__*/React.createElement("span", {
+      className: "text-slate-100"
+    }, r.objectLabel), r.ref && /*#__PURE__*/React.createElement("div", {
+      className: "text-[11px] text-slate-500 mt-0.5 leading-snug"
+    }, r.ref)), /*#__PURE__*/React.createElement("td", {
+      className: "px-2 py-2 text-slate-300"
+    }, r.value || "—"), /*#__PURE__*/React.createElement("td", {
+      className: "px-2 py-2"
+    }, /*#__PURE__*/React.createElement(Chip, {
+      cls: gradeStyle(r.grade)
+    }, r.grade || "—")), /*#__PURE__*/React.createElement("td", {
+      className: "px-2 py-2 mono text-slate-300"
+    }, r.conf != null ? Number(r.conf).toFixed(2) : "—"), /*#__PURE__*/React.createElement("td", {
+      className: "px-2 py-2"
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "mr-1"
+    }, p.icon), r.url ? /*#__PURE__*/React.createElement("a", {
+      href: r.url,
+      target: "_blank",
+      rel: "noreferrer",
+      className: "text-sky-400 hover:text-sky-300 underline"
+    }, r.source, " ↗") : /*#__PURE__*/React.createElement("span", {
+      className: "text-slate-300"
+    }, r.source || "—")));
+  })))));
+}
+function ReportOverview({
+  run,
+  s
+}) {
   const decTier = run.decisionEngine?.tier || s.decision || "REVIEW";
   const dec = DECISION[decTier] || DECISION.REVIEW;
   return /*#__PURE__*/React.createElement("div", {
@@ -1021,6 +1155,50 @@ function Report({
     className: "text-xs text-slate-400 mt-1"
   }, e.rationale))))));
 }
+function Report({
+  run
+}) {
+  const s = run.synthesis;
+  const byAxis = useMemo(() => axisEvidenceFromRun(run), [run.gedges, run.decisionEngine]);
+  const axisKeys = Object.keys(byAxis);
+  const [sub, setSub] = useState("overview");
+  if (run.status !== "done" || !s) {
+    return /*#__PURE__*/React.createElement("div", {
+      className: "rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-10 text-center"
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "text-sm text-slate-400"
+    }, "The report is constructed once the loop completes."), /*#__PURE__*/React.createElement("div", {
+      className: "text-xs text-slate-600 mt-1"
+    }, run.status === "running" ? "synthesis pending — evidence still being gathered…" : "submit a query to begin."));
+  }
+  const active = sub !== "overview" && byAxis[sub] ? sub : "overview";
+  return /*#__PURE__*/React.createElement("div", {
+    className: "space-y-5"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 border border-slate-800"
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setSub("overview"),
+    className: `px-3 py-1.5 rounded-lg text-xs font-medium transition ${active === "overview" ? "bg-sky-500 text-white" : "text-slate-400 hover:text-slate-200"}`
+  }, "Report"), axisKeys.map(ax => {
+    const entry = byAxis[ax];
+    const absent = entry.meta?.grade === "absent" || entry.rows.length === 0;
+    return /*#__PURE__*/React.createElement("button", {
+      key: ax,
+      onClick: () => setSub(ax),
+      className: `px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active === ax ? "bg-sky-500 text-white" : "text-slate-400 hover:text-slate-200"}`
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "capitalize"
+    }, ax), /*#__PURE__*/React.createElement("span", {
+      className: `text-[10px] ${active === ax ? "opacity-80" : absent ? "text-rose-400/80" : "text-slate-500"}`
+    }, absent ? "⚪" : entry.rows.length));
+  })), active === "overview" ? /*#__PURE__*/React.createElement(ReportOverview, {
+    run: run,
+    s: s
+  }) : /*#__PURE__*/React.createElement(AxisEvidence, {
+    ax: active,
+    entry: byAxis[active]
+  }));
+}
 
 // ======================================================================================
 //  Query screen + run shell
@@ -1030,6 +1208,7 @@ function QueryScreen({
 }) {
   const [q, setQ] = useState(EXAMPLES[0]);
   const [demo, setDemo] = useState(true);
+  const [agents, setAgents] = useState(false);
   const [partial, setPartial] = useState(false);
   return /*#__PURE__*/React.createElement("div", {
     className: "max-w-2xl mx-auto px-4 py-20 fade-up"
@@ -1039,11 +1218,11 @@ function QueryScreen({
     className: "text-3xl sm:text-4xl font-extrabold text-white"
   }, "Ask the Virtual CSO."), /*#__PURE__*/React.createElement("p", {
     className: "text-slate-400 mt-3"
-  }, "Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a Scientific Reviewer audit (with one re-route), and a CSO synthesis run as live agents — the loop, the evidence graph, and the report build in real time."), /*#__PURE__*/React.createElement("form", {
+  }, "Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time."), /*#__PURE__*/React.createElement("form", {
     className: "mt-8",
     onSubmit: e => {
       e.preventDefault();
-      if (q.trim()) onRun(q.trim(), demo, partial);
+      if (q.trim()) onRun(q.trim(), demo, partial, agents);
     }
   }, /*#__PURE__*/React.createElement("textarea", {
     value: q,
@@ -1062,10 +1241,19 @@ function QueryScreen({
     className: "accent-sky-500"
   }), "demo mode ", /*#__PURE__*/React.createElement("span", {
     className: "text-slate-600"
-  }, "(cached data, no LLM/network — reliable for a stage)")), /*#__PURE__*/React.createElement("button", {
+  }, "(cached data for the routed skills — reliable for a stage)")), /*#__PURE__*/React.createElement("button", {
     type: "submit",
     className: "px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm"
   }, "Run assessment →")), /*#__PURE__*/React.createElement("label", {
+    className: "flex items-center gap-2 text-sm text-emerald-300/90 cursor-pointer mt-3"
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: agents,
+    onChange: e => setAgents(e.target.checked),
+    className: "accent-emerald-500"
+  }), "⚡ live agents ", /*#__PURE__*/React.createElement("span", {
+    className: "text-slate-600"
+  }, "(reasoning roles call a real LLM — the genuine multi-agent loop; ~3-4 min. Off = instant, deterministic stubs.)")), /*#__PURE__*/React.createElement("label", {
     className: "flex items-center gap-2 text-sm text-fuchsia-300/90 cursor-pointer mt-3"
   }, /*#__PURE__*/React.createElement("input", {
     type: "checkbox",
@@ -1090,7 +1278,7 @@ function App() {
   const [run, setRun] = useState(emptyRun);
   const [tab, setTab] = useState("loop");
   const esRef = useRef(null);
-  const start = useCallback((query, demo, partial) => {
+  const start = useCallback((query, demo, partial, agents) => {
     if (esRef.current) esRef.current.close();
     setRun({
       ...emptyRun(),
@@ -1101,9 +1289,7 @@ function App() {
       }
     });
     setTab("loop");
-    // demo off → run the routed skills live (real ClawBio/Tavily data) so the
-    // evidence layer is populated; otherwise the decision sees no information.
-    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}${demo ? "" : "&live=1"}${partial ? "&partial=1" : ""}`;
+    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo ? 1 : 0}&agents=${agents ? 1 : 0}${partial ? "&partial=1" : ""}`;
     const es = new EventSource(url);
     esRef.current = es;
     const on = name => es.addEventListener(name, e => {
@@ -1111,7 +1297,7 @@ function App() {
       setRun(prev => reduceEvent(prev, name, data));
       if (name === "done" || name === "error") es.close();
     });
-    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "engine_gaps", "review", "synthesis", "decision", "done", "error"].forEach(on);
+    ["start", "phase", "briefing", "plan", "evidence", "node", "edge", "engine_gaps", "panel", "division_finding", "review", "synthesis", "decision", "done", "error"].forEach(on);
     es.onerror = () => {
       setRun(prev => prev.status === "done" ? prev : reduceEvent(prev, "error", {
         message: "connection lost — is server.py running?"
@@ -1127,7 +1313,7 @@ function App() {
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
     const q = p.get("q");
-    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1");
+    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1");
     if (p.get("tab")) setTab(p.get("tab"));
   }, [start]);
   if (run.status === "idle") return /*#__PURE__*/React.createElement(QueryScreen, {

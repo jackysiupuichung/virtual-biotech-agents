@@ -51,6 +51,14 @@ const emptyRun = () => ({
   synthesis: null,
   report_md: null,
   decision: "PENDING",
+  decisionSource: null,       // "prometheux" | "agent"
+  decisionEngine: null,       // {tier, score, max_score, axes, explanation, facts}
+  agentDecision: null,        // the synthesis agent's proposed tier (for divergence)
+  diverges: false,            // engine tier != agent tier
+  engineGaps: [],             // Prometheux structural gaps (the non-silenceable voice)
+  engineForced: false,        // a structural gap forced the re-route
+  panel: null,                // latest 4-lens reviewer-panel vote {lenses, reroute_votes, n_lenses}
+  divisionFindings: {},       // division name -> division_finding event
   confidence: "n/a",
   error: null,
 });
@@ -81,6 +89,16 @@ function reduceEvent(run, ev, data) {
       r.steps = r.steps.map(s => s.id === data.step ? { ...s, status: "done", evidence: data } : s);
       return r;
     }
+    case "engine_gaps":
+      r.engineGaps = data.gaps || [];
+      r.engineForced = !!data.forced;
+      return r;
+    case "panel":
+      r.panel = data;
+      return r;
+    case "division_finding":
+      r.divisionFindings = { ...(run.divisionFindings||{}), [data.division]: data };
+      return r;
     case "review":
       r.review = data.review;
       r.steps = r.steps.map(s => s.id === "review" ? { ...s, status: "done", review: data.review } : s);
@@ -88,10 +106,19 @@ function reduceEvent(run, ev, data) {
     case "synthesis":
       r.synthesis = data.synthesis;
       return r;
+    case "decision":
+      r.decision = data.decision || "REVIEW";
+      r.decisionSource = data.decision_source || null;
+      r.decisionEngine = data.engine || null;
+      r.agentDecision = data.agent_decision || null;
+      r.diverges = !!data.diverges;
+      r.confidence = data.confidence || r.confidence;
+      return r;
     case "done":
       r.steps = r.steps.map(s => s.status === "running" ? { ...s, status: "done" } : s);
       r.report_md = data.report_md;
-      r.decision = data.decision || "REVIEW";
+      r.decision = data.decision || r.decision || "REVIEW";
+      r.decisionSource = data.decision_source || r.decisionSource;
       r.confidence = data.confidence || "n/a";
       r.status = "done";
       return r;
@@ -403,7 +430,7 @@ function Chip({children, cls=""}) {
   return <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium border ${cls}`}>{children}</span>;
 }
 
-function LoopStep({step, idx, last, active, onClick}) {
+function LoopStep({step, idx, last, active, onClick, engineGaps, engineForced, panel}) {
   const ev = step.evidence;
   const running = step.status === "running";
   const kindCls = step.kind === "agent" ? "border-violet-500/40 bg-violet-500/5" : "border-slate-700 bg-slate-900/60";
@@ -453,6 +480,35 @@ function LoopStep({step, idx, last, active, onClick}) {
             {(step.review.gaps||[]).map((gp,i)=><div key={i} className="text-xs text-amber-300/80 mt-1">↳ gap: {gp.missing} → re-route to {gp.route_to}</div>)}
           </div>
         )}
+        {step.id==="review" && engineGaps && engineGaps.length>0 && (
+          <div className="mt-3 rounded-lg border border-fuchsia-500/40 bg-fuchsia-500/5 p-3">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="px-2 py-0.5 rounded-md font-bold bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40">◆ PROMETHEUX</span>
+              <span className="text-fuchsia-200/90">deductive gap-detector · {engineForced ? "forced re-route" : "advisory"}</span>
+            </div>
+            {engineGaps.map((g,i)=>(
+              <div key={i} className="mt-2 text-xs text-fuchsia-100/80">
+                {g.forces_reroute ? "⛔" : "○"} {g.explanation} <span className="text-slate-500">→ {g.route_to}</span>
+              </div>
+            ))}
+            <div className="mt-2 text-[10px] text-slate-500">A proven missing axis is a fact, not a judgement — so the engine re-routes even if the LLM panel said synthesize.</div>
+          </div>
+        )}
+        {step.id==="review" && panel && panel.lenses && panel.lenses.length>0 && (
+          <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+            <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">4-lens reviewer panel</div>
+            <div className="flex flex-wrap gap-1.5">
+              {panel.lenses.map((l,i)=>(
+                <span key={i} className={`px-2 py-0.5 rounded-md text-xs border ${l.verdict==="re-route"?"text-rose-300 border-rose-500/40 bg-rose-500/10":"text-emerald-300 border-emerald-500/40 bg-emerald-500/10"}`}>
+                  {l.key} {l.verdict==="re-route"?"✗ re-route":"✓"}
+                </span>
+              ))}
+            </div>
+            {panel.n_lenses!=null && (
+              <div className="mt-2 text-xs text-slate-400">{panel.reroute_votes}/{panel.n_lenses} lenses flag re-route</div>
+            )}
+          </div>
+        )}
         {active && ev && (res.top_cell_types) && (
           <table className="mt-3 w-full text-xs">
             <thead><tr className="text-slate-500 text-left"><th className="py-1">cell type</th><th>mean expr</th><th>% expr</th></tr></thead>
@@ -472,13 +528,77 @@ function LoopTrace({run}) {
       <div className="flex items-center gap-3 mb-5 text-xs text-slate-400 flex-wrap">
         {Object.entries(PROV).map(([k,p])=><span key={k}>{p.icon} {p.label}</span>)}
       </div>
+      {run.decisionEngine && <PrometheuxDecision run={run} className="mb-5"/>}
       <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
         {run.steps.map((s,i)=>(
           <LoopStep key={s.id+"_"+i} step={s} idx={i} last={i===run.steps.length-1}
-            active={active===s.id} onClick={()=>setActive(active===s.id?null:s.id)}/>
+            active={active===s.id} onClick={()=>setActive(active===s.id?null:s.id)}
+            engineGaps={run.engineGaps} engineForced={run.engineForced} panel={run.panel}/>
         ))}
         {run.status==="running" && run.steps.length===0 && <div className="text-sm text-slate-500">starting the loop…</div>}
+        {Object.keys(run.divisionFindings||{}).length>0 && (
+          <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+            <div className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">division findings</div>
+            <div className="space-y-1.5">
+              {Object.values(run.divisionFindings).map((df,i)=>{
+                const f = df.finding || {};
+                return (
+                  <div key={i} className="flex items-start gap-2 text-xs">
+                    <span className="text-slate-300 font-semibold whitespace-nowrap">{df.division}</span>
+                    {f.evidence_grade && <Chip cls={gradeStyle(f.evidence_grade)}>{f.evidence_grade}</Chip>}
+                    {f.interpretation && <span className="text-slate-400 truncate">{f.interpretation}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+// Prometheux deductive decision: the GO/NO-GO tier derived from per-axis coverage,
+// with the safety hard-gate and a replayable per-axis basis. Authoritative over the
+// agent's free-text; a divergence is surfaced, never silently overridden.
+function PrometheuxDecision({run, className}) {
+  const e = run.decisionEngine;
+  if (!e) return null;
+  const dec = DECISION[e.tier] || DECISION.REVIEW;
+  const axes = e.axes || {};
+  return (
+    <div className={`rounded-2xl border border-fuchsia-500/40 bg-fuchsia-500/5 p-5 ${className||""}`}>
+      <div className="flex items-center gap-2 mb-3 flex-wrap">
+        <span className="px-2 py-0.5 rounded-md font-bold text-xs bg-fuchsia-500/20 text-fuchsia-200 border border-fuchsia-500/40">◆ PROMETHEUX</span>
+        <span className="text-xs uppercase tracking-widest text-fuchsia-200/80">deductive decision</span>
+        <span className={`ml-auto px-3 py-1 rounded-lg font-extrabold text-sm ${dec.c}`}>{(e.tier||"REVIEW").replace("_"," ")}</span>
+      </div>
+      <div className="text-sm text-slate-200">
+        coverage score <span className="mono font-bold text-fuchsia-200">{e.score}</span>
+        <span className="text-slate-500"> / {e.max_score}</span>
+      </div>
+      <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {Object.entries(axes).map(([ax,a])=>{
+          const absent = a.grade==="absent";
+          return (
+          <div key={ax} className={`rounded-lg border px-3 py-2 ${absent?"border-rose-500/30 bg-rose-500/5 border-dashed":"border-slate-700 bg-slate-950/50"}`}>
+            <div className="text-[10px] uppercase tracking-wide text-slate-500">{ax}</div>
+            <div className={`text-sm font-semibold ${a.weight>=1?"text-emerald-300":a.weight>=0.5?"text-sky-300":a.weight>0?"text-amber-300":"text-rose-300/90"}`}>{absent?"no information":a.grade}</div>
+            <div className="mono text-[10px] text-slate-500">w {a.weight}</div>
+          </div>
+        );})}
+      </div>
+      {(e.absent_axes||[]).length>0 && (
+        <div className="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-xs text-rose-200/90">
+          ⚪ <b>No information</b> on: {e.absent_axes.join(", ")} — these axes were never assessed (or returned empty). The score reflects absence, not weak evidence.
+        </div>
+      )}
+      {e.explanation && <p className="mt-3 text-xs text-fuchsia-100/70 leading-relaxed border-t border-fuchsia-500/20 pt-3">{e.explanation}</p>}
+      {run.diverges && (
+        <div className="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+          ⚠️ <b>Divergence:</b> the synthesis agent proposed <b>{(run.agentDecision||"").replace("_"," ")}</b>, but the deductive layer derives <b>{(e.tier||"").replace("_"," ")}</b> from the evidence coverage. The derived tier is the decision of record.
+        </div>
+      )}
     </div>
   );
 }
@@ -491,28 +611,95 @@ function Panel({title, accent, children}) {
   return <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-5"><div className={`text-xs uppercase tracking-widest mb-3 ${a}`}>{title}</div>{children}</div>;
 }
 
-function Report({run}) {
-  const s = run.synthesis;
-  if (run.status !== "done" || !s) {
-    return (
-      <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-10 text-center">
-        <div className="text-sm text-slate-400">The report is constructed once the loop completes.</div>
-        <div className="text-xs text-slate-600 mt-1">{run.status==="running" ? "synthesis pending — evidence still being gathered…" : "submit a query to begin."}</div>
+// Collect the per-run evidence edges, grouped by validity axis (druggability,
+// modality, linkage, safety, clinical precedence…). The decision engine supplies
+// the axis grade + weight; the streamed edges supply the supporting datasource rows.
+function axisEvidenceFromRun(run) {
+  const axesMeta = run.decisionEngine?.axes || {};
+  const nodes = run.gnodes || {};
+  const byAxis = {};
+  // seed every axis the decision engine evaluated, so empty axes still surface
+  Object.entries(axesMeta).forEach(([ax, a]) => { byAxis[ax] = { meta: a, rows: [] }; });
+  Object.values(run.gedges || {}).forEach(e => {
+    if (!e.axis) return;
+    (byAxis[e.axis] ||= { meta: null, rows: [] }).rows.push({
+      ...e,
+      subjectLabel: nodes[e.s]?.label || e.s,
+      objectLabel: nodes[e.t]?.label || e.t,
+    });
+  });
+  return byAxis;
+}
+
+function AxisEvidence({ ax, entry }) {
+  const a = entry.meta;
+  const absent = a?.grade === "absent" || entry.rows.length === 0;
+  return (
+    <div className="space-y-4">
+      <div className={`rounded-2xl border p-5 ${absent ? "border-rose-500/30 bg-rose-500/5" : "border-slate-700 bg-slate-900/60"}`}>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs uppercase tracking-widest text-slate-400">{ax}</span>
+          {a && <Chip cls={gradeStyle(absent ? "absent" : a.grade)}>{absent ? "no information" : a.grade}</Chip>}
+          {a && <Chip cls="border-slate-600 text-slate-300 bg-slate-800/60">weight {a.weight}</Chip>}
+          <span className="ml-auto text-xs text-slate-500">{entry.rows.length} evidence item{entry.rows.length!==1?"s":""}</span>
+        </div>
+        {absent && <p className="mt-2 text-xs text-rose-200/80">No information on this axis was gathered — the score reflects absence, not weak evidence.</p>}
       </div>
-    );
-  }
-  const dec = DECISION[s.decision] || DECISION.REVIEW;
+      {entry.rows.length > 0 && (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/30 overflow-hidden">
+          <table className="w-full text-xs">
+            <thead><tr className="text-slate-500 text-left">
+              <th className="px-4 py-2 font-medium">evidence (relation → entity)</th>
+              <th className="px-2 py-2 font-medium">value</th>
+              <th className="px-2 py-2 font-medium">grade</th>
+              <th className="px-2 py-2 font-medium">conf</th>
+              <th className="px-2 py-2 font-medium">source</th>
+            </tr></thead>
+            <tbody>
+              {entry.rows.map((r,i)=>{
+                const p = PROV[provOf(r.prov)] || PROV.computed;
+                return (
+                  <tr key={i} className="border-t border-slate-800/60 align-top">
+                    <td className="px-4 py-2 text-slate-200">
+                      <span className="text-sky-400 mono">{r.type}</span> → <span className="text-slate-100">{r.objectLabel}</span>
+                      {r.ref && <div className="text-[11px] text-slate-500 mt-0.5 leading-snug">{r.ref}</div>}
+                    </td>
+                    <td className="px-2 py-2 text-slate-300">{r.value || "—"}</td>
+                    <td className="px-2 py-2"><Chip cls={gradeStyle(r.grade)}>{r.grade || "—"}</Chip></td>
+                    <td className="px-2 py-2 mono text-slate-300">{r.conf!=null?Number(r.conf).toFixed(2):"—"}</td>
+                    <td className="px-2 py-2">
+                      <span className="mr-1">{p.icon}</span>
+                      {r.url
+                        ? <a href={r.url} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300 underline">{r.source} ↗</a>
+                        : <span className="text-slate-300">{r.source || "—"}</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReportOverview({run, s}) {
+  const decTier = run.decisionEngine?.tier || s.decision || "REVIEW";
+  const dec = DECISION[decTier] || DECISION.REVIEW;
   return (
     <div className="space-y-5">
       <div className={`rounded-2xl border border-slate-700 bg-slate-900/60 p-6 ring-1 ${dec.ring}`}>
         <div className="text-xs uppercase tracking-widest text-slate-500 mb-2">Executive summary</div>
         <div className="flex items-center gap-3 flex-wrap">
-          <span className={`px-4 py-1.5 rounded-lg font-extrabold text-sm ${dec.c}`}>{(s.decision||"REVIEW").replace("_"," ")}</span>
+          <span className={`px-4 py-1.5 rounded-lg font-extrabold text-sm ${dec.c}`}>{decTier.replace("_"," ")}</span>
+          {run.decisionSource==="prometheux" && <Chip cls="border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10">◆ derived</Chip>}
           <Chip cls="border-slate-600 text-slate-300 bg-slate-800">confidence: {s.confidence||run.confidence}</Chip>
         </div>
         <p className="mt-4 text-sm text-slate-200 leading-relaxed">{s.recommendation}</p>
         {s.target_overview && <p className="mt-3 text-xs text-slate-400 leading-relaxed border-t border-slate-800 pt-3">{s.target_overview}</p>}
       </div>
+      {run.decisionEngine && <PrometheuxDecision run={run}/>}
       <div className="grid md:grid-cols-2 gap-5">
         <Panel title="Liabilities & risks" accent="rose">
           {(s.liabilities||[]).map((l,i)=><div key={i} className="mb-3 last:mb-0"><div className="text-sm text-slate-200">{l.risk}</div>{l.mitigation && <div className="text-xs text-emerald-300/80 mt-0.5">↳ mitigation: {l.mitigation}</div>}</div>)}
@@ -536,28 +723,81 @@ function Report({run}) {
   );
 }
 
+function Report({run}) {
+  const s = run.synthesis;
+  const byAxis = useMemo(()=>axisEvidenceFromRun(run), [run.gedges, run.decisionEngine]);
+  const axisKeys = Object.keys(byAxis);
+  const [sub, setSub] = useState("overview");
+  if (run.status !== "done" || !s) {
+    return (
+      <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-10 text-center">
+        <div className="text-sm text-slate-400">The report is constructed once the loop completes.</div>
+        <div className="text-xs text-slate-600 mt-1">{run.status==="running" ? "synthesis pending — evidence still being gathered…" : "submit a query to begin."}</div>
+      </div>
+    );
+  }
+  const active = sub !== "overview" && byAxis[sub] ? sub : "overview";
+  return (
+    <div className="space-y-5">
+      {/* axis nav — the report is read either as the synthesis (overview) or per validity axis */}
+      <div className="flex flex-wrap gap-1.5 p-1 rounded-xl bg-slate-900/60 border border-slate-800">
+        <button onClick={()=>setSub("overview")}
+          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${active==="overview"?"bg-sky-500 text-white":"text-slate-400 hover:text-slate-200"}`}>
+          Report
+        </button>
+        {axisKeys.map(ax=>{
+          const entry = byAxis[ax];
+          const absent = entry.meta?.grade==="absent" || entry.rows.length===0;
+          return (
+            <button key={ax} onClick={()=>setSub(ax)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${active===ax?"bg-sky-500 text-white":"text-slate-400 hover:text-slate-200"}`}>
+              <span className="capitalize">{ax}</span>
+              <span className={`text-[10px] ${active===ax?"opacity-80":absent?"text-rose-400/80":"text-slate-500"}`}>
+                {absent?"⚪":entry.rows.length}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {active==="overview"
+        ? <ReportOverview run={run} s={s}/>
+        : <AxisEvidence ax={active} entry={byAxis[active]}/>}
+    </div>
+  );
+}
+
 // ======================================================================================
 //  Query screen + run shell
 // ======================================================================================
 function QueryScreen({onRun}) {
   const [q, setQ] = useState(EXAMPLES[0]);
   const [demo, setDemo] = useState(true);
+  const [agents, setAgents] = useState(false);
+  const [partial, setPartial] = useState(false);
   return (
     <div className="max-w-2xl mx-auto px-4 py-20 fade-up">
       <div className="text-xs text-sky-400 mono mb-2">virtual-biotech-cso · multi-agent harness</div>
       <h1 className="text-3xl sm:text-4xl font-extrabold text-white">Ask the Virtual CSO.</h1>
-      <p className="text-slate-400 mt-3">Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a Scientific Reviewer audit (with one re-route), and a CSO synthesis run as live agents — the loop, the evidence graph, and the report build in real time.</p>
-      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo);}}>
+      <p className="text-slate-400 mt-3">Submit a target-assessment question. A Chief-of-Staff briefing, division scientists, a four-lens Scientific Reviewer panel (with a bounded re-route loop), and a CSO synthesis run as agents — the loop, the evidence graph, and the report build in real time.</p>
+      <form className="mt-8" onSubmit={(e)=>{e.preventDefault(); if(q.trim()) onRun(q.trim(), demo, partial, agents);}}>
         <textarea value={q} onChange={(e)=>setQ(e.target.value)} rows={3}
           className="w-full rounded-xl bg-slate-900/70 border border-slate-700 focus:border-sky-500 outline-none p-4 text-slate-100 text-sm resize-none"
           placeholder="e.g. Assess B7-H3 potential as a therapeutic target in lung cancer"/>
         <div className="flex items-center justify-between gap-3 mt-3 flex-wrap">
           <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
             <input type="checkbox" checked={demo} onChange={(e)=>setDemo(e.target.checked)} className="accent-sky-500"/>
-            demo mode <span className="text-slate-600">(cached data, no LLM/network — reliable for a stage)</span>
+            demo mode <span className="text-slate-600">(cached data for the routed skills — reliable for a stage)</span>
           </label>
           <button type="submit" className="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-white font-semibold text-sm">Run assessment →</button>
         </div>
+        <label className="flex items-center gap-2 text-sm text-emerald-300/90 cursor-pointer mt-3">
+          <input type="checkbox" checked={agents} onChange={(e)=>setAgents(e.target.checked)} className="accent-emerald-500"/>
+          ⚡ live agents <span className="text-slate-600">(reasoning roles call a real LLM — the genuine multi-agent loop; ~3-4 min. Off = instant, deterministic stubs.)</span>
+        </label>
+        <label className="flex items-center gap-2 text-sm text-fuchsia-300/90 cursor-pointer mt-3">
+          <input type="checkbox" checked={partial} onChange={(e)=>setPartial(e.target.checked)} className="accent-fuchsia-500"/>
+          ◆ skip the safety step <span className="text-slate-600">(demonstrate the Prometheux gap-detector forcing a re-route to fill the missing axis)</span>
+        </label>
       </form>
       <div className="mt-8">
         <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-2">try an example</div>
@@ -574,11 +814,11 @@ function App() {
   const [tab, setTab] = useState("loop");
   const esRef = useRef(null);
 
-  const start = useCallback((query, demo) => {
+  const start = useCallback((query, demo, partial, agents) => {
     if (esRef.current) esRef.current.close();
-    setRun({ ...emptyRun(), status:"running", meta:{ query } });
+    setRun({ ...emptyRun(), status:"running", meta:{ query, partial: !!partial } });
     setTab("loop");
-    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo?1:0}`;
+    const url = `/api/run?query=${encodeURIComponent(query)}&demo=${demo?1:0}&agents=${agents?1:0}${partial?"&partial=1":""}`;
     const es = new EventSource(url);
     esRef.current = es;
     const on = (name) => es.addEventListener(name, (e)=>{
@@ -586,7 +826,7 @@ function App() {
       setRun(prev => reduceEvent(prev, name, data));
       if (name === "done" || name === "error") es.close();
     });
-    ["start","phase","briefing","plan","evidence","node","edge","review","synthesis","done","error"].forEach(on);
+    ["start","phase","briefing","plan","evidence","node","edge","engine_gaps","panel","division_finding","review","synthesis","decision","done","error"].forEach(on);
     es.onerror = () => { setRun(prev => prev.status==="done"?prev:reduceEvent(prev,"error",{message:"connection lost — is server.py running?"})); es.close(); };
   }, []);
 
@@ -596,7 +836,7 @@ function App() {
   useEffect(()=>{
     const p = new URLSearchParams(window.location.search);
     const q = p.get("q");
-    if (q) start(q, p.get("demo") !== "0");
+    if (q) start(q, p.get("demo") !== "0", p.get("partial") === "1", p.get("agents") === "1");
     if (p.get("tab")) setTab(p.get("tab"));
   }, [start]);
 
@@ -616,6 +856,7 @@ function App() {
             {run.meta?.calls_llm
               ? <span className="text-slate-500 mono">{run.meta.backend} · {run.meta.model}</span>
               : <span className="text-slate-500">demo / stub — no LLM</span>}
+            {run.meta?.partial && <Chip cls="border-fuchsia-500/40 text-fuchsia-200 bg-fuchsia-500/10">◆ safety step skipped</Chip>}
           </div>
         </div>
         <div className="flex gap-2 text-center">

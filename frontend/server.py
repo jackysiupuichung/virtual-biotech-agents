@@ -12,10 +12,12 @@ Endpoints
     GET  /                         -> index.html (and sibling static assets)
     GET  /api/run?query=...&demo=1 -> text/event-stream of loop events
 
-The loop reuses the skill's own pure functions (cso.py) and agent runners
-(runners.py); it mirrors harness.run() but yields after each phase instead of
-only printing. No fabrication: if no agent backend is available, the reasoning
-roles fall back to cso.py's honest stubs and the event stream says so.
+The streaming endpoint drives the SAME multi-agent loop the CLI runs
+(harness.run), bridging its structured phase events to SSE via an emit callback —
+so the browser sees the real planner agent, the concurrent division scientists,
+the four-lens reviewer panel, the Prometheux voter, and the bounded review→reroute
+loop. No fabrication: if no agent backend is available, the reasoning roles fall
+back to cso.py's honest stubs and the event stream says so.
 """
 from __future__ import annotations
 
@@ -32,10 +34,8 @@ SKILL = HERE.parent / "skills" / "virtual-biotech-cso"
 sys.path.insert(0, str(SKILL))
 
 import cso          # noqa: E402  (sibling skill module)
-import harness      # noqa: E402  (schemas + helpers)
-import runners      # noqa: E402
+import harness      # noqa: E402  (the real multi-agent loop, driven via emit())
 import kg as KG      # noqa: E402  (persistent canonical knowledge graph)
-from tracing import TraceRecorder  # noqa: E402  (span recorder _agent_or_stub requires)
 
 # default config, overridable via CLI
 CONFIG = {"backend": "auto", "model": None}
@@ -95,11 +95,11 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
     def emit_node(node):
         deltas.append(("node", {**node, "shared_runs": GRAPH.shared_with(node["id"], run_id)}))
 
-    def ev_edge(s, t, etype, *, value=None, ref=None, c=conf):
+    def ev_edge(s, t, etype, *, value=None, ref=None, c=conf, url=None):
         """An evidence edge: the claim IS the edge; provenance is its metadata."""
         deltas.append(("edge", GRAPH.upsert_edge(
             s, t, etype, conf=c, axis=axis, value=value, grade=ev.get("grade"),
-            prov=prov_kind, source=src_label, url=src_url,
+            prov=prov_kind, source=src_label, url=url or src_url,
             ref=ref or ev.get("reference"), step=ev["step"], run=run_id)))
 
     # --- step_02: target EXPRESSED_IN cell types ---------------------------- #
@@ -133,60 +133,87 @@ def _ingest_evidence(run_id: str, ents: dict, ev: dict) -> list[tuple[str, dict]
                 value=f"risk: {res['broad_tissue_risk']}")
 
     # --- step_05: prior trials (target/disease EVALUATED_IN) --------------- #
-    for prog in (res.get("example_programs") or [])[:4]:
-        tr_id = KG.nid("trial", prog)
-        emit_node(GRAPH.upsert_node(tr_id, "Trial", prog, run=run_id))
-        ev_edge(target_id, tr_id, "EVALUATED_IN", value="prior program")
+    # Programs may be plain strings or structured {name/title, nct, url} rows from
+    # the live clinical-trial-finder. When a trial carries its own NCT/url, the node
+    # and its edges deep-link to that *specific* study record, not the registry base.
+    programs = res.get("example_programs") or res.get("trials") or []
+    for prog in programs[:4]:
+        if isinstance(prog, dict):
+            label = prog.get("name") or prog.get("title") or prog.get("nct") or "trial"
+            trial_url = prog.get("url") or KG.trial_deep_link(prog.get("nct", "")) or src_url
+            tr_key = prog.get("nct") or label
+        else:
+            label, trial_url, tr_key = prog, src_url, prog
+        tr_id = KG.nid("trial", tr_key)
+        emit_node(GRAPH.upsert_node(tr_id, "Trial", label, run=run_id, url=trial_url))
+        ev_edge(target_id, tr_id, "EVALUATED_IN", value="prior program", url=trial_url)
         deltas.append(("edge", GRAPH.upsert_edge(
             disease_id, tr_id, "TREATED_IN", conf=conf, axis=axis, prov=prov_kind,
-            source=src_label, url=src_url, ref=ev.get("reference"), step=ev["step"], run=run_id)))
+            source=src_label, url=trial_url, ref=ev.get("reference"), step=ev["step"], run=run_id)))
 
     return deltas
 
 
-def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False):
+def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False,
+             backend: str | None = None):
     """Generator yielding (event_name, payload) for each phase of the loop.
 
-    ``partial`` deliberately drops the safety step from the plan, so the safety axis
-    is never assessed. This makes the Prometheux gap-detector emit a *structural*
-    (forcing) gap that re-routes on its own, and — because the synthesis agent sees
-    only partial evidence — can surface a divergence between the agent's optimistic
-    tier and the engine's derived one. It exists to *show* the load-bearing engine
-    moments the full plan never triggers; it is clearly labelled in the UI."""
+    This drives the REAL multi-agent loop — ``harness.run()`` — and bridges its
+    structured phase events to SSE. It is no longer a re-implementation that can
+    drift: the planner agent, the N concurrent division scientists, the four-lens
+    reviewer panel, the Prometheux voter, and the bounded review→reroute loop are
+    exactly what the CLI runs. The harness pushes events via an ``emit`` callback;
+    a background thread runs the loop while this generator forwards events (plus the
+    graph deltas it derives from ``evidence`` events) to the browser in order.
+
+    ``partial`` is unused now (kept for endpoint compatibility); the engine's
+    structural-gap forcing is demonstrated by the live loop itself.
+    """
     case = cso.case_key(query)
-    routing = cso.load_routing()
     run_id = f"run-{case}-{len(GRAPH.nodes)}"  # deterministic-ish; no RNG
     ents = parse_entities(query)
-    # Demo mode (and an explicit "stub" backend) force the no-backend path: the reasoning
-    # roles use cso.py's cached briefing/review/synthesis instead of a live agent. This keeps
-    # the demo fully offline and fast (no LLM/CLI call) while still exercising the re-route
-    # loop and a real CONDITIONAL_GO. Non-demo runs use the selected backend (live agents).
-    if demo or CONFIG["backend"] == "stub":
-        runner = runners.StubRunner()
-    else:
-        runner = runners.select_runner(CONFIG["backend"], CONFIG["model"])
-    calls_llm = runner.name != "stub"
-    # span recorder _agent_or_stub requires; out_dir=None → no file, observe-only
-    rec = TraceRecorder(None, run_name=case, backend=runner.name, model=runner.model)
+    # The reasoning roles run on `backend`: a per-request override (the UI's "live
+    # agents" toggle) wins over the server's launch default. "stub" → honest offline
+    # stubs (instant, deterministic — the default demo path); "auto"/a named provider
+    # → real agent calls. DATA is cached whenever `demo` is set, independent of this.
+    backend = backend or CONFIG["backend"]
 
+    # Bridge the harness's emit-callback into this generator via a queue + worker
+    # thread (harness.run is blocking; we want to stream as events arrive).
+    import queue
+    import threading
+    q: "queue.Queue[tuple[str, dict] | None]" = queue.Queue()
+    box: dict[str, Any] = {}
+
+    def emit(event: str, payload: dict) -> None:
+        q.put((event, payload))
+
+    def worker() -> None:
+        try:
+            box["result"] = harness.run(
+                query, None, backend=backend, model=CONFIG["model"],
+                demo=demo, live=live, argv=[], emit=emit, quiet=True)
+        except Exception as exc:  # surface to the stream, then end it
+            box["error"] = exc
+        finally:
+            q.put(None)  # sentinel: loop finished
+
+    # --- backbone: seed real ENTITIES before the loop streams evidence ------- #
+    target_id = KG.nid("target", ents["target"])
+    disease_id = KG.nid("disease", ents["disease"])
+    target_canon = KG.canonical_entity("target", ents["target"])
+    disease_canon = KG.canonical_entity("disease", ents["disease"])
     yield "start", {
         "query": query, "case": case, "run_id": run_id, "entities": ents,
-        "backend": runner.name if calls_llm else "none",
-        "model": runner.model if calls_llm else "none",
-        "calls_llm": calls_llm,
         "mode": "demo" if demo else ("live" if live else "default"),
         "kg_nodes": len(GRAPH.nodes), "kg_edges": len(GRAPH.edges),
     }
-
-    # seed the biomedical backbone: real ENTITIES, linked by the hypothesis edge.
-    # The "hypothesis" is no longer a node — it's the Target ──TARGETS──> Disease
-    # edge (modality carried as edge metadata). Entities dedupe across runs.
-    target_id = KG.nid("target", ents["target"])
-    disease_id = KG.nid("disease", ents["disease"])
     backbone = [
-        ("node", {**GRAPH.upsert_node(target_id, "Target", ents["target"], run=run_id),
+        ("node", {**GRAPH.upsert_node(target_id, "Target", ents["target"],
+                                      run=run_id, **target_canon),
                   "shared_runs": GRAPH.shared_with(target_id, run_id)}),
-        ("node", {**GRAPH.upsert_node(disease_id, "Disease", ents["disease"], run=run_id),
+        ("node", {**GRAPH.upsert_node(disease_id, "Disease", ents["disease"],
+                                      run=run_id, **disease_canon),
                   "shared_runs": GRAPH.shared_with(disease_id, run_id)}),
         ("edge", GRAPH.upsert_edge(target_id, disease_id, "TARGETS", conf=1.0, prov="computed",
                                    modality=ents["modality"], run=run_id)),
@@ -195,133 +222,54 @@ def run_loop(query: str, *, demo: bool, live: bool, partial: bool = False):
         mod_id = KG.nid("modality", ents["modality"])
         backbone.append(("node", {**GRAPH.upsert_node(mod_id, "Modality", ents["modality"], run=run_id),
                                    "shared_runs": GRAPH.shared_with(mod_id, run_id)}))
-        # the therapeutic approach: this target is pursued VIA this modality
         backbone.append(("edge", GRAPH.upsert_edge(target_id, mod_id, "VIA_MODALITY", conf=0.9,
                                                    prov="web", run=run_id)))
     for ev_name, payload in backbone:
         yield ev_name, payload
 
-    # 1 — BRIEF (agent role) ------------------------------------------------- #
-    yield "phase", {"id": "briefing", "role": "Chief of Staff", "kind": "agent",
-                    "division": "Office of CSO", "title": "Field briefing", "status": "running"}
-    briefing, brief_src = harness._agent_or_stub(
-        _NullTrace(), "chief_of_staff", runner, cso.CHIEF_OF_STAFF_PROMPT,
-        f"User query: {query}", harness.BRIEFING_SCHEMA,
-        stub=cso.load_briefing(query, case, demo=demo), rec=rec)
-    briefing.setdefault("source", brief_src)
-    yield "briefing", {"briefing": briefing, "source": brief_src}
+    # --- run the real loop, forwarding its events (+ derived graph deltas) --- #
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    review_verdict = "synthesize"
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        event, payload = item
+        # The server already emitted a richer "start" (entities + run_id + kg counts)
+        # before launching the loop, and composes its own terminal "done" (with the
+        # cross-run ranking) below — so swallow the harness's own start/done.
+        if event in ("start", "done"):
+            box[f"harness_{event}"] = payload
+            continue
+        yield event, payload
+        # Every routed-step evidence event becomes biomedical nodes + edges.
+        if event == "evidence":
+            for ev_name, ev_payload in _ingest_evidence(run_id, ents, payload):
+                yield ev_name, ev_payload
+        elif event == "review":
+            review_verdict = payload.get("review", {}).get("verdict", review_verdict)
+        elif event == "decision":
+            # stamp the hypothesis EDGE with the decision of record
+            GRAPH.upsert_edge(target_id, disease_id, "TARGETS",
+                              decision=payload.get("decision"),
+                              confidence=payload.get("confidence"), run=run_id)
+    thread.join()
 
-    # 2 — DECOMPOSE & ROUTE -------------------------------------------------- #
-    subtasks = cso.decompose_and_route(query, case, routing)
-    if partial:
-        # drop the safety step so the safety axis is never assessed — the engine
-        # gap-detector will force a re-route, demonstrating the load-bearing role.
-        subtasks = [t for t in subtasks if "offtarget_safety" not in t.step
-                    and "safety" not in t.step]
-    yield "plan", {"subtasks": [t.as_plan_entry() for t in subtasks], "partial": partial}
+    if box.get("error") is not None:
+        raise box["error"]
+    result = box.get("result", {})
 
-    # 3 — EXECUTE DIVISIONS (stream each step as it completes) --------------- #
-    results: list[dict] = []
-    for task in subtasks:
-        yield "phase", {"id": task.step, "role": task.skill, "kind": "skill",
-                        "division": task.division, "title": task.question, "status": "running"}
-        env = cso.execute_skill(task, case, demo, live)
-        results.append(env)
-        evev = _evidence_event(env)
-        yield "evidence", evev
-        for ev_name, payload in _ingest_evidence(run_id, ents, evev):
-            yield ev_name, payload
-
-    # 4 — REVIEW (agent role; verdict drives control flow) ------------------- #
-    yield "phase", {"id": "review", "role": "Scientific Reviewer", "kind": "agent",
-                    "division": "Audit loop", "title": "Audit evidence", "status": "running"}
-    review, review_src = harness._agent_or_stub(
-        _NullTrace(), "scientific_reviewer", runner, cso.REVIEWER_PROMPT,
-        harness._evidence_context(results), harness.REVIEW_SCHEMA,
-        stub=cso.load_review(query, case, results, demo=demo), rec=rec)
-    review.setdefault("source", review_src)
-
-    # 4b — PROMETHEUX gap-detector (load-bearing): derive structural gaps as a
-    #      non-silenceable reviewer voice. A proven missing axis forces a re-route
-    #      even if the LLM panel said synthesize. Surfaced to the UI as its own voice.
-    engine_gaps = _prometheux_gaps(results, ents["target"])
-    if engine_gaps:
-        review = cso.aggregate_panel_review(
-            [("scientific_reviewer", review)], routing, extra_gaps=engine_gaps)
-        review.setdefault("source", review_src)
-    yield "engine_gaps", {"gaps": engine_gaps,
-                          "forced": any(g.get("forces_reroute") for g in engine_gaps)}
-    yield "review", {"review": review}
-
-    # 5 — RE-ROUTE (one follow-up step if the reviewer flagged a gap) -------- #
-    if review.get("verdict") == "re-route":
-        gap = (review.get("gaps") or [{}])[0]
-        followup = cso._reroute_task(gap, routing)
-        yield "phase", {"id": followup.step, "role": followup.skill, "kind": "skill",
-                        "division": followup.division + " (re-route)", "title": followup.question,
-                        "status": "running", "reroute": True,
-                        "why": gap.get("missing", "")}
-        env = cso.execute_skill(followup, case, demo, live)
-        results.append(env)
-        evev = {**_evidence_event(env), "reroute": True}
-        yield "evidence", evev
-        for ev_name, payload in _ingest_evidence(run_id, ents, evev):
-            yield ev_name, payload
-
-    # 6 — SYNTHESIZE (agent role) ------------------------------------------- #
-    yield "phase", {"id": "synth", "role": "CSO Orchestrator", "kind": "agent",
-                    "division": "Synthesis", "title": "Synthesize recommendation",
-                    "status": "running", "terminal": True}
-    syn_context = (
-        f"User query: {query}\n\nBriefing:\n{json.dumps(briefing, default=str)}\n\n"
-        f"Evidence:\n{harness._evidence_context(results)}\n\n"
-        f"Reviewer:\n{json.dumps(review, default=str)}"
-    )
-    synthesis, _ = harness._agent_or_stub(
-        _NullTrace(), "cso_synthesis", runner, cso.ORCHESTRATOR_PROMPT,
-        syn_context, harness.SYNTHESIS_SCHEMA,
-        stub=cso.load_synthesis(query, case, results, demo=demo), rec=rec)
-    yield "synthesis", {"synthesis": synthesis}
-
-    # 6b — PROMETHEUX decision (load-bearing): derive the GO/NO-GO tier deductively
-    #      from per-axis coverage + a safety hard-gate. The derived tier is the
-    #      Decision of record; the agent's free-text is rationale. A divergence from
-    #      the agent's proposal is surfaced to the UI, never silently overridden.
-    decision_engine = _prometheux_decision(results, ents["target"])
-    agent_decision = (synthesis or {}).get("decision")
-    decision = (decision_engine or {}).get("tier") or agent_decision or "REVIEW"
-    confidence = (synthesis or {}).get("confidence", "n/a")
-    yield "decision", {
-        "decision": decision,
-        "decision_source": "prometheux" if decision_engine else "agent",
-        "agent_decision": agent_decision,
-        "engine": decision_engine,
-        "diverges": bool(decision_engine and agent_decision
-                         and agent_decision != decision_engine["tier"]),
-        "confidence": confidence,
-    }
-
-    # stamp the hypothesis EDGE (Target ──TARGETS──> Disease) with the decision of
-    # record, then persist the whole graph
-    GRAPH.upsert_edge(target_id, disease_id, "TARGETS",
-                      decision=decision, confidence=confidence, run=run_id)
+    # persist the graph, then explain-a-rank over it (meaningful from run #2 on)
     GRAPH.commit()
-
-    # 7 — DONE: assemble report.md + summary -------------------------------- #
-    # Explain-a-rank over the just-committed graph: only populated once a second
-    # target shares the graph, so the first run shows none and later runs explain
-    # how the new target ranks against the prior ones.
     ranking_payload = _prometheux_ranking()
-    report_md = cso.synthesize_report(query, case, briefing, results, review, synthesis,
-                                      demo, decision_engine=decision_engine,
-                                      ranking=ranking_payload["edges"])
     yield "done", {
-        "report_md": report_md,
-        "decision": decision,
-        "decision_source": "prometheux" if decision_engine else "agent",
-        "confidence": confidence,
-        "n_steps": len(results),
-        "reviewer_verdict": review.get("verdict", "synthesize"),
+        "report_md": result.get("report_md", ""),
+        "decision": result.get("summary", {}).get("decision"),
+        "decision_source": result.get("summary", {}).get("decision_source"),
+        "confidence": result.get("summary", {}).get("confidence"),
+        "n_steps": result.get("summary", {}).get("n_steps"),
+        "reviewer_verdict": result.get("summary", {}).get("reviewer_verdict", review_verdict),
         "ranking": ranking_payload,
         "kg_nodes": len(GRAPH.nodes), "kg_edges": len(GRAPH.edges),
     }
@@ -368,29 +316,6 @@ def _prometheux_ranking() -> dict:
         return {"leaderboard": [], "edges": []}
 
 
-def _evidence_event(env: dict) -> dict:
-    """Normalize one routed-step result into a graph/report-ready event."""
-    prov_icon, prov_note = cso._provenance(env)
-    return {
-        "step": env["step"],
-        "division": env["division"],
-        "skill": env["skill"],
-        "question": env.get("question", ""),
-        "result": env.get("result", {}),
-        "grade": cso._evidence_grade(env),
-        "provenance": prov_icon,
-        "provenance_note": prov_note,
-        "reference": cso._evidence_reference(env),
-        "digest": cso._result_digest(env),
-        "source": env.get("source", ""),
-    }
-
-
-class _NullTrace:
-    """harness._agent_or_stub expects a trace with .step(); we don't need it."""
-    def step(self, *a, **k): pass
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter console
         pass
@@ -434,6 +359,15 @@ class Handler(BaseHTTPRequestHandler):
         demo = qs.get("demo", ["0"])[0] in ("1", "true")
         live = qs.get("live", ["0"])[0] in ("1", "true")
         partial = qs.get("partial", ["0"])[0] in ("1", "true")
+        # Per-request backend override (the UI's "live agents" toggle). "live_agents=1"
+        # → real agents via the server's configured provider (auto); unchecked → instant
+        # offline stubs. Falls back to the server default when the param is absent.
+        agents = qs.get("agents", [None])[0]
+        backend = None
+        if agents in ("1", "true"):
+            backend = CONFIG["backend"] if CONFIG["backend"] != "stub" else "auto"
+        elif agents in ("0", "false"):
+            backend = "stub"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -441,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         try:
-            for event, data in run_loop(query, demo=demo, live=live, partial=partial):
+            for event, data in run_loop(query, demo=demo, live=live, partial=partial,
+                                        backend=backend):
                 self.wfile.write(_sse(event, data))
                 self.wfile.flush()
         except BrokenPipeError:
@@ -455,12 +390,25 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # --- static files ---------------------------------------------------- #
+    # Route map: "/" serves the marketing landing site; "/app" serves the live
+    # console. Everything else falls through to a path under frontend/.
+    ROUTES = {
+        "": "site/index.html",
+        "/": "site/index.html",
+        "/app": "index.html",
+        "/app/": "index.html",
+        "/console": "index.html",
+        "/schematic": "site/schematic.html",
+        "/schematic.html": "site/schematic.html",
+    }
+
     def _static(self, path):
-        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        rel = self.ROUTES.get(path, path.lstrip("/"))
+        # Resolve and constrain strictly within the frontend dir (no traversal).
         target = (HERE / rel).resolve()
-        if HERE not in target.parents and target != HERE / rel or not target.is_file():
-            # constrain to the frontend dir
-            target = (HERE / rel)
+        if HERE != target and HERE not in target.parents:
+            self.send_error(403)
+            return
         if not target.is_file():
             self.send_error(404)
             return
