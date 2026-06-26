@@ -25,6 +25,8 @@ conclusion is replayable.
 Supporting sponsor tools: **Tavily** powers live literature search; **ClawBio** is the
 skill runtime each scientist division executes over.
 
+📄 See **[SPONSORS.md](SPONSORS.md)** for each sponsor and exactly how its tech is implemented.
+
 ---
 
 ## Why this is genuinely a multi-agent project
