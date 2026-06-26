@@ -359,15 +359,21 @@ class Handler(BaseHTTPRequestHandler):
         demo = qs.get("demo", ["0"])[0] in ("1", "true")
         live = qs.get("live", ["0"])[0] in ("1", "true")
         partial = qs.get("partial", ["0"])[0] in ("1", "true")
-        # Per-request backend override (the UI's "live agents" toggle). "live_agents=1"
-        # → real agents via the server's configured provider (auto); unchecked → instant
-        # offline stubs. Falls back to the server default when the param is absent.
+        # The UI's "live agents" toggle drives the WHOLE run, not just reasoning:
+        #   agents=1 → real LLM agents (backend) AND execute routed skills for real
+        #             (live=True, demo=False) — data is fetched, not cached.
+        #   agents=0 → instant offline stubs over cached fixtures (demo=True).
+        # It is authoritative over the demo/live params (which the UI always sends a
+        # default for). Omit `agents` entirely (e.g. a hand-built link) to drive
+        # demo/live manually with the server's default backend.
         agents = qs.get("agents", [None])[0]
         backend = None
         if agents in ("1", "true"):
             backend = CONFIG["backend"] if CONFIG["backend"] != "stub" else "auto"
+            live, demo = True, False
         elif agents in ("0", "false"):
             backend = "stub"
+            demo, live = True, False
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
