@@ -16,6 +16,13 @@ __pycache__/
 # Generated skill / workflow output (runtime artifacts, not source)
 output/
 
+# Large raw datasets (download/regenerate, don't commit binaries)
+frontend/data/
+*.h5ad
+
+# Runtime knowledge-graph store (mutates each run; curated fixtures are demo_data/)
+skills/virtual-biotech-cso/kg.json
+
 # scanpy dataset cache
 data/*.h5ad
 
